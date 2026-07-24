@@ -3823,6 +3823,18 @@ static void metal_stage_rot_e8(float *mxg, const int *mrows, int p, int D){
     }
 }
 #endif
+/* moe()'s MB_BUILD subset builder (review F2): coli_metal_moe_block(_begin) take ONE
+ * fmt/qgs for an entire GPU batch of experts (+ optionally the fused shared expert), so
+ * a candidate member at (fmt,gs) is only safe to fold into a batch already established
+ * at (est_fmt,est_gs) if it can't disagree about layout: fmt=4 (grouped int4) is the
+ * only format with a group size to disagree ON, so this is a no-op (always compatible)
+ * for est_fmt!=4 (nothing established yet, or the batch isn't grouped) or fmt!=4 (the
+ * candidate itself isn't grouped -- its own fmt mismatch is a separate, pre-existing gap
+ * this guard does not cover, see MB_BUILD's comment). Pulled out of MB_BUILD as its own
+ * function so it's independently testable (see tests/test_moe_gs_guard.c). */
+static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
+    return !(est_fmt==4 && fmt==4 && gs!=est_gs);
+}
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
@@ -4253,19 +4265,37 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * batch's rows all share s, so this is one FWHT per token in practice. The down
          * input is rotated on-GPU by moe_fwht inside moe_submit. */
         int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
-        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, mgs=0, sh_in=0;
+        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, mgs=0, mgs_ok=1, sh_in=0;
         const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
         int xoffb[65],nrb[65];
         float *mxg=NULL; int *mrows=NULL; float *mrw=NULL;
-        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH) */
+        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH).
+         * mgs_ok (review F2): moe_submit takes ONE fmt/qgs for the WHOLE batch, so a
+         * fmt=4 subset needs every member's group size to agree with the first expert's
+         * (mgs) -- fmt equality alone (already checked below for the shared expert) isn't
+         * enough once fmt=4 has a group size to disagree on. Routed experts get the same
+         * guard against each other (first-expert-gs consistency): a v1-class mixed-
+         * precision container could in principle mint routed experts at different gs
+         * within one layer (qt_resolve_fmt derives fmt/gs per-tensor from the file, with
+         * no uniformity enforced across experts at load time), even though a normal
+         * single-pass conversion never would. mgs_ok=0 does NOT drop the mismatched
+         * expert's rows: it leaves nbb's bookkeeping untouched and instead suppresses the
+         * GPU submit call at the two call sites below, which leaves cpu_res/cpu_miss at
+         * their initial 1 -- the same state a genuine GPU submission failure leaves them
+         * in, so the existing CPU fallback loop (metal_done false) redoes this whole
+         * nb-expert block correctly regardless of the mismatch. (Not checked, and out of
+         * scope for this guard: per-expert fmt agreement across g/u/d, and gs agreement
+         * across sh_gate/sh_up/sh_down or across a single expert's own g/u/d -- see
+         * WORKER_REPORT UNCERTAINTIES.) */
         #define MB_BUILD(WANTMISS, TRY_SH) do{ \
-            nbb=0; Rtot=0; mfmt=-1; mgs=0; sh_in=0; \
+            nbb=0; Rtot=0; mfmt=-1; mgs=0; mgs_ok=1; sh_in=0; \
             for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; \
                 int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0; \
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
                     if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
                 if(!cnt) continue; \
                 if(mfmt<0){ mfmt=e->g.fmt; mgs=e->g.gs; } \
+                else if(!mb_gs_compat(mfmt,mgs,e->g.fmt,e->g.gs)) mgs_ok=0; \
                 MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
                 MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
                 MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \
@@ -4273,7 +4303,8 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++; \
             } \
             if(TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
-                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf){ \
+                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf \
+                   && mb_gs_compat(mfmt,mgs,shf,l->sh_gate.gs)){ \
                     if(mfmt<0){ mfmt=shf; mgs=l->sh_gate.gs; } \
                     MG[nbb]=shf==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4; \
                     MU[nbb]=shf==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4; \
@@ -4295,13 +4326,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             mxg=falloc((int64_t)(nb+1)*S*D);
             mrows=xalloc((size_t)(nb+1)*S*sizeof(int),"moe mrows"); mrw=xalloc((size_t)(nb+1)*S*sizeof(float),"moe mrw");
             MB_BUILD(0, base==0 && !g_pre_sh);
-            if(nbb>0){
+            if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
                 m->t_emm += now_s()-t0;
                 if(mh){ cpu_res=0; mh_shared=sh_in; }
-            } else cpu_res=0;
+            } else if(!nbb) cpu_res=0;   /* nbb==0: nothing in this subset. nbb>0 && !mgs_ok
+                                          * (F2): gs-heterogeneous fmt=4 subset -- leave
+                                          * cpu_res=1 so the CPU loop below redoes it. */
         }
 #endif
         /* Expert loads run HERE, after the resident-experts GPU submit above: under METAL the
@@ -4358,12 +4391,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
                 m->t_ewait += now_s()-tw; }
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
-            if(nbb>0){
+            if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
                 if(coli_metal_moe_block(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
-            } else cpu_miss=0;
+            } else if(!nbb) cpu_miss=0;   /* see the resident-subset call site above */
             if(mh){ double t0=now_s();
                 if(coli_metal_moe_block_end(mh,out)){ if(mh_shared) shared_on_gpu=1; }
                 else cpu_res=1;
