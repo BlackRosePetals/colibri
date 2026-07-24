@@ -83,6 +83,12 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
+/* Declared unconditionally (not just under COLI_METAL): on a non-Metal build it just sits
+ * at 0 forever, which is the correct value there (no Metal backend => never enabled). Kept
+ * outside the #ifdef so portable code — e.g. kvb_fmt_gate_notice below — can read "is Metal
+ * active" without needing COLI_METAL (and the backend_metal.h / Metal framework link it
+ * would drag in) on every platform's test build. */
+static int g_metal_enabled;
 #ifdef COLI_METAL
 #include "backend_metal.h"
 /* No <omp.h> here: the guarded include above already provides it under _OPENMP
@@ -1769,6 +1775,29 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 }
 #endif
 
+/* KV_B FMT-GATE NOTICE (#kvb): kernel contract — the fused Metal attention kernels
+ * (attention_rows' coli_metal_attn_decode and layer_forward_rows' coli_metal_layer_decode,
+ * both gated on `l->kv_b.fmt==2||l->kv_b.fmt==4`) only run against kv_b_proj stored INT4,
+ * either per-row (fmt=2) or grouped (fmt=4, since #587's kv_b grouped-int4 addition); any
+ * OTHER format silently falls through to the CPU absorb path for decode attention on that
+ * layer. v1-class mixed-precision containers can mint kv_b_proj at a format outside that
+ * pair, so this is a real trap, not a hypothetical: print it once (called from model_init,
+ * after all layer tensors are resolved) so it isn't silent. NOTICE ONLY — no gate/behavior
+ * change here. */
+static void kvb_fmt_gate_notice(Model *m){
+    Cfg *c=&m->c;
+    if(!g_metal_enabled) return;
+    int bad=0, first_fmt=-1;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kv_b.fmt!=2 && m->L[i].kv_b.fmt!=4){
+        bad++; if(first_fmt<0) first_fmt=m->L[i].kv_b.fmt; }
+    if(bad) fprintf(stderr,
+        "[METAL] kv_b_proj is fmt=%d (not int4) on %d/%d layer%s: the fused Metal "
+        "attention path requires kv_b in int4, per-row (fmt=2) or grouped (fmt=4), so "
+        "those layers run decode attention on the CPU absorb path instead. Requantize "
+        "kv_b to int4 (per-row --kvb-bits 4, or grouped) to re-enable the fused path.\n",
+        first_fmt, bad, c->n_layers, bad==1?"":"s");
+}
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
@@ -1844,6 +1873,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         }
         #undef P
     }
+    kvb_fmt_gate_notice(m);                       /* once per load, after all layer kv_b resolved */
     /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
     {
         /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
