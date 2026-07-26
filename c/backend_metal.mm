@@ -1237,6 +1237,14 @@ static id<MTLCommandBuffer> moe_submit(int nb, int D, int Iinter, int fmt, int q
       off += n;
     }
   }
+  // COLI_METAL_MOE_EXACT=1: route fmt=4 routed experts to the CPU reference path (bit-exact,
+  // matches matmul_i4_grouped) instead of the fast batched float4 kernel. Opt-in; default is
+  // the fast GPU path. Returning nil makes moe() fall back to CPU for fmt=4 experts, exactly
+  // like an unresolved slab -- fmt=1/2 stay on the GPU, attention/dense are untouched.
+  // (PR #587 gate-2: token-exact mode for trajectories whose gap dips under the drift tail.)
+  { static int g_moe_exact = -1;
+    if (g_moe_exact < 0) { const char *e = getenv("COLI_METAL_MOE_EXACT"); g_moe_exact = (e && e[0] && e[0] != '0'); }
+    if (fmt == 4 && g_moe_exact) return nil; }
   if (g_resset_enabled) {   // E5: commit any pending slab adds before we may skip useResource:
     double t0 = mnow(); resset_flush(); g_t_resset_flush += mnow() - t0;   // METAL-RESSET line
   }
