@@ -126,6 +126,29 @@ def _glm_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, workspace, experts)
 
 
+def _qwen36_geometry(config, context, _model_dir):
+    """Hybrid: only the full_attention layers hold a KV cache; the linear
+    (DeltaNet) layers carry a recurrent state whose size does not depend on the
+    context at all. One scaled context term would over-promise on a model where
+    30 of 40 layers never grow."""
+    layers = _required_int(config, "num_hidden_layers", "qwen36")
+    kinds = config.get("layer_types")
+    if not isinstance(kinds, list) or len(kinds) != layers:
+        raise ValueError("qwen36: missing or invalid planning key 'layer_types'")
+    full = sum(kind == "full_attention" for kind in kinds)
+    kv = (full * context * _required_int(config, "num_key_value_heads", "qwen36") *
+          _required_int(config, "head_dim", "qwen36") * 2 * 4)
+    key_heads = _required_int(config, "linear_num_key_heads", "qwen36")
+    key_dim = _required_int(config, "linear_key_head_dim", "qwen36")
+    value_heads = _required_int(config, "linear_num_value_heads", "qwen36")
+    value_dim = _required_int(config, "linear_value_head_dim", "qwen36")
+    conv_k = _required_int(config, "linear_conv_kernel_dim", "qwen36", 2)
+    conv_dim = key_heads * key_dim * 2 + value_heads * value_dim
+    fixed = (layers - full) * (value_heads * key_dim * value_dim +
+                               conv_dim * (conv_k - 1)) * 4
+    return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -262,6 +285,37 @@ FAMILIES = (
         has_gateway_adapter=True,
         has_cli_adapter=True,
         tune_prompt_template="<|user|>\n{prompt}\n<|assistant|>\n",
+    ),
+    FamilyDescriptor(
+        id="qwen36",
+        model_types=("qwen3_5_moe", "qwen3_5_moe_text"),
+        display_name="Qwen3.6-35B-A3B",
+        display_scale="35B",
+        engine_artifact="qwen36",
+        engine_aliases=(),
+        engine_group="qwen36",
+        internal_arch="qwen36",
+        build_target="qwen36",
+        process_names=("qwen36",),
+        default_model_id="qwen3.6-colibri",
+        cli_adapter="qwen36",
+        gateway_adapter="qwen36",
+        planner_id="qwen36_hybrid",
+        planner_geometry=_qwen36_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
+        config_section="text_config",
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 8, "Q36_MAXT"),
+        capabilities=FamilyCapabilities(False, False, False, True),
+        has_gateway_adapter=True,
+        # coli run stays unwired on purpose: cmd_run dispatches per arch after
+        # this gate, and without a qwen36 branch the engine would inherit GLM's
+        # prompt template -- a wrong template does not fail loudly, it degrades
+        # the answer. False gives the user "use coli chat or coli serve", which
+        # is true and actionable; chat/serve/web all work through the gateway.
+        has_cli_adapter=False,
+        tune_prompt_template=(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
     ),
     FamilyDescriptor(
         id="deepseek_v4",

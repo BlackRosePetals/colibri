@@ -1305,6 +1305,7 @@ install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) \
 	$(INSTALL) -m 755 inkling$(EXE) $(DESTDIR)$(LIBEXECDIR)/inkling$(EXE)
 	$(INSTALL) -m 755 kimi_k3$(EXE) $(DESTDIR)$(LIBEXECDIR)/kimi_k3$(EXE)
 	$(INSTALL) -m 755 olmoe$(EXE) $(DESTDIR)$(LIBEXECDIR)/olmoe$(EXE)
+	$(INSTALL) -m 755 qwen36$(EXE) $(DESTDIR)$(LIBEXECDIR)/qwen36$(EXE)
 	@if [ -f deepseek_v4$(EXE) ]; then \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
