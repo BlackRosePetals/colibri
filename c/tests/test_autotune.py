@@ -65,6 +65,14 @@ class AutotuneUnitTest(unittest.TestCase):
         self.assertAlmostEqual(result["tok_s"], 16 / 355.556)
         self.assertNotEqual(result["tok_s"], 0.04)
 
+    def test_parse_replay_accepts_legacy_speed_without_elapsed_time(self):
+        result = parse_replay(
+            "REPLAY decode: 16 tokens | 0.04 tok/s | expert hit 34.4%\n"
+            "[PROF] decode forwards: 16 | latency p50 4000.0 ms | p90 5000.0 ms | "
+            "p99 60000.0 ms | max 70000.0 ms"
+        )
+        self.assertEqual(result["tok_s"], 0.04)
+
     def test_profile_round_trip_and_explicit_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "engine"
