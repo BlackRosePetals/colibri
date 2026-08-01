@@ -22,7 +22,9 @@ from pathlib import Path
 SCHEMA_VERSION = 1
 PROMPT_RE = re.compile(r"\[PROMPT_TOKENS\]\s+\d+:\s*([0-9 ]+)")
 TOKENS_RE = re.compile(r"\[TOKENS\]\s+\d+\s+generated:\s*([0-9 ]+)")
-SPEED_RE = re.compile(r"REPLAY decode:\s+\d+\s+tokens.*?\|\s*([0-9.]+)\s+tok/s")
+REPLAY_TIMING_RE = re.compile(
+    r"REPLAY decode:\s+(\d+)\s+tokens in\s+([0-9.]+)s.*?\|\s*[0-9.]+\s+tok/s"
+)
 HIT_RE = re.compile(r"expert hit\s+([0-9.]+)%")
 LATENCY_RE = re.compile(r"latency p50\s+([0-9.]+)\s*ms.*?p99\s+([0-9.]+)\s*ms")
 
@@ -163,13 +165,17 @@ def candidate_steps(plan: dict, base_env: dict) -> list[tuple[str, dict]]:
 
 
 def parse_replay(output: str) -> dict:
-    speed = SPEED_RE.search(output)
-    if not speed:
-        raise ValueError("engine did not emit REPLAY throughput")
+    timing = REPLAY_TIMING_RE.search(output)
+    if not timing:
+        raise ValueError("engine did not emit REPLAY timing")
+    tokens = int(timing.group(1))
+    elapsed_s = float(timing.group(2))
+    if elapsed_s <= 0:
+        raise ValueError("engine emitted an invalid REPLAY duration")
     hit = HIT_RE.search(output)
     latency = LATENCY_RE.search(output)
     return {
-        "tok_s": float(speed.group(1)),
+        "tok_s": tokens / elapsed_s,
         "hit_pct": float(hit.group(1)) if hit else None,
         "p50_ms": float(latency.group(1)) if latency else None,
         "p99_ms": float(latency.group(2)) if latency else None,

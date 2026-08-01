@@ -56,6 +56,15 @@ class AutotuneUnitTest(unittest.TestCase):
         self.assertEqual(result["hit_pct"], 92.5)
         self.assertEqual(result["p99_ms"], 80.0)
 
+    def test_parse_replay_uses_elapsed_time_below_point_one_tok_s(self):
+        result = parse_replay(
+            "REPLAY decode: 16 tokens in 355.556s | 0.04 tok/s | expert hit 34.4%\n"
+            "[PROF] decode forwards: 16 | latency p50 4000.0 ms | p90 5000.0 ms | "
+            "p99 60000.0 ms | max 70000.0 ms"
+        )
+        self.assertAlmostEqual(result["tok_s"], 16 / 355.556)
+        self.assertNotEqual(result["tok_s"], 0.04)
+
     def test_profile_round_trip_and_explicit_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "engine"
@@ -107,7 +116,8 @@ class AutotuneIntegrationTest(unittest.TestCase):
                 " pipe=os.environ.get('COLI_CUDA_PIPE','0')\n"
                 " speed={'0':10.0,'1':12.0,'2':11.0}[pipe]\n"
                 " if os.environ.get('COLI_CUDA_ASYNC') == '0': speed=9.0\n"
-                " print(f'REPLAY decode: 4 tokens in 1.000s | {speed:.2f} tok/s | expert hit 95.0%')\n"
+                " elapsed=4/speed\n"
+                " print(f'REPLAY decode: 4 tokens in {elapsed:.6f}s | {speed:.2f} tok/s | expert hit 95.0%')\n"
                 " print('[PROF] decode forwards: 4 | latency p50 80.0 ms | p90 90.0 ms | p99 100.0 ms | max 100.0 ms')\n",
                 encoding="utf-8",
             )
@@ -120,8 +130,10 @@ class AutotuneIntegrationTest(unittest.TestCase):
             )
             self.assertTrue(profile["accepted"])
             self.assertEqual(profile["winner"]["env"], {"COLI_CUDA_PIPE": "1"})
-            self.assertAlmostEqual(profile["gain"], 0.20)
-            self.assertEqual(json.loads(path.read_text())["winner"]["tok_s"], 12.0)
+            self.assertAlmostEqual(profile["gain"], 0.20, places=5)
+            self.assertAlmostEqual(
+                json.loads(path.read_text())["winner"]["tok_s"], 12.0, places=4
+            )
 
     def test_reverse_confirmation_rejects_warmup_drift(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -139,7 +151,8 @@ class AutotuneIntegrationTest(unittest.TestCase):
                 " except FileNotFoundError: n=0\n"
                 " open(counter,'w').write(str(n+1))\n"
                 " speed=10.0+n\n"
-                " print(f'REPLAY decode: 4 tokens in 1.000s | {speed:.2f} tok/s | expert hit 95.0%')\n"
+                " elapsed=4/speed\n"
+                " print(f'REPLAY decode: 4 tokens in {elapsed:.6f}s | {speed:.2f} tok/s | expert hit 95.0%')\n"
                 " print('[PROF] decode forwards: 4 | latency p50 80.0 ms | p90 90.0 ms | p99 100.0 ms | max 100.0 ms')\n",
                 encoding="utf-8",
             )
