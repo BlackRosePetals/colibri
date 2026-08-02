@@ -131,3 +131,9 @@ c/coli_cuda_dsv4*.dll
 c/coli_cuda_dsv4*.lib
 c/coli_cuda_dsv4*.exp
 c/*.obj
+# macOS
+.DS_Store
+**/.DS_Store
+
+# compiled objects
+*.o
