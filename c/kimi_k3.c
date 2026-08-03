@@ -80,6 +80,9 @@
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
+#ifdef COLI_CUDA
+#include "backend_cuda.h"
+#endif
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                    /* KV prefix reuse (shared) */
@@ -287,6 +290,9 @@ static float w_rowdot(const W *w, int r, const float *x){
 #define QCHUNK 1024                      /* rows per load-quantize pass */
 static int g_bits_env=0;                 /* K3_BITS explicitly set: enables the
                                           * int8-container -> int4 load downcast */
+#ifdef COLI_CUDA
+static int g_k3_cuda=0;                  /* K3_CUDA=1: MXFP4 routed experts on CUDA at decode */
+#endif
 static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
@@ -498,6 +504,16 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         snprintf(m->pfx,sizeof(m->pfx),"language_model.");
     if((c->n_layers+c->res_bs-1)/c->res_bs+1>16){ fprintf(stderr,"attn_res: too many blocks\n"); exit(1); }
     g_bits_env = getenv("K3_BITS")!=NULL;
+#ifdef COLI_CUDA
+    g_k3_cuda = getenv("K3_CUDA") ? atoi(getenv("K3_CUDA")) : 0;
+    if(g_k3_cuda){
+        int dev0 = 0;
+        if(!coli_cuda_init(&dev0, 1)){
+            fprintf(stderr,"[K3-CUDA] device unavailable -- experts stay on CPU\n");
+            g_k3_cuda = 0;
+        } else fprintf(stderr,"[K3-CUDA] MXFP4 routed experts on device 0 (decode only)\n");
+    }
+#endif
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
     g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
     g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
@@ -866,6 +882,34 @@ static inline float situf_(float g, float u, float b1, float b2){
     return b1*tanhf(g/b1)*sigmoidf_(g) * b2*tanhf(u/b2);
 }
 
+#ifdef COLI_CUDA
+/* CUDA apply for one expert, decode only (S==1).
+ *
+ * Same shape as the Vulkan path below and the CPU expert_apply above -- w1/w3,
+ * SiTU-GLU on the host, then w2 down -- but stateless: the routed tier streams,
+ * so there is nothing resident to keep a device handle for. Weights ride up
+ * with the call.
+ *
+ * Returns 0 with u untouched on ANY failure, so the caller falls through to the
+ * disk+CPU path exactly as it does when Vulkan declines. That is the contract
+ * vLLM's MXFP4 backends use too -- FlashInfer/AITER when they can, an emulation
+ * path when they cannot -- and it is what makes the fast path safe to attempt
+ * unconditionally. */
+static int cuda_expert_apply(Model *m, const uint8_t *w1p, const uint8_t *w1s,
+                             const uint8_t *w2p, const uint8_t *w2s,
+                             const uint8_t *w3p, const uint8_t *w3s,
+                             const float *z, float wk,
+                             float *u, float *gate, float *up, float *hz){
+    Cfg *c=&m->c;
+    if(!coli_cuda_matmul_mxfp4(gate,z,w1p,w1s,1,c->latent,c->moe_inter)) return 0;
+    if(!coli_cuda_matmul_mxfp4(up,  z,w3p,w3s,1,c->latent,c->moe_inter)) return 0;
+    for(int i=0;i<c->moe_inter;i++) gate[i]=situf_(gate[i],up[i],c->situ_b1,c->situ_b2);
+    if(!coli_cuda_matmul_mxfp4(hz,gate,w2p,w2s,1,c->moe_inter,c->latent)) return 0;
+    for(int i=0;i<c->latent;i++) u[i]+=wk*hz[i];
+    return 1;
+}
+#endif
+
 /* u += wk * E(z) for one loaded expert slot (SiTU-GLU in the latent).
  * gate/up are [moe_inter] scratch, hz is [latent] scratch. */
 static void expert_apply(Model *m, Slot *s, const float *z, float wk,
@@ -873,6 +917,11 @@ static void expert_apply(Model *m, Slot *s, const float *z, float wk,
     Cfg *c=&m->c;
     uint8_t *w1p=s->buf, *w1s=w1p+m->e_w1p, *w2p=w1s+m->e_w1s, *w2s=w2p+m->e_w2p,
             *w3p=w2s+m->e_w2s, *w3s=w3p+m->e_w1p;
+#ifdef COLI_CUDA
+    /* Opt-in (K3_CUDA=1), decode only: at S>1 the CPU kernels amortise across
+     * the batch and the per-call upload would not pay for itself. */
+    if(g_k3_cuda && cuda_expert_apply(m,w1p,w1s,w2p,w2s,w3p,w3s,z,wk,u,gate,up,hz)) return;
+#endif
     void (*mm)(float*,const float*,const uint8_t*,const uint8_t*,int,int,int)
         = g_k3_idot ? matmul_mxfp4_i8 : matmul_mxfp4;
     mm(gate,z,w1p,w1s,1,c->latent,c->moe_inter);
