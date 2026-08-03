@@ -54,6 +54,30 @@ jobs:
         with:
           dockerfile: docker/Dockerfile
           failure-threshold: error
+  # The C suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+  #
+  # Before this the only sanitized code in CI was nothing at all: fuzz-rans has
+  # always built with ASan+UBSan but was never wired to a job, and it covers
+  # rans.h alone. The engine's pointer arithmetic, mmap/pread paths and worker
+  # threads had never been run under a sanitizer here.
+  #
+  # Leak detection is off on purpose -- the engines allocate the tensor index,
+  # parsed config and weight slabs once and use them until exit (st.h calls this
+  # out: "intentionally leaked ... one-time startup parsing"). Reporting those
+  # would bury the findings that matter under noise nobody intends to fix. The
+  # flags live in c/Makefile's test-asan target, not here, so the same command
+  # reproduces it locally.
+  sanitizers:
+    name: Sanitizers (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: C suite under ASan + UBSan
+        run: make -C c test-asan
+      - name: rANS fuzz round-trip (ASan + UBSan)
+        # Already sanitized and already asserting byte identity across every
+        # compiled decode arm; it just had no job to run in.
+        run: make -C c fuzz-rans
 
   engines-all-platforms:
     name: All engines (${{ matrix.name }})

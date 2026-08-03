@@ -17,6 +17,14 @@ DARWIN := $(findstring darwin,$(TRIPLET))
 LINUX  := $(findstring linux,$(TRIPLET))
 IS_WIN := $(MINGW)$(CYGWIN)
 
+# Appended to every platform's flags, so a caller can add to the build without
+# replacing it. Overriding CFLAGS= on the command line would drop that
+# platform's OpenMP and -march flags, which is how a sanitizer run ends up
+# silently unsanitized. Used by test-asan; also the supported way to pass
+# your own flag: make colibri EXTRA_CFLAGS=-DFOO
+EXTRA_CFLAGS  ?=
+EXTRA_LDFLAGS ?=
+
 # Fallbacks for the rare toolchain that does not answer -dumpmachine: keep the
 # #129 signal (OS=Windows_NT, set in every Windows shell) for Windows, then
 # `uname` for everything else, so no host regresses.
@@ -54,7 +62,7 @@ $(warning libomp not found: building single-threaded. For multithreading: brew i
 OMPC    =
 OMPL    =
 endif
-CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 # Opt-in: ARCH=native appends -mcpu=native (arm64 clang uses -mcpu, not -march),
 # which unlocks the i8mm SMMLA int8/int4 dot kernels in colibri.c. ARCH unset ->
 # no -mcpu, default build byte-identical. Apple clang knows apple-m4 / native.
@@ -66,7 +74,7 @@ else
 CFLAGS += -mcpu=$(ARCH)
 endif
 endif
-LDFLAGS = -lm $(OMPL)
+LDFLAGS = -lm $(OMPL) $(EXTRA_LDFLAGS)
 EXE     =
 else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
@@ -79,12 +87,12 @@ else ifneq ($(IS_WIN),)
 # a v3 build simply compiles out the VNNI path - safe on any x86-64.
 CC      = gcc
 ARCH   ?= x86-64-v3
-CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
 # -lpsapi: compat.h calls GetProcessMemoryInfo (rss_gb). It's linked via
 # #pragma comment(lib,"psapi.lib") for MSVC, but MinGW gcc ignores that pragma
 # (warns), so link psapi explicitly or the build fails undefined-reference on
 # modern GCC (e.g. 16.x under UCRT). Harmless where the pragma also resolves it.
-LDFLAGS = -lm -fopenmp -static -lpsapi
+LDFLAGS = -lm -fopenmp -static -lpsapi $(EXTRA_LDFLAGS)
 EXE     = .exe
 else
 ifneq (,$(PPC64))
@@ -94,8 +102,8 @@ ifneq (,$(PPC64))
 # (validated token-exact vs the transformers oracle on a POWER8 S824).
 CC      = gcc
 ARCH   ?= native
-CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -O3 -mcpu=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 else ifneq (,$(AARCH64))
 # --- Linux / *BSD aarch64 (#631) ---
@@ -128,8 +136,8 @@ ARCHFLAG := -march=$(ARCH)
 else
 ARCHFLAG := -mcpu=$(ARCH)
 endif
-CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -O3 $(ARCHFLAG) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 else
 # --- Linux / *BSD x86-64 (percorso originale, invariato) ---
@@ -139,8 +147,8 @@ CC      = gcc
 # ARCH=x86-64 -> massima compatibilita' (niente AVX2: usa il path scalare di fallback).
 # -pthread: Linux lo tira dentro via -fopenmp, i *BSD no e le pthread_* non risolvono (#219).
 ARCH   ?= native
-CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
-LDFLAGS = -lm -fopenmp -pthread
+CFLAGS  = -O3 -march=$(ARCH) -fopenmp -pthread -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function $(EXTRA_CFLAGS)
+LDFLAGS = -lm -fopenmp -pthread $(EXTRA_LDFLAGS)
 EXE     =
 endif
 endif
@@ -991,6 +999,33 @@ bench-omp-grain: tests/bench_omp_grain.c
 	$(CC) $(CFLAGS) $< -o tests/bench_omp_grain $(LDFLAGS)
 	./tests/bench_omp_grain
 
+# --- sanitizers ---------------------------------------------------------
+# The whole C test suite under AddressSanitizer + UndefinedBehaviorSanitizer.
+# Until this target the only sanitized code in the tree was fuzz-rans, which
+# covers rans.h alone -- the engine's 9k lines of pointer arithmetic, mmap/pread
+# and worker threads had never been run under ASan at all.
+#
+# detect_leaks is OFF, deliberately. The engines allocate their tensor index,
+# parsed config and weight slabs once and use them until exit; st.h says as much
+# ("intentionally leaked ... one-time startup parsing"). LeakSanitizer reports
+# every one of those, which would bury the reports that matter -- a
+# heap-buffer-overflow or a use-after-free -- under noise nobody intends to fix.
+# halt_on_error makes the first UB report fail the run instead of scrolling past.
+#
+# -O1: ASan needs frame pointers and readable stacks; -O3 costs signal for speed
+# that a test run does not need.
+ASAN_CFLAGS  = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined
+ASAN_LDFLAGS = -fsanitize=address,undefined
+ASAN_ENV     = ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+
+# `make clean` first is not optional: tools/clean.py had to be fixed to remove
+# Unix test binaries at all (it globbed only *.exe), and without that step this
+# target re-runs binaries built with the NORMAL flags and reports them clean.
+test-asan:
+	@$(MAKE) clean
+	@$(ASAN_ENV) $(MAKE) test-c EXTRA_CFLAGS="$(ASAN_CFLAGS)" EXTRA_LDFLAGS="$(ASAN_LDFLAGS)"
+	@echo "test-asan: suite clean under ASan + UBSan"
+
 # Local validation: one portable CPU build and dependency-free tests.
 check:
 	$(MAKE) clean
@@ -1035,6 +1070,7 @@ bench: iobench$(EXE)
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
+.PHONY: test-asan
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
