@@ -688,8 +688,14 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
 
+# NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
+# hand it a define matching nothing and link a runtime it never calls -- a
+# build whose compile line, libraries and exit status all claim "CUDA" while
+# the GPU sits idle. Same guard #783 put on kimi_k3, which since gaining an
+# MXFP4 expert path no longer needs it. tests/test_makefile_cuda_scope.py
+# asserts this shape.
 olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h
-	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
+	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
