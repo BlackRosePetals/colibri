@@ -1,0 +1,6 @@
+# run: 03_Cpipe_only
+# date: 2026-08-04T18:00:21Z
+# cmd: env COLI_METAL=1 DIRECT=1 MTP=0 PIPE=1 PIPE_WORKERS=8 ./coli run --model /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow --ram 110 --ngen 1024 Compare the myths of Lucifer and Prometheus
+# usage_md5: 6ba15f6d1dc0719655232e3144bc50b1
+env: ./coli: No such file or directory
+# wall: 0s

@@ -1,0 +1,222 @@
+# run: 07_Epipe16
+# date: 2026-08-04T23:17:51Z
+# cmd: env COLI_METAL=1 DIRECT=1 MTP=0 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=16 ../../c/coli run --model /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow --ram 110 --cap 33 --ngen 1024 Compare the myths of Lucifer and Prometheus
+# usage_md5: 6ba15f6d1dc0719655232e3144bc50b1
+[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)
+[MTP] absent (draft=0)
+[USAGE] expert history: 6331800 selections (/Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow/.coli_usage)
+[PIN] placement: 0 VRAM + 2478 RAM expert (46.9 GB warm) in 7s da /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow/.coli_usage
+[PIN] mlock: 46.9 GB wired in physical RAM (no compression) in 2s
+[RAM_GB=110.0] cap=33 ok (projected peak 109.9 GB)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=33 experts/layer | experts@8-bit dense@8-bit | idot: neon ==
+loaded in 1.22s | resident dense: 9647.10 MB | layers=78 experts=256 | MTP absent (draft=0)
+prompt: 13 tokens | generating up to 1024 (EOS stop=154820) | n-gram draft=0
+[gMASK]<sop><|user|>Compare the myths of Lucifer and Prometheus<|assistant|><think></think>[prefill] layer 1/78 · 13 token · +0.00s
+[prefill] layer 5/78 · 13 token · +0.27s
+[prefill] layer 9/78 · 13 token · +1.16s
+[prefill] layer 13/78 · 13 token · +1.91s
+[prefill] layer 17/78 · 13 token · +2.55s
+[prefill] layer 21/78 · 13 token · +3.09s
+[prefill] layer 25/78 · 13 token · +3.68s
+[prefill] layer 29/78 · 13 token · +4.36s
+[prefill] layer 33/78 · 13 token · +4.90s
+[prefill] layer 37/78 · 13 token · +5.44s
+[prefill] layer 41/78 · 13 token · +5.99s
+[prefill] layer 45/78 · 13 token · +6.57s
+[prefill] layer 49/78 · 13 token · +7.14s
+[prefill] layer 53/78 · 13 token · +7.72s
+[prefill] layer 57/78 · 13 token · +8.29s
+[prefill] layer 61/78 · 13 token · +8.85s
+[prefill] layer 65/78 · 13 token · +9.39s
+[prefill] layer 69/78 · 13 token · +9.94s
+[prefill] layer 73/78 · 13 token · +10.56s
+[prefill] layer 77/78 · 13 token · +11.25s
+[prefill] layer 78/78 · 13 token · +11.40s
+PROFILO PREFILL (11.57s):
+PROFILE: expert-disk 264.410s service / 8.888s wait | expert-matmul 1.465s | attention 1.034s (including kvb 0.048s) | lm_head 0.004s | other 0.182s
+ATTENTION: projection/RoPE 0.742s | score-softmax-value 0.018s | output projection 0.226s
+METAL: blocchi GPU 178 | fallback CPU 0 | expert su GPU 4475 | setup 0.14s gpu-wall 1.28s (kernel 1.10s) scatter 0.01s
+The myths of Lucifer (from Judeo-Christian tradition) and Prometheus (from Greek
+[t=16  RSS 97.87 GB  hit 76%  1.50 tok/s  1.00 tok/fw]
+ tradition) are two of the most profound and heavily analyzed figures in comparative mythology and
+[t=32  RSS 97.87 GB  hit 76%  1.44 tok/s  1.00 tok/fw]
+ literature. Both are rebel figures associated with the dawn, fire, and the pursuit
+[t=48  RSS 97.87 GB  hit 77%  1.50 tok/s  1.00 tok/fw]
+ of forbidden knowledge, often drawing comparisons to other mythological "tricksters"
+[t=64  RSS 97.87 GB  hit 77%  1.49 tok/s  1.00 tok/fw]
+ or "culture heroes." 
+
+While they originate from vastly different cultural landscapes—the Ab
+[t=80  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+rahamic theological framework versus the ancient Greek polytheistic framework—their narratives share
+[t=96  RSS 97.87 GB  hit 77%  1.44 tok/s  1.00 tok/fw]
+ striking structural similarities. 
+
+Here is a detailed comparison of the two figures across several
+[t=112  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ key dimensions:
+
+---
+
+### 1. Etymology and Symbolic Association with Light
+[t=128  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+
+
+Both figures are deeply associated with light, though in different ways. 
+
+*
+[t=144  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ **Lucifer:** The name "Lucifer" is Latin for "Light-br
+[t=160  RSS 97.87 GB  hit 76%  1.43 tok/s  1.00 tok/fw]
+inger" or "Morning Star" (from *lux*, light/freight
+[t=176  RSS 97.87 GB  hit 76%  1.44 tok/s  1.00 tok/fw]
+, and *ferre*, to bring/carry). In Christian tradition, Lucifer
+[t=192  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+ was originally the highest-ranking angel, the "seal of perfection" and "
+[t=208  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+covering cherub," who was associated with the radiant, blinding light of the
+[t=224  RSS 97.87 GB  hit 77%  1.47 tok/s  1.00 tok/fw]
+ divine. His association with light takes on a tragic, ironic twist after his fall
+[t=240  RSS 97.87 GB  hit 77%  1.46 tok/s  1.00 tok/fw]
+, transforming him into the lord of darkness.
+* **Prometheus:** The name
+[t=256  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+ "Prometheus" is traditionally derived from Greek *promētheuas*,
+[t=272  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+ meaning "forethought" or "providence." While his name does not directly
+[t=288  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+ translate to a light figure, he is the benefactor of humanity, associated with
+[t=304  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+ the divine fire stolen from Mount Olympus. In Greek cosmology, light and fire
+[t=320  RSS 97.87 GB  hit 77%  1.45 tok/s  1.00 tok/fw]
+ are intertwined, representing divine knowledge, civilization, and enlightenment.
+
+### . The
+[t=336  RSS 97.87 GB  hit 77%  1.44 tok/s  1.00 tok/fw]
+ Rebel Archetype and Divine Transgression
+Both figures are quintessential rebels who defy
+[t=352  RSS 97.87 GB  hit 77%  1.44 tok/s  1.00 tok/fw]
+ the supreme deity(s) of their respective pantheons, though their motives and
+[t=368  RSS 97.87 GB  hit 77%  1.43 tok/s  1.00 tok/fw]
+ methods differ significantly. 
+
+* **Lucifer:** In Christian theology, Lucifer's
+[t=384  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ rebellion is an act of immense pride and self-idolatry. Often interpreted
+[t=400  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ as the "first rebel," Lucifer's transgression was an attempt to usurp
+[t=416  RSS 97.87 GB  hit 77%  1.42 tok/s  1.00 tok/fw]
+ the throne of the Supreme Being. His rebellion is deeply existential: he chooses to
+[t=432  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ defy a deity he knows is omnipotent and omniscient. His rebellion is
+[t=448  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ an act of pure self-idolatry and pride.
+* **Prometheus
+[t=464  RSS 97.87 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+:** Prometheus's transgression is entirely altruistic. He defies Zeus not to
+[t=480  RSS 97.87 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ to take power for himself, but to provide fire (knowledge, technology, civilization
+[t=496  RSS 97.87 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+) to humanity. His rebellion is an act of profound compassion for human suffering,
+[t=512  RSS 97.87 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ positioning him as a "culture hero" or "trickster" who uses
+[t=528  RSS 97.87 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ his divine intelligence to subvert a cruel or tyrannical order in favor of
+[t=544  RSS 97.87 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ vulnerable mortals.
+
+### 3. The Punishment and the Eternal Ordeal
+[t=560  RSS 97.87 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+
+ 
+
+Both figures are subjected to eternal or1eal punishments for their trans
+[t=576  RSS 97.87 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+gressions, though the nature of their suffering differs considerably. 
+
+* **Luc
+[t=592  RSS 97.87 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+ifer:** Cast out of Heaven, Lucifer (often conflated with Satan in later
+[t=608  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ theology) becomes the lord of Hell. His punishment is often depicted as an eternal
+[t=624  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ fall from grace—expelled from the presence of the divine. In Milton's
+[t=640  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ *Paradise Lost*, he lies "chained on the burning lake"
+[t=656  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ with his fallen angels, destined for eternal torment. His punishment is existential and spiritual
+[t=672  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+: an eternal separation from the divine light he once bore.
+* **Prometheus
+[t=688  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+:** His punishment is brutally physical. Zeus orders him nailed to a cliff in the
+[t=704  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ Caucasus Mountains, where an eagle (or vulture) descends daily to
+[t=720  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ feed on his "regenerative" liver. He cannot move, only to endure
+[t=736  RSS 97.87 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ what appears to be an eternal regimen of agony and1eal torment for his
+[t=752  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ transgression of giving fire to humanity. He is eventually freed by the hero Her
+[t=768  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+acles (Hercules), but only with Zeus's reluctant consent.
+### 
+[t=784  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+. The Benefactor vs. The Adversary
+ 
+
+The core difference between
+[t=800  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ the two lies in their relationships to humanity. 
+
+* **Lucifer:** In
+[t=816  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ Christian theology, Lucifer (as the conflation of Satan) becomes the "Ad
+[t=832  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+versary" of humanity. The "scapegoat" for all evil in
+[t=848  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ the world, he is depicted as a roaring lion1 seeking2e to devour
+[t=864  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ humanity. His role is adversarial2humanity; he is the accuser
+[t=880  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+, the deceiver, the "great red dragon7" of Revelation.
+*
+[t=896  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ **Prometheus:** He is the "Benefactor." The root of his name
+[t=912  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ (Prometheus) means "forethought," it is a title that fits the
+[t=928  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ Benefactor. He is a "culture hero"2 humanity, providing fire,
+[t=944  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ the arts, and sciences to elevate the human condition. He does not deceive;
+[t=960  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ he elevates. He is the prophetic "wise one" or "tr
+[t=976  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ickster8" who enables humanity to defy the gods.
+###  Summary:
+[t=992  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+ The Fall and the Ascent
+ 
+
+Both Lucifer and Prometheus are liminal figures
+[t=1008  RSS 97.87 GB  hit 76%  1.38 tok/s  1.00 tok/fw]
+: boundary-crossers stationed at the dawn of cosmic time2. Yet their narratives
+[t=1024  RSS 97.87 GB  hit 76%  1.37 tok/s  1.00 tok/fw]
+
+---
+prefill 13 tokens in 11.57s | decode 1024 tokens in 745.03s (1.37 tok/s) | expert hit rate 75.9% (pin 55.3% + lru 20.6%) | RSS 97.87 GB
+experts loaded/token: 599.4 (per-layer 7.99 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.00 tokens/forward (1023 forwards per 1024 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 1387.114s service / 441.514s wait | expert-matmul 167.586s | attention 124.903s (including kvb 0.000s) | lm_head 0.000s | other 11.030s
+ATTENTION: projection/RoPE 0.000s | score-softmax-value 0.000s | output projection 0.000s
+METAL-ATTN: layer GPU 79794 | gpu-wall 121.04s (kernel 93.61s | cpu-sched 0.94s gpu-sched 14.17s)
+METAL: blocchi GPU 138666 | fallback CPU 0 | expert su GPU 618275 | setup 18.84s gpu-wall 140.07s (kernel 74.36s) scatter 1.24s
+
+    (\      colibri v1.4.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2 · 744B MoE · int4 · streaming CPU
+             run
+             
+  ──────────────────────────────────────────────────────────
+# wall: 769s

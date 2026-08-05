@@ -23,9 +23,12 @@ Benchmark colibri on M1 Ultra (128GB unified memory) using the same methodology 
 
 ### fmt=2 Track (Per-Row Int4)
 
-**Status:** Ready to benchmark immediately
+**Status:** Blocked on fmt=2 model conversion (converter script to be written)
 
-**Model:** Converted from official fmt=4 container using `--group-size 0`
+**Model:** Converted from the official fmt=4 container with `c/tools/convert_fmt4_to_fmt2.py`
+(must be created first — spec in [`metal_fmt2.md`](metal_fmt2.md) Phase 1.2).
+`coli convert --group-size 0` does **not** do this: it only converts FP8→int4 from the
+HuggingFace repo and cannot read an existing int4 container.
 
 **Advantage:** Full Metal support (no code changes needed)
 
@@ -53,7 +56,7 @@ Benchmark colibri on M1 Ultra (128GB unified memory) using the same methodology 
 
 ### 1. Model Availability
 
-- **fmt=4:** `~/mlx-models/GLM-5.2-colibri-int4-g64-with-int8-mtp` (already present)
+- **fmt=4:** `/mnt/zfs1/noprot/mlx-lm/models/GLM-5.2-colibri-int4-g64-with-int8-mtp` (NFS; no local SSD copy exists)
 - **fmt=2:** Convert from fmt=4 using plan in [`metal_fmt2.md`](metal_fmt2.md#phase-1)
 
 ### 2. Build with Metal

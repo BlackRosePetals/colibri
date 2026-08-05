@@ -1,0 +1,209 @@
+# run: 08_ram105
+# date: 2026-08-04T23:30:40Z
+# cmd: env COLI_METAL=1 DIRECT=1 MTP=0 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=8 ../../c/coli run --model /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow --ram 105 --cap 33 --ngen 1024 Compare the myths of Lucifer and Prometheus
+# usage_md5: 6ba15f6d1dc0719655232e3144bc50b1
+[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)
+[MTP] absent (draft=0)
+[USAGE] expert history: 6331800 selections (/Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow/.coli_usage)
+[PIN] auto: 44.4 GB plan capped to 41.9 GB to preserve the no-pin LRU cap 33/layer
+[PIN] placement: 0 VRAM + 2217 RAM expert (41.9 GB warm) in 6s da /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow/.coli_usage
+[PIN] mlock: 42.0 GB wired in physical RAM (no compression) in 2s
+[RAM_GB=105.0] cap=33 ok (projected peak 105.0 GB)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=33 experts/layer | experts@8-bit dense@8-bit | idot: neon ==
+loaded in 1.24s | resident dense: 9647.10 MB | layers=78 experts=256 | MTP absent (draft=0)
+prompt: 13 tokens | generating up to 1024 (EOS stop=154820) | n-gram draft=0
+[gMASK]<sop><|user|>Compare the myths of Lucifer and Prometheus<|assistant|><think></think>[prefill] layer 1/78 · 13 token · +0.00s
+[prefill] layer 5/78 · 13 token · +0.27s
+[prefill] layer 9/78 · 13 token · +1.17s
+[prefill] layer 13/78 · 13 token · +1.92s
+[prefill] layer 17/78 · 13 token · +2.56s
+[prefill] layer 21/78 · 13 token · +3.12s
+[prefill] layer 25/78 · 13 token · +3.70s
+[prefill] layer 29/78 · 13 token · +4.40s
+[prefill] layer 33/78 · 13 token · +4.94s
+[prefill] layer 37/78 · 13 token · +5.48s
+[prefill] layer 41/78 · 13 token · +6.06s
+[prefill] layer 45/78 · 13 token · +6.66s
+[prefill] layer 49/78 · 13 token · +7.23s
+[prefill] layer 53/78 · 13 token · +7.84s
+[prefill] layer 57/78 · 13 token · +8.43s
+[prefill] layer 61/78 · 13 token · +8.99s
+[prefill] layer 65/78 · 13 token · +9.54s
+[prefill] layer 69/78 · 13 token · +10.09s
+[prefill] layer 73/78 · 13 token · +10.71s
+[prefill] layer 77/78 · 13 token · +11.42s
+[prefill] layer 78/78 · 13 token · +11.58s
+PROFILO PREFILL (11.75s):
+PROFILE: expert-disk 189.239s service / 9.087s wait | expert-matmul 1.428s | attention 1.047s (including kvb 0.049s) | lm_head 0.004s | other 0.186s
+ATTENTION: projection/RoPE 0.751s | score-softmax-value 0.019s | output projection 0.227s
+METAL: blocchi GPU 178 | fallback CPU 0 | expert su GPU 4472 | setup 0.14s gpu-wall 1.25s (kernel 1.08s) scatter 0.01s
+The myths of Lucifer (from Judeo-Christian tradition) and Prometheus (from Greek
+[t=16  RSS 93.30 GB  hit 75%  1.49 tok/s  1.00 tok/fw]
+ tradition) are among the most profoundly resonant stories of rebellion in world mythology.
+[t=32  RSS 93.30 GB  hit 75%  1.46 tok/s  1.00 tok/fw]
+ Though they emerge from entirely different cultural and religious contexts, both figures serve as classic
+[t=48  RSS 93.30 GB  hit 75%  1.44 tok/s  1.00 tok/fw]
+ "Trickster-Lightbringer" archetypes—beings who defy
+[t=64  RSS 93.30 GB  hit 76%  1.48 tok/s  1.00 tok/fw]
+ the established cosmic order to grant humanity a transformative power, only to suffer immense and
+[t=80  RSS 93.30 GB  hit 76%  1.45 tok/s  1.00 tok/fw]
+ eternal consequences.
+
+Here is a in-depth comparison of the two figures across various dimensions
+[t=96  RSS 93.30 GB  hit 75%  1.40 tok/s  1.00 tok/fw]
+:
+
+### 1. The Names and Their Etymology
+*   **Luc
+[t=112  RSS 93.30 GB  hit 75%  1.40 tok/s  1.00 tok/fw]
+ifer:**** The name "Lucifer" originates from the Latin *luc
+[t=128  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+em ferre*, meaning "Light-Bringer" or "Morning-Star."
+[t=144  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+* In Christian tradition, this title became the proper name of the highest-ranking angel
+[t=160  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ who fell from grace. The use of "morning star" (Venus
+[t=176  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+) as a metaphor for a fallen king has roots in older Canaanite and
+[t=192  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ Babylonian mythology, particularly the myth of Helel ben Shahar ("Morning
+[t=208  RSS 93.30 GB  hit 76%  1.43 tok/s  1.00 tok/fw]
+ Star, son of Dawn") from the Book of Isaiah.
+*   **Prom
+[t=224  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+etheus:**** The name "Prometheus" is widely believed by linguists to
+[t=240  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ derive from the classical Greek *pro-* (meaning "before" or "fore
+[t=256  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+thought") and *methenko* (meaning "to learn" or "to
+[t=272  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ know"), though alternative theories suggest it may derive from the Vedic Sanskrit *
+[t=288  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+pramanth*,* meaning "firestick" or "tinder." Both
+[t=304  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+ figures are deeply intertwined with the symbolism of light and fire—Lucifer as the
+[t=320  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ Morning Star bringing the dawn, and Prometheus as the bearer of the divine spark/fire
+[t=336  RSS 93.30 GB  hit 76%  1.42 tok/s  1.00 tok/fw]
+.
+
+### 2. The Core Myth
+*   **Lucifer:****
+[t=352  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ In Christian tradition, Lucifer was an archangel of unparalleled beauty and power, second
+[t=368  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ only to God. However, pride consumed him. He sought to overthrow the divine
+[t=384  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ order and establish his own throne, leading a celestial rebellion against the Creator. Def
+[t=400  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+eated and cast down from Heaven to the underworld, he became identified with Satan,
+[t=416  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ the embodiment of evil and opposition to God's will.
+*   **Prometheus
+[t=432  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+:**** In Greek myth, Prometheus was a Titan (an older, primordial
+[t=448  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ race of deities) who famously defied Zeus by stealing the divine spark/fire
+[t=464  RSS 93.30 GB  hit 76%  1.41 tok/s  1.00 tok/fw]
+ (*pyrphoros*) and gifting it to early humanity. This act
+[t=480  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+ allowed humans to evolve from primitive innocence into civilized beings, but it also required a
+[t=496  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+ brutal, eternal punishment for Prometheus: he was chained to a rock in the Caucas
+[t=512  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+us Mountains, where an eagle (or vulture) daily fed on his "
+[t=528  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+immortal" liver.
+*   **Key Difference:**** Lucifer's myth is
+[t=544  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+ primarily spiritual and moral, focusing on a war of egos and the transition from
+[t=560  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+ innocence to sin. Prometheus' myth is largely material and cultural, focusing on humanity
+[t=576  RSS 93.30 GB  hit 76%  1.40 tok/s  1.00 tok/fw]
+'s transition from innocence to technological advancement.
+
+### .3. The Symbolism
+[t=592  RSS 93.30 GB  hit 75%  1.39 tok/s  1.00 tok/fw]
+ of Light and Fire
+*   **Lucifer:**** As the "Morning
+[t=608  RSS 93.30 GB  hit 75%  1.39 tok/s  1.00 tok/fw]
+ Star" (the planet Venus as it appears before dawn), Lucifer is the herald
+[t=624  RSS 93.30 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ of the sun/light. However, in Christian theology, Lucifer's light is merely
+[t=640  RSS 93.30 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ a reflection of the divine Light (God), which he rejects in favor of his
+[t=656  RSS 93.30 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ own flawed, ego-driven will. His "light" becomes a false, corrupted
+[t=672  RSS 93.30 GB  hit 76%  1.39 tok/s  1.00 tok/fw]
+ light—*a Morning Star that falls from the sky.*
+*   **Prom
+[t=688  RSS 93.30 GB  hit 75%  1.38 tok/s  1.00 tok/fw]
+etheus:**** Fire is the central symbol of Prometheus' myth. It represents *
+[t=704  RSS 93.30 GB  hit 75%  1.38 tok/s  1.00 tok/fw]
+techne*—divine power, knowledge, and transformative tool-making. Fire
+[t=720  RSS 93.30 GB  hit 75%  1.38 tok/s  1.00 tok/fw]
+ allows humanity to survive the elements, forge civilization, and ultimately challenge the gods themselves
+[t=736  RSS 93.30 GB  hit 75%  1.38 tok/s  1.00 tok/fw]
+. Crucially, while Prometheus gives humanity the "light" of knowledge, the
+[t=752  RSS 93.30 GB  hit 75%  1.38 tok/s  1.00 tok/fw]
+ myth also warns that this "light" comes with a heavy price.
+
+### 
+[t=768  RSS 93.30 GB  hit 75%  1.37 tok/s  1.00 tok/fw]
+ **4. The Nature of Their Rebellions**
+*   **Lucifer
+[t=784  RSS 93.30 GB  hit 75%  1.37 tok/s  1.00 tok/fw]
+:**** Rebels against divine law out of pride. The orthodox Christian view (he
+[t=800  RSS 93.30 GB  hit 75%  1.37 tok/s  1.00 tok/fw]
+avily influenced by authors like John Milton in *Paradise Lost*) frames
+[t=816  RSS 93.30 GB  hit 75%  1.37 tok/s  1.00 tok/fw]
+ Lucifer's rebellion as an act of sheer ego. He wishes to be God,
+[t=832  RSS 93.30 GB  hit 75%  1.37 tok/s  1.00 tok/fw]
+ not a servant to God. His rebellion is existential and spiritual.
+*   **
+[t=848  RSS 93.30 GB  hit 75%  1.36 tok/s  1.00 tok/fw]
+Prometheus:**** Rebels against divine authority out of a desire to help humanity.
+[t=864  RSS 93.30 GB  hit 75%  1.36 tok/s  1.00 tok/fw]
+ He doesn't want to *be* Zeus; he simply wants to limit Zeus
+[t=880  RSS 93.30 GB  hit 75%  1.36 tok/s  1.00 tok/fw]
+'s absolute power over human destiny. His rebellion is fundamentally altruistic.
+
+### 
+[t=896  RSS 93.30 GB  hit 75%  1.36 tok/s  1.00 tok/fw]
+.5. The Eternal Punishment
+*   Both figures are eternally
+[t=912  RSS 93.30 GB  hit 75%  1.36 tok/s  1.00 tok/fw]
+ condemned for their transgressions.
+*   **Lucifer:**** Is cast
+[t=928  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+ out of Heaven and into the underworld/realm of shadows. In orthodox Christianity,
+[t=944  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+ this fall is literal and eternal. He becomes Satan, the "Adversary
+[t=960  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+," bound to the darkness of his own spiritual exile.
+*   **Prometheus
+[t=976  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+:**** Is bound to a rock in the Caucasus Mountains, where his liver
+[t=992  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+ is perpetually eaten by an eagle/vulture (depending on the version of the
+[t=1008  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+ myth). This punishment is meant to be eternal, as Zeus demands he reveal the
+[t=1024  RSS 93.30 GB  hit 75%  1.35 tok/s  1.00 tok/fw]
+
+---
+prefill 13 tokens in 11.75s | decode 1024 tokens in 757.89s (1.35 tok/s) | expert hit rate 74.9% (pin 52.1% + lru 22.8%) | RSS 93.30 GB
+experts loaded/token: 599.4 (per-layer 7.99 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.00 tokens/forward (1023 forwards per 1024 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 1472.161s service / 455.181s wait | expert-matmul 165.440s | attention 126.134s (including kvb 0.000s) | lm_head 0.000s | other 11.138s
+ATTENTION: projection/RoPE 0.000s | score-softmax-value 0.000s | output projection 0.000s
+METAL-ATTN: layer GPU 79794 | gpu-wall 122.34s (kernel 94.10s | cpu-sched 0.92s gpu-sched 15.18s)
+METAL: blocchi GPU 139482 | fallback CPU 0 | expert su GPU 618272 | setup 18.12s gpu-wall 138.91s (kernel 74.65s) scatter 1.22s
+
+    (\      colibri v1.4.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2 · 744B MoE · int4 · streaming CPU
+             run
+             
+  ──────────────────────────────────────────────────────────
+# wall: 780s

@@ -24,32 +24,48 @@ Convert the official GLM-5.2 fmt=4 (grouped int4) container to fmt=2 (per-row in
 
 **No existing converter:** There is NO tool to convert fmt=4 → fmt=2 directly. The `coli convert` command only converts FP8→int4.
 
+**Dead end — do NOT try `coli convert --group-size 0`:** it looks like it should turn the
+fmt=4 container into per-row int4, but it cannot:
+- `coli convert` always *reads* from `--repo zai-org/GLM-5.2-FP8` (a ~750 GB HuggingFace
+  FP8 download); there is no `--indir` passthrough, so it never touches a local int4
+  container.
+- On `coli convert`, `--model` is the *output* directory (forwarded as `--outdir` to
+  `convert_fp8_to_int4.py`), and `--outdir` is not a valid `coli convert` switch at all
+  (argparse rejects it).
+- `convert_fp8_to_int4.py` expects FP8 e4m3 weights with `weight_scale_inv` sidecars;
+  fed an already-int4 colibri container (U8 nibbles + F32 `.qs` scales) it has no valid
+  dequant path.
+- `--group-size 0` only selects per-row scales *when quantizing from FP8* — it is not a
+  re-quantization of existing int4 data.
+
+A broken helper (`c/convert_fmt4_to_fmt2.sh`) built on this misconception was deleted;
+this section is the record of why that approach cannot work.
+
 ### 1.2 Required: fmt=4 → fmt=2 Converter
 
 A new converter script must be created to:
-1. Read existing packed int4 weights (unchanged between formats)
-2. Read grouped scales from `.qs` files
-3. Dequantize to approximate FP32
-4. Recompute per-row scales
-5. Write new `.qs` files with per-row scaling
+1. Read existing packed int4 weights (nibble *packing layout* is identical between formats)
+2. Read grouped scales from the `.qs` companion arrays (`O × ceil(I/64)` floats per tensor)
+3. Dequantize to approximate FP32: `w[o,i] = (nibble − 8) × qs[o×ng + i/64]`
+4. Recompute per-row scales (absmax/7) and **re-quantize the nibbles** — same math as
+   `quant_int4` in `c/tools/convert_fp8_to_int4.py` (`np.rint`, clamp `[-8,7]`, offset `+8`,
+   low nibble = even element)
+5. Write each tensor under the same name plus a `.qs` companion of exactly `O` floats
+   (the engine's `qt_resolve_fmt` in `c/colibri.c` then auto-detects fmt=2)
 
 **Size analysis:**
-- Source (fmt=4 grouped): 406 GB
+- Source (fmt=4 grouped): ~406 GB of shards (414 GB dir incl. `_inflight/` partials, skipped)
 - Target (fmt=2 per-row): ~372 GB
 - Savings: ~34 GB (from reduced scale file sizes)
 
-**Workflow (disk-safe):**
+**Workflow (NFS source → SSD destination, no deletion needed):**
 ```bash
-# Option A: Convert in-place using fmt4_to_fmt2.py (recommended)
-# 1. Create converter script (see c/tools/convert_fmt4_to_fmt2.py)
-# 2. Run conversion from NFS source to SSD destination
+# 1. Create converter script (c/tools/convert_fmt4_to_fmt2.py — spec above)
+# 2. Run conversion; source stays on NFS, output lands on the internal SSD
+#    (553 GiB free ≥ ~372 GB output, so no need to delete anything)
 python3 c/tools/convert_fmt4_to_fmt2.py \
   --indir /mnt/zfs1/noprot/mlx-lm/models/GLM-5.2-colibri-int4-g64-with-int8-mtp \
   --outdir ~/mlx-models/GLM-5.2-colibri-int4-perrow
-
-# Option B: Delete fmt=4 from SSD first, then convert
-rm -rf ~/mlx-models/GLM-5.2-colibri-int4-g64-with-int8-mtp
-# Then run converter above
 ```
 
 **Output:** New directory `~/mlx-models/GLM-5.2-colibri-int4-perrow` (~372 GB)
@@ -212,8 +228,8 @@ Add row to community benchmarks table:
 - **Expert hit rate:** Record hit rate for each config
 - **Thermals:** Monitor if M1 Ultra throttles during long runs (1024 tokens @ ~2 tok/s = ~8-10 min)
 - **Quality caveat:** fmt=2 (per-row) has ~9pp lower quality than fmt=4 (grouped scales) — this is expected and documented in quant_ablation.py
-- **Source format:** The source model is fmt=4 (grouped int4, group_size=64), NOT FP8. Conversion requires a fmt=4→fmt=2 converter, not `coli convert`.
-- **Disk space:** fmt=4 source is 406 GB; fmt=2 output is ~372 GB. Delete fmt=4 from SSD before conversion to avoid 778 GB peak requirement.
+- **Source format:** The source model is fmt=4 (grouped int4, group_size=64), NOT FP8. Conversion requires a fmt=4→fmt=2 converter, not `coli convert` (see Phase 1.1 for why `--group-size 0` is a dead end).
+- **Disk space:** The fmt=4 source lives on NFS (`/mnt/zfs1/noprot/mlx-lm/models/...`, ~406 GB of shards); fmt=2 output is ~372 GB on the internal SSD. Source and destination never coexist on the same volume — 553 GiB free on the SSD suffices with nothing to delete. Skip `_meta/` and `_inflight/` in the source dir.
 
 ---
 

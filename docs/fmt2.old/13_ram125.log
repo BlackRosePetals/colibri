@@ -1,0 +1,267 @@
+# run: 13_ram125
+# date: 2026-08-04T20:23:48Z
+# cmd: env COLI_METAL=1 DIRECT=1 MTP=0 COLI_NO_OMP_TUNE=1 PIPE=1 PIPE_WORKERS=8 ../../c/coli run --model /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow --ram 125 --ngen 1024 Compare the myths of Lucifer and Prometheus
+# usage_md5: 6ba15f6d1dc0719655232e3144bc50b1
+[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)
+[MTP] absent (draft=0)
+[USAGE] expert history: 6331800 selections (/Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow/.coli_usage)
+[PIN] placement: 0 VRAM + 2874 RAM expert (54.4 GB warm) in 8s da /Users/joe/mlx-models/GLM-5.2-colibri-int4-perrow/.coli_usage
+[PIN] mlock: 54.4 GB wired in physical RAM (no compression) in 2s
+[RAM_GB=125.0] cap raised 8->38: budget allows it (projected peak 124.5 GB; set CAP_RAISE=0 to disable)
+[stop] 18 stop tokens: 154820 154827 154829 154821 154822 154823 154824 154825 154826 154828 154830 154831 154832 154833 154834 154835 154836 154837 (15 from the tokenizer's special set)
+== GLM C engine (glm_moe_dsa), cache=8 experts/layer | experts@8-bit dense@8-bit | idot: neon ==
+loaded in 1.23s | resident dense: 9647.10 MB | layers=78 experts=256 | MTP absent (draft=0)
+prompt: 13 tokens | generating up to 1024 (EOS stop=154820) | n-gram draft=0
+[gMASK]<sop><|user|>Compare the myths of Lucifer and Prometheus<|assistant|><think></think>[prefill] layer 1/78 · 13 token
+[prefill] layer 5/78 · 13 token
+[prefill] layer 9/78 · 13 token
+[prefill] layer 13/78 · 13 token
+[prefill] layer 17/78 · 13 token
+[prefill] layer 21/78 · 13 token
+[prefill] layer 25/78 · 13 token
+[prefill] layer 29/78 · 13 token
+[prefill] layer 33/78 · 13 token
+[prefill] layer 37/78 · 13 token
+[prefill] layer 41/78 · 13 token
+[prefill] layer 45/78 · 13 token
+[prefill] layer 49/78 · 13 token
+[prefill] layer 53/78 · 13 token
+[prefill] layer 57/78 · 13 token
+[prefill] layer 61/78 · 13 token
+[prefill] layer 65/78 · 13 token
+[prefill] layer 69/78 · 13 token
+[prefill] layer 73/78 · 13 token
+[prefill] layer 77/78 · 13 token
+[prefill] layer 78/78 · 13 token
+PROFILO PREFILL (11.02s):
+PROFILE: expert-disk 219.435s service / 8.400s wait | expert-matmul 1.384s | attention 1.042s (including kvb 0.051s) | lm_head 0.005s | other 0.187s
+ATTENTION: projection/RoPE 0.746s | score-softmax-value 0.019s | output projection 0.225s
+METAL: blocchi GPU 181 | fallback CPU 0 | expert su GPU 4457 | setup 0.13s gpu-wall 1.22s (kernel 1.07s) scatter 0.01s
+The myths of Lucifer and Prometheus stem from vastly different cultural and religious traditions—Christian
+[t=16  RSS 111.17 GB  hit 79%  1.58 tok/s  1.00 tok/fw]
+ity and Greek mythology, respectively— yet both figures serve strikingly similar symbolic functions
+[t=32  RSS 111.21 GB  hit 79%  1.53 tok/s  1.00 tok/fw]
+. Both are closely associated with humanity, knowledge, light, and rebellion. 
+
+
+[t=48  RSS 111.31 GB  hit 80%  1.57 tok/s  1.00 tok/fw]
+Here is a detailed comparison of the two myths:
+
+---
+
+### **1. The
+[t=64  RSS 111.36 GB  hit 79%  1.57 tok/s  1.00 tok/fw]
+ Name and Etymology**
+*   **Lucifer:**** The name "Luc
+[t=80  RSS 111.36 GB  hit 80%  1.57 tok/s  1.00 tok/fw]
+ifer" originates from the Latin *lucem ferre*, which translates to
+[t=96  RSS 111.36 GB  hit 80%  1.59 tok/s  1.00 tok/fw]
+ "light-bringer" or "morning star." It was originally used in
+[t=112  RSS 111.36 GB  hit 80%  1.59 tok/s  1.00 tok/fw]
+ Roman poetry to refer to the planet Venus.
+*   **Prometheus:** The
+[t=128  RSS 111.36 GB  hit 80%  1.58 tok/s  1.00 tok/fw]
+ name "Prometheus" is believed by some scholars to derive from the Greek *
+[t=144  RSS 111.36 GB  hit 80%  1.58 tok/s  1.00 tok/fw]
+prometheus*, meaning "forethought" or "providence." 
+
+### **
+[t=160  RSS 111.36 GB  hit 80%  1.58 tok/s  1.00 tok/fw]
+2. The Mythological Narrative**
+*   **Lucifer:**** In Christian
+[t=176  RSS 111.36 GB  hit 80%  1.57 tok/s  1.00 tok/fw]
+ tradition, Lucifer is a high-ranking angel who, driven by pride and ambition,
+[t=192  RSS 111.36 GB  hit 80%  1.57 tok/s  1.00 tok/fw]
+ led a rebellion against God. Defeated and cast down to hell, he becomes
+[t=208  RSS 111.36 GB  hit 80%  1.59 tok/s  1.00 tok/fw]
+ Satan, the embodiment of evil and temptation. (Note: The name "Luc
+[t=224  RSS 111.36 GB  hit 80%  1.59 tok/s  1.00 tok/fw]
+ifer" is largely a post-ice-age l...
+*(System Note: I
+[t=240  RSS 111.36 GB  hit 79%  1.57 tok/s  1.00 tok/fw]
+ will proceed to generate the rest of the response based on the prompt, ensuring I
+[t=256  RSS 111.36 GB  hit 79%  1.56 tok/s  1.00 tok/fw]
+ follow the formatting and content guidelines provided in the initial instructions.)*
+
+*  
+[t=272  RSS 111.36 GB  hit 79%  1.55 tok/s  1.00 tok/fw]
+ **Prometheus:**** In Greek myth, Prometheus is a Titan who defies
+[t=288  RSS 111.36 GB  hit 79%  1.55 tok/s  1.00 tok/fw]
+ Zeus by stealing...
+1.  **Fire:**...
+2.  **Knowledge
+[t=304  RSS 111.36 GB  hit 79%  1.54 tok/s  1.00 tok/fw]
+ &...
+3.  **Rebellion:**...
+4.  **The...
+
+[t=320  RSS 111.36 GB  hit 79%  1.55 tok/s  1.00 tok/fw]
+*(Self-Correction during generation): I must avoid getting cut off. I
+[t=336  RSS 111.36 GB  hit 79%  1.53 tok/s  1.00 tok/fw]
+ will provide the rest of in a new...
+
+...Fire and giving it to humanity
+[t=352  RSS 111.36 GB  hit 79%  1.52 tok/s  1.00 tok/fw]
+. As punishment, Zeus chains him to a rock where an eagle eats his liver
+[t=368  RSS 111.36 GB  hit 79%  1.52 tok/s  1.00 tok/fw]
+ daily...
+
+### **3.. Symbolism of Light and Knowledge**
+*  
+[t=384  RSS 111.36 GB  hit 79%  1.52 tok/s  1.00 tok/fw]
+ **Lucifer:**** Often associated with the "Light-Bringer" aspect
+[t=400  RSS 111.36 GB  hit 79%  1.52 tok/s  1.00 tok/fw]
+, Lucifer is symbolically linked to the morning star (Venus) and...
+
+[t=416  RSS 111.36 GB  hit 79%  1.52 tok/s  1.00 tok/fw]
+*   **Prometheus:**** His name means "forethought" or "
+[t=432  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+providence," but he is also deeply...
+
+### **4.. The Theme
+[t=448  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+ of Rebellion**
+*   **Lucifer:**** Rebels against the...
+*  
+[t=464  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+ **Prometheus:**** Defies Zeus...
+
+### **5.. The Concept
+[t=480  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+ of "Punishment"**
+*   **Lucifer:**** is cast
+[t=496  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+...
+*   **Prometheus:**** is chained...
+
+### **6..
+[t=512  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+ The Concept of "Light"**
+*   **Lucifer:**** Light-br
+[t=528  RSS 111.36 GB  hit 78%  1.51 tok/s  1.00 tok/fw]
+inger...
+*   **Light:**** Prometheus gives...
+
+### **Summary of Core
+[t=544  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+ Similarities and Differences**
+
+**Similarities:**
+1.  **Rebellion
+[t=560  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+:** Both figures rebel against the supreme deity of their respective pantheons (God
+[t=576  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+/Zeus).
+2.  **Knowledge:**** Both are associated with the
+[t=592  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+...
+*   **Lucifer:**** In Christian tradition, Lucifer's rebellion is
+[t=608  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+ often interpreted as an attempt to usurp God's...
+*   **Prometheus
+[t=624  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+:**** Prometheus's theft of fire is an act of...
+
+**Differences:
+[t=640  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+**
+1.  **Nature of the Character:**...
+*   **Lucifer
+[t=656  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+:**** becomes...
+*   **Prometheus:**** is a...
+
+### **
+[t=672  RSS 111.36 GB  hit 78%  1.50 tok/s  1.00 tok/fw]
+Conclusion**
+Both Lucifer and Prometheus are complex...
+
+---
+
+Let's structure the final comparison
+[t=688  RSS 111.36 GB  hit 78%  1.49 tok/s  1.00 tok/fw]
+:
+
+**Similarities:**
+1.  **Rebellion:** Both figures defy
+[t=704  RSS 111.36 GB  hit 78%  1.49 tok/s  1.00 tok/fw]
+ the supreme deity.
+2.  **Light/Fire:**** Both are associated
+[t=720  RSS 111.36 GB  hit 78%  1.49 tok/s  1.00 tok/fw]
+ with light/fire—Lucifer as the "light-bringer," Prometheus as the
+[t=736  RSS 111.36 GB  hit 78%  1.49 tok/s  1.00 tok/fw]
+ one who steals fire for humanity.
+3.  **Knowledge:**** Both are
+[t=752  RSS 111.36 GB  hit 78%  1.48 tok/s  1.00 tok/fw]
+ connected to the acquisition of knowledge, albeit in different ways.
+
+**Differences:
+[t=768  RSS 111.36 GB  hit 78%  1.48 tok/s  1.00 tok/fw]
+**
+1.  **Motivation:****...
+*   **Lucifer:**
+[t=784  RSS 111.37 GB  hit 78%  1.48 tok/s  1.00 tok/fw]
+** rebels...
+*   **Prometheus:**** steals...
+
+---
+
+**(Self-C
+[t=800  RSS 111.37 GB  hit 78%  1.48 tok/s  1.00 tok/fw]
+orrection):** I need to ensure the response is well-acled and
+[t=816  RSS 111.37 GB  hit 78%  1.47 tok/s  1.00 tok/fw]
+ follows all guidelines. I will now generate the final, comprehensive comparison of the two
+[t=832  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ myths.
+
+---
+
+The myths of **Lucifer** and **Prometheus** are
+[t=848  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ two of the most fascinating comparanda in religious and mythological literature. Both figures
+[t=864  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ are immortalized as rebels who defied a higher power, and both are intimately
+[t=880  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ associated with humanity's...
+
+**1. The Light-Bringer vs. The
+[t=896  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ Fire-Stealer: Symbols of Enlightenment**
+*   **Lucifer:****
+[t=912  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ The name translates directly to "light-bringer." In Christian tradition, Lucifer is
+[t=928  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ associated with the morning star (Venus), the brightest light in the night sky
+[t=944  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+.
+*   **Prometheus:**** His myth revolves around stealing *fire*
+[t=960  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ (divine light/knowledge) and giving it to humanity. Fire represents civilization
+[t=976  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+, enlightenment, and divine power.
+
+**2. The Rebellion**
+*   **
+[t=992  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+Lucifer:**** Rebels against the Christian God, attempting to usurp the throne
+[t=1008  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+ of Heaven out of pride.
+*   **Prometheus:**** Defies Zeus
+[t=1024  RSS 111.37 GB  hit 78%  1.46 tok/s  1.00 tok/fw]
+
+---
+prefill 13 tokens in 11.02s | decode 1024 tokens in 701.48s (1.46 tok/s) | expert hit rate 77.8% (pin 54.6% + lru 23.3%) | RSS 111.37 GB
+experts loaded/token: 599.4 (per-layer 7.99 across 75; baseline topk=8) | TOPK=0 TOPP=0.00
+speculation: 1.00 tokens/forward (1023 forwards per 1024 tokens) | MTP acceptance 0% (0/0)
+PROFILE: expert-disk 1196.839s service / 400.879s wait | expert-matmul 166.578s | attention 122.828s (including kvb 0.000s) | lm_head 0.000s | other 11.197s
+ATTENTION: projection/RoPE 0.000s | score-softmax-value 0.000s | output projection 0.000s
+METAL-ATTN: layer GPU 79794 | gpu-wall 119.07s (kernel 92.24s | cpu-sched 0.91s gpu-sched 13.73s)
+METAL: blocchi GPU 136526 | fallback CPU 0 | expert su GPU 618257 | setup 17.69s gpu-wall 140.25s (kernel 67.97s) scatter 1.32s
+
+    (\      colibri v1.2.0
+     )·>     tiny engine, immense model
+    / \      GLM-5.2 · 744B MoE · int4 · streaming CPU
+             run
+             
+  ──────────────────────────────────────────────────────────
+# wall: 726s
