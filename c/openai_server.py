@@ -782,7 +782,18 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
     if enable_thinking:
-        effort = "High" if reasoning_effort == "high" else "Max"
+        # The endpoint accepts none/minimal/low/medium/high/xhigh, and this used
+        # to render every one of them except "high" as Max -- so a client asking
+        # for `minimal` got more reasoning than one asking for `high`, and the
+        # mapping was not even monotonic (#809). On a single machine that is not
+        # a cosmetic mismatch: unrequested reasoning spends the token budget
+        # before the answer starts.
+        #
+        # GLM-5.2's template takes a word here, not a number, so the levels map
+        # onto the ones it understands, in order. `none` cannot appear: it turns
+        # thinking off upstream and never reaches this branch.
+        effort = {"minimal": "Low", "low": "Low", "medium": "Medium",
+                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "High")
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
