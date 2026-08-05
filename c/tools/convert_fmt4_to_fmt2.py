@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """fmt=4 -> fmt=2 converter: GLM-5.2 colibri container, grouped int4 (gs=64) -> per-row int4.
 
-Motivation: the Metal backend rejects fmt=4 at every entry point (docs/metal_dispatch_gap.md);
-fmt=2 (per-row int4) is the format with full backend support. Spec: docs/metal_fmt2.md Phase 1.2.
+Motivation: the Metal backend rejects fmt=4 at its attention/dispatch entry points
+(#585/#587); fmt=2 (per-row int4) is the format with full backend support. Converted
+container benchmarked in docs/METAL-M1ULTRA-FMT2-REPORT.md.
 
 Container layout (both formats): every quantized tensor is a FLAT 1-D U8 array `name` (packed
 nibbles, offset binary: value = nibble - 8, LOW nibble = even element) plus a FLAT 1-D F32
@@ -26,7 +27,7 @@ Conversion math (all dims are multiples of 64):
   3. write flat U8 [O*I/2] + flat F32 .qs of exactly O floats -> engine auto-detects fmt=2
 
 USO:
-  source c/venv.sh
+  python3 -m pip install numpy safetensors
   python3 c/tools/convert_fmt4_to_fmt2.py --selftest
   python3 c/tools/convert_fmt4_to_fmt2.py --indir SRC --outdir DST --dry-run
   python3 c/tools/convert_fmt4_to_fmt2.py --indir SRC --outdir DST [--workers 8]
