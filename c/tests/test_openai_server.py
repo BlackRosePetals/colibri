@@ -1748,5 +1748,44 @@ class ConnectionLimitTest(unittest.TestCase):
                          "dripping connections were never reclaimed")
 
 
+class ReasoningEffortTest(unittest.TestCase):
+    """render_chat mapped every level except "high" onto Max (#809).
+
+    The endpoint accepts none/minimal/low/medium/high/xhigh. Four of the five
+    that enable thinking rendered Max, so a client asking for `minimal` got
+    more reasoning than one asking for `high` -- and on a single machine
+    unrequested reasoning spends the token budget before the answer starts.
+    """
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def effort(self, level):
+        import re
+        text = render_chat(self.MESSAGES, enable_thinking=True,
+                           reasoning_effort=level)
+        found = re.search(r"Reasoning Effort: (\w+)", text)
+        return found.group(1) if found else None
+
+    def test_levels_are_distinct_and_ordered(self):
+        rendered = [self.effort(l) for l in
+                    ("minimal", "low", "medium", "high", "xhigh")]
+        rank = {"Low": 0, "Medium": 1, "High": 2, "Max": 3}
+        scores = [rank[r] for r in rendered]
+        self.assertEqual(scores, sorted(scores), rendered)
+        self.assertLess(scores[0], scores[-1],
+                        "minimal and xhigh render the same effort")
+
+    def test_minimal_is_not_max(self):
+        """The reported symptom, pinned on its own."""
+        self.assertNotEqual(self.effort("minimal"), "Max")
+        self.assertNotEqual(self.effort("low"), "Max")
+        self.assertNotEqual(self.effort("medium"), "Max")
+
+    def test_thinking_off_emits_no_effort_line(self):
+        text = render_chat(self.MESSAGES, enable_thinking=False,
+                           reasoning_effort="xhigh")
+        self.assertNotIn("Reasoning Effort", text)
+
+
 if __name__ == "__main__":
     unittest.main()
