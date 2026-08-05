@@ -1038,3 +1038,6 @@ bench: iobench$(EXE)
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
+
+tests/test_kv_ring_grow$(EXE): tests/test_kv_ring_grow.c inkling.c st.h json.h compat.h kv_prefix.h
+	$(CC) $(CFLAGS) tests/test_kv_ring_grow.c -o tests/test_kv_ring_grow$(EXE) $(LDFLAGS)
