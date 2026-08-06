@@ -385,9 +385,10 @@ class InklingStreamSplit:
     answer). Buffers partial markers across chunk boundaries so a marker split
     between two DATA frames never leaks."""
 
-    def __init__(self, on_content, on_reasoning=None):
+    def __init__(self, on_content, on_reasoning=None, on_reasoning_end=None):
         self.on_content = on_content
         self.on_reasoning = on_reasoning
+        self.on_reasoning_end = on_reasoning_end
         self.mode = "content"
         self.buf = ""
 
@@ -404,6 +405,8 @@ class InklingStreamSplit:
                 return
             i, m = min(hits)
             self._emit(self.buf[:i])
+            if m == INK_TEXT and self.mode == "reasoning" and self.on_reasoning_end:
+                self.on_reasoning_end()
             self.mode = "reasoning" if m == INK_THINK else "content"
             self.buf = self.buf[i + len(m):]
 
@@ -868,6 +871,17 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
+
+
+def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                         tool_choice=None, audio_out=None):
+    """Render a chat request with the active engine's native prompt contract."""
+    if ARCH == "inkling":
+        return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, audio_out=audio_out)
+    renderer = (render_chat_kimi if ARCH == "kimi" else
+                render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
+    return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -2513,16 +2527,9 @@ class APIHandler(BaseHTTPRequestHandler):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else
-                    render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
         audio_clips = [] if ARCH == "inkling" else None
-        if audio_clips is not None:
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice, audio_out=audio_clips)
-        else:
-            prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                              tool_choice)
+        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+                                      tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
                         audio=b"".join(audio_clips) if audio_clips else None)
@@ -2556,8 +2563,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
-                             tools, tool_choice)
+        prompt = render_chat_for_arch(messages, enable_thinking,
+                                      "high" if enable_thinking else None,
+                                      tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2588,8 +2596,12 @@ class APIHandler(BaseHTTPRequestHandler):
         def blocks_and_stop(text, stats):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
-            if enable_thinking:
+            reasoning = ""
+            if ARCH == "inkling":
+                text, reasoning = split_inkling(text)
+            elif enable_thinking:
                 reasoning, text = split_thinking_reply(text)
+            if enable_thinking:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
@@ -2727,8 +2739,13 @@ class APIHandler(BaseHTTPRequestHandler):
                               "signature": ANTHROPIC_LOCAL_SIGNATURE}})
                 send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
-            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                     if enable_thinking else None)
+            if ARCH == "inkling":
+                split = InklingStreamSplit(emit_answer,
+                                           emit_thinking if enable_thinking else None,
+                                           close_thinking if enable_thinking else None)
+            else:
+                split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
+                         if enable_thinking else None)
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -2740,7 +2757,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
             stop_filter.finish()
             if split:
-                split.finish()
+                split.close()
                 close_thinking()               # budget exhaustion before </think>
             if tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
