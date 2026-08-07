@@ -1212,7 +1212,16 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 m->t_eload+=now_s()-t0;
             }
 #ifdef COLI_VULKAN
-            if(g_k3_vk&&qof[j]>=0) vk_expert_try_upload(m,li,uids[base+j],use[j]);
+            /* #848: offer EVERY expert used this layer, not only the ones that just
+             * came off disk. qof[j]>=0 means "this was a RAM-cache miss", which is the
+             * right gate for the readiness wait above and the wrong one here: it made
+             * the VRAM tier reachable only through disk reads, so the fill stopped the
+             * moment the RAM cache went warm and never resumed. K3_VK_GB was then a cap
+             * that could not be reached rather than the thing that stopped the fill.
+             * Re-offering a resident expert is nearly free -- vk_expert_try_upload
+             * returns on `v->w1` before it touches the per-step quota -- and it reads
+             * only s->buf, which an LRU slot and a ws[] slot populate identically. */
+            if(g_k3_vk) vk_expert_try_upload(m,li,uids[base+j],use[j]);
 #endif
             int f=pfirst[base+j];
             for(int p2=0;p2<pcnt[base+j];p2++){
@@ -1751,6 +1760,18 @@ static void model_state_reset(Model *m){
     m->Lc=NULL; m->Rc=NULL; m->max_t=0;
 }
 
+/* Decide reuse before changing the state it describes. A miss discards the
+ * old recurrent/KV state first and allocates a fresh target; a hit grows the
+ * existing target while preserving its prefix. The old order allocated first,
+ * then reset on the inevitable first-request miss, leaving Lc/Rc NULL when
+ * MLA prefill immediately indexed them (#855). */
+static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
+    int reuse=kv_prefix_reuse(&m->kvp,ids,np);
+    if(!reuse) model_state_reset(m);
+    kv_alloc(m,max_t);
+    return reuse;
+}
+
 static int serve_stdin_readable(void){
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
      * La versione portabile (con i fix #139/#195) vive in compat.h, incluso via st.h. */
@@ -1821,13 +1842,12 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
      * the conversation, and every replayed position pulled its experts off
      * disk again. When this prompt begins with the sequence the state already
      * holds, that state IS the state at that position: keep it and prefill
-     * only the tail. This is why kv_alloc above must run FIRST and must keep
-     * its buffers: growing them discards the positions fed[] describes.
+     * only the tail. The reuse decision must happen BEFORE a miss resets that
+     * state; allocation then either starts fresh or grows the preserved state.
      * At least one new token is required, since the state cannot be rewound.
      * Either the reused positions are token-identical or nothing is reused;
      * the emitted tokens are unchanged in both cases. */
-    kv_alloc(m,np+q->max_tok+8);
-    int reuse=kv_prefix_reuse(&m->kvp, ids, np);
+    int reuse=prepare_request_state(m,ids,np,np+q->max_tok+8);
     if(getenv("K3_PREFIX_LOG")){
         /* Report the decision either way, with the state behind a "no".
          * "It did not get faster" is otherwise the same observation as
@@ -1841,7 +1861,6 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
                     (m->kvp.len>0 && m->kvp.len<np) ? " (diverged)" : "");
         fflush(stderr);
     }
-    if(!reuse) model_state_reset(m);
     int chunk=getenv("K3_CHUNK")?atoi(getenv("K3_CHUNK")):32;
     if(chunk<1) chunk=1; if(chunk>512) chunk=512;
     double t0=now_s(), a0=m->t_attn, e0=m->t_moe, d0=m->t_eload, h0=m->t_head;

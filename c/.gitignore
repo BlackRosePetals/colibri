@@ -29,3 +29,4 @@ tests/test_int3
 tests/test_int3_load
 tests/test_tok_o200k
 tests/test_pipe_block
+tests/test_kimi_request_state
