@@ -1077,6 +1077,7 @@ int coli_v4_expert_store_open_planned(
 /* ######## deepseek_v4_math.c ######## */
 #include "deepseek_v4_internal.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdlib.h>
 
@@ -1232,15 +1233,11 @@ int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
     return 0;
 }
 
-int coli_v4_rope_precompute(float *cosines, float *sines,
-                            int dimension, int sequence_length,
-                            int original_sequence_length, float base,
-                            float factor, int beta_fast, int beta_slow) {
-    if (!cosines || !sines || dimension < 2 || (dimension & 1) ||
-        sequence_length < 1 || !(base > 1.0f) || !(factor > 0.0f))
-        return -1;
-    int pairs = dimension / 2;
-    int low = 0, high = -1;
+static void rope_yarn_bounds(int dimension, int original_sequence_length,
+                             float base, int beta_fast, int beta_slow,
+                             int *low, int *high) {
+    *low = 0;
+    *high = -1;
     if (original_sequence_length > 0) {
         const float two_pi = 6.2831853071795864769f;
         float denominator = 2.0f * logf(base);
@@ -1248,27 +1245,82 @@ int coli_v4_rope_precompute(float *cosines, float *sines,
             original_sequence_length / (beta_fast * two_pi)) / denominator;
         float high_value = dimension * logf(
             original_sequence_length / (beta_slow * two_pi)) / denominator;
-        low = (int)floorf(low_value);
-        high = (int)ceilf(high_value);
-        if (low < 0) low = 0;
-        if (high > dimension - 1) high = dimension - 1;
+        *low = (int)floorf(low_value);
+        *high = (int)ceilf(high_value);
+        if (*low < 0) *low = 0;
+        if (*high > dimension - 1) *high = dimension - 1;
     }
+}
+
+static float rope_frequency(int pair, int dimension,
+                            int original_sequence_length, float base,
+                            float factor, int low, int high) {
+    float frequency = 1.0f / powf(base, (float)(2 * pair) / dimension);
+    if (original_sequence_length > 0) {
+        float width = high == low ? 0.001f : (float)(high - low);
+        float ramp = (pair - low) / width;
+        if (ramp < 0.0f) ramp = 0.0f;
+        if (ramp > 1.0f) ramp = 1.0f;
+        float smooth = 1.0f - ramp;
+        frequency = frequency / factor * (1.0f - smooth) + frequency * smooth;
+    }
+    return frequency;
+}
+
+int coli_v4_rope_precompute_range(
+    float *cosines, float *sines, int dimension, int start_position,
+    int sequence_length, int original_sequence_length, float base,
+    float factor, int beta_fast, int beta_slow) {
+    if (!cosines || !sines || dimension < 2 || (dimension & 1) ||
+        start_position < 0 || sequence_length < 1 ||
+        !(base > 1.0f) || !(factor > 0.0f))
+        return -1;
+    if (start_position > INT_MAX - (sequence_length - 1)) return -1;
+    int pairs = dimension / 2;
+    int low = 0, high = -1;
+    rope_yarn_bounds(dimension, original_sequence_length, base,
+                     beta_fast, beta_slow, &low, &high);
     for (int pair = 0; pair < pairs; pair++) {
-        float frequency = 1.0f / powf(base, (float)(2 * pair) / dimension);
-        if (original_sequence_length > 0) {
-            float width = high == low ? 0.001f : (float)(high - low);
-            float ramp = (pair - low) / width;
-            if (ramp < 0.0f) ramp = 0.0f;
-            if (ramp > 1.0f) ramp = 1.0f;
-            float smooth = 1.0f - ramp;
-            frequency = frequency / factor * (1.0f - smooth) + frequency * smooth;
-        }
-        for (int position = 0; position < sequence_length; position++) {
-            size_t index = (size_t)position * pairs + pair;
-            float angle = position * frequency;
+        float frequency = rope_frequency(pair, dimension,
+                                         original_sequence_length, base,
+                                         factor, low, high);
+        for (int item = 0; item < sequence_length; item++) {
+            size_t index = (size_t)item * pairs + pair;
+            float angle = (start_position + item) * frequency;
             cosines[index] = cosf(angle);
             sines[index] = sinf(angle);
         }
+    }
+    return 0;
+}
+
+int coli_v4_rope_precompute(float *cosines, float *sines,
+                            int dimension, int sequence_length,
+                            int original_sequence_length, float base,
+                            float factor, int beta_fast, int beta_slow) {
+    return coli_v4_rope_precompute_range(
+        cosines, sines, dimension, 0, sequence_length,
+        original_sequence_length, base, factor, beta_fast, beta_slow);
+}
+
+int coli_v4_rope_position(float *cosines, float *sines,
+                          int dimension, int position,
+                          int original_sequence_length, float base,
+                          float factor, int beta_fast, int beta_slow) {
+    if (!cosines || !sines || dimension < 2 || (dimension & 1) ||
+        position < 0 || !(base > 1.0f) || !(factor > 0.0f))
+        return -1;
+    int pairs = dimension / 2;
+    int low = 0, high = -1;
+    rope_yarn_bounds(dimension, original_sequence_length, base,
+                     beta_fast, beta_slow, &low, &high);
+    for (int pair = 0; pair < pairs; pair++) {
+        float frequency = rope_frequency(pair, dimension,
+                                         original_sequence_length, base,
+                                         factor, low, high);
+        float angle = position * frequency;
+        cosines[pair] = cosf(angle);
+        sines[pair] = sinf(angle);
     }
     return 0;
 }
@@ -1626,22 +1678,13 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
-        float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
-        float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
-        if (!all_cos || !all_sin || coli_v4_rope_precompute(
-                all_cos, all_sin, rope_dim, position + 1,
+        if (coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
                 compressed ? config->original_max_position_embeddings : 0,
                 compressed ? config->compress_rope_theta : config->rope_theta,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
-        if (!result) {
-            memcpy(cosines, all_cos + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*cosines));
-            memcpy(sines, all_sin + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*sines));
-        }
-        free(all_sin); free(all_cos);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
@@ -2024,22 +2067,13 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
-        float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
-        float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
-        if (!all_cos || !all_sin || coli_v4_rope_precompute(
-                all_cos, all_sin, rope_dim, position + 1,
+        if (coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
                 compressed ? config->original_max_position_embeddings : 0,
                 compressed ? config->compress_rope_theta : config->rope_theta,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
-        if (!result) {
-            memcpy(cosines, all_cos + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*cosines));
-            memcpy(sines, all_sin + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*sines));
-        }
-        free(all_sin); free(all_cos);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
@@ -2211,10 +2245,11 @@ int coli_v4_attention_window_batch_ref(
     int *compressed_counts = calloc((size_t)batch, sizeof(*compressed_counts));
     int *compressed_indices = malloc((size_t)batch * config->index_topk *
                                      sizeof(*compressed_indices));
-    int end_position = start_position + batch;
     size_t rope_pairs = (size_t)rope_dim / 2;
-    float *cosines = malloc((size_t)end_position * rope_pairs * sizeof(*cosines));
-    float *sines = malloc((size_t)end_position * rope_pairs * sizeof(*sines));
+    /* The batch consumes only its own positions.  A table from position zero
+     * made long-context prefill scale with history that is never read here. */
+    float *cosines = malloc((size_t)batch * rope_pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)batch * rope_pairs * sizeof(*sines));
     if (!qa || !q || !kv || !attended || !oa || !norm || !selected_counts ||
         !compressed_counts || !compressed_indices || !cosines || !sines) {
         free(sines); free(cosines); free(compressed_indices);
@@ -2287,15 +2322,14 @@ int coli_v4_attention_window_batch_ref(
     }
 
     int compressed = weights->plan.compression_ratio != 0;
-    if (!result) result = coli_v4_rope_precompute(
-        cosines, sines, rope_dim, end_position,
+    if (!result) result = coli_v4_rope_precompute_range(
+        cosines, sines, rope_dim, start_position, batch,
         compressed ? config->original_max_position_embeddings : 0,
         compressed ? config->compress_rope_theta : config->rope_theta,
         config->rope_factor, config->rope_beta_fast, config->rope_beta_slow);
     for (int item = 0; !result && item < batch; item++) {
-        int position = start_position + item;
-        const float *item_cos = cosines + (size_t)position * rope_pairs;
-        const float *item_sin = sines + (size_t)position * rope_pairs;
+        const float *item_cos = cosines + (size_t)item * rope_pairs;
+        const float *item_sin = sines + (size_t)item * rope_pairs;
         float *item_q = q + (size_t)item * q_width;
         float *item_kv = kv + (size_t)item * head_dim;
         for (int head = 0; head < heads; head++) {
@@ -2363,8 +2397,8 @@ int coli_v4_attention_window_batch_ref(
                 kv_count, topk, 1.0f / sqrtf((float)head_dim));
         }
         free(all_kv); free(indices);
-        const float *item_cos = cosines + (size_t)position * rope_pairs;
-        const float *item_sin = sines + (size_t)position * rope_pairs;
+        const float *item_cos = cosines + (size_t)item * rope_pairs;
+        const float *item_sin = sines + (size_t)item * rope_pairs;
         for (int head = 0; !result && head < heads; head++) {
             float *rope = item_attended + (size_t)head * head_dim +
                           head_dim - rope_dim;
@@ -2406,7 +2440,8 @@ int coli_v4_attention_window_batch_ref(
     if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
     if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
 
-    free(group_outputs); free(group_inputs); free(sines); free(cosines);
+    free(group_outputs); free(group_inputs);
+    free(sines); free(cosines);
     free(compressed_indices); free(compressed_counts); free(selected_counts);
     free(norm); free(oa); free(attended); free(kv); free(q); free(qa);
     return result ? set_error(error, error_size, "batched attention failed") : 0;
@@ -2622,11 +2657,10 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 
     int rope_position = position + 1 - state->ratio;
     int pairs = state->rope_dim / 2;
-    size_t table_count = (size_t)(rope_position + 1) * pairs;
-    float *cosines = malloc(table_count * sizeof(*cosines));
-    float *sines = malloc(table_count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, state->rope_dim, rope_position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, state->rope_dim, rope_position,
             state->config->original_max_position_embeddings,
             state->config->compress_rope_theta, state->config->rope_factor,
             state->config->rope_beta_fast, state->config->rope_beta_slow)) {
@@ -2634,9 +2668,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "cannot create compressor RoPE table");
     }
     float *rope = output + dimension - state->rope_dim;
-    coli_v4_rope_apply(rope, 1, state->rope_dim,
-                       cosines + (size_t)rope_position * pairs,
-                       sines + (size_t)rope_position * pairs, 0);
+    coli_v4_rope_apply(rope, 1, state->rope_dim, cosines, sines, 0);
     coli_bf16_round_array(rope, (size_t)state->rope_dim);
     free(sines); free(cosines);
 
@@ -2803,11 +2835,10 @@ static int apply_position_rope(float *queries,
                                int position) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     int rope_dim = config->qk_rope_head_dim, pairs = rope_dim / 2;
-    size_t count = (size_t)(position + 1) * pairs;
-    float *cosines = malloc(count * sizeof(*cosines));
-    float *sines = malloc(count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, rope_dim, position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, rope_dim, position,
             config->original_max_position_embeddings,
             config->compress_rope_theta, config->rope_factor,
             config->rope_beta_fast, config->rope_beta_slow)) {
@@ -2816,8 +2847,7 @@ static int apply_position_rope(float *queries,
     for (int head = 0; head < heads; head++) {
         float *query = queries + (size_t)head * dimension;
         coli_v4_rope_apply(query + dimension - rope_dim, 1, rope_dim,
-                           cosines + (size_t)position * pairs,
-                           sines + (size_t)position * pairs, 0);
+                           cosines, sines, 0);
         coli_bf16_round_array(query + dimension - rope_dim, (size_t)rope_dim);
     }
     free(sines); free(cosines);
@@ -4126,11 +4156,10 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 
     int rope_position = position + 1 - state->ratio;
     int pairs = state->rope_dim / 2;
-    size_t table_count = (size_t)(rope_position + 1) * pairs;
-    float *cosines = malloc(table_count * sizeof(*cosines));
-    float *sines = malloc(table_count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, state->rope_dim, rope_position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, state->rope_dim, rope_position,
             state->config->original_max_position_embeddings,
             state->config->compress_rope_theta, state->config->rope_factor,
             state->config->rope_beta_fast, state->config->rope_beta_slow)) {
@@ -4138,9 +4167,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "cannot create compressor RoPE table");
     }
     float *rope = output + dimension - state->rope_dim;
-    coli_v4_rope_apply(rope, 1, state->rope_dim,
-                       cosines + (size_t)rope_position * pairs,
-                       sines + (size_t)rope_position * pairs, 0);
+    coli_v4_rope_apply(rope, 1, state->rope_dim, cosines, sines, 0);
     coli_bf16_round_array(rope, (size_t)state->rope_dim);
     free(sines); free(cosines);
 
@@ -4366,11 +4393,10 @@ static int apply_position_rope(float *queries,
                                int position) {
     int heads = config->index_n_heads, dimension = config->index_head_dim;
     int rope_dim = config->qk_rope_head_dim, pairs = rope_dim / 2;
-    size_t count = (size_t)(position + 1) * pairs;
-    float *cosines = malloc(count * sizeof(*cosines));
-    float *sines = malloc(count * sizeof(*sines));
-    if (!cosines || !sines || coli_v4_rope_precompute(
-            cosines, sines, rope_dim, position + 1,
+    float *cosines = malloc((size_t)pairs * sizeof(*cosines));
+    float *sines = malloc((size_t)pairs * sizeof(*sines));
+    if (!cosines || !sines || coli_v4_rope_position(
+            cosines, sines, rope_dim, position,
             config->original_max_position_embeddings,
             config->compress_rope_theta, config->rope_factor,
             config->rope_beta_fast, config->rope_beta_slow)) {
@@ -4379,8 +4405,7 @@ static int apply_position_rope(float *queries,
     for (int head = 0; head < heads; head++) {
         float *query = queries + (size_t)head * dimension;
         coli_v4_rope_apply(query + dimension - rope_dim, 1, rope_dim,
-                           cosines + (size_t)position * pairs,
-                           sines + (size_t)position * pairs, 0);
+                           cosines, sines, 0);
         coli_bf16_round_array(query + dimension - rope_dim, (size_t)rope_dim);
     }
     free(sines); free(cosines);
@@ -4798,22 +4823,13 @@ static int attention_token_impl(float *output,
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
 
     if (!result) {
-        float *all_cos = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_cos));
-        float *all_sin = calloc((size_t)(position + 1) * rope_dim / 2, sizeof(*all_sin));
         int compressed = weights->plan.compression_ratio != 0;
-        if (!all_cos || !all_sin || coli_v4_rope_precompute(
-                all_cos, all_sin, rope_dim, position + 1,
+        if (coli_v4_rope_position(
+                cosines, sines, rope_dim, position,
                 compressed ? config->original_max_position_embeddings : 0,
                 compressed ? config->compress_rope_theta : config->rope_theta,
                 config->rope_factor,
                 config->rope_beta_fast, config->rope_beta_slow)) result = -1;
-        if (!result) {
-            memcpy(cosines, all_cos + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*cosines));
-            memcpy(sines, all_sin + (size_t)position * rope_dim / 2,
-                   (size_t)rope_dim / 2 * sizeof(*sines));
-        }
-        free(all_sin); free(all_cos);
     }
     if (!result) {
         for (int head = 0; head < heads; head++) {
