@@ -64,13 +64,17 @@ jobs:
           - os: ubuntu-latest
             name: linux
             shell: bash
+            v4: "1"
           - os: macos-latest
             name: macos
             shell: bash
+            # No v4: the engine builds on x86-64 Linux/Windows and aarch64 Linux
+            # only (COLI_V4_SUPPORTED in c/Makefile); the target exits 1 here.
           - os: windows-latest
             name: windows
             # GitHub shells are format strings: 'msys2 {0}', never bare 'msys2'.
             shell: "msys2 {0}"
+            v4: "1"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -90,11 +94,18 @@ jobs:
             mingw-w64-ucrt-x86_64-binutils
       - if: matrix.os == 'macos-latest'
         run: brew install libomp
+      # "Every engine" was four of five. deepseek-v4's only CI is the Linux
+      # v4-tiny job in check.yml, so the MSYS2 build of that engine had no job
+      # anywhere -- the release tag compiled it on Windows for the first time.
+      # The hyphenated target is appended rather than folded into the loop
+      # because it must not run on macos.
       - name: Build every engine
         run: |
           cd c
           rc=0
-          for t in colibri inkling kimi_k3 olmoe; do
+          ENGINES="colibri inkling kimi_k3 olmoe"
+          if [ "${{ matrix.v4 }}" = "1" ]; then ENGINES="$ENGINES deepseek-v4"; fi
+          for t in $ENGINES; do
             echo "::group::$t"
             make $t || { echo "FAILED: $t"; rc=1; }
             echo "::endgroup::"
