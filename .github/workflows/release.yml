@@ -185,13 +185,44 @@ jobs:
           # now, and one hardcoded list that silently omitted an engine is what #858
           # was. Keep the expectation in a single place, above.
           COLI_EXPECT="$SIBLINGS" python3 - <<'PYCHK'
-          import os, sys
+          import importlib.machinery, importlib.util, json, os, sys, tempfile
           exe = ".exe" if os.name == "nt" else ""
           expect = os.environ["COLI_EXPECT"].split()
+
+          # 1. the files are here
           missing = [n for n in expect if not os.path.exists(os.path.join(".", n + exe))]
           if missing:
-              sys.exit("FAIL: coli would not resolve these next to itself: " + ", ".join(missing))
-          print("OK: every engine is where coli's engine_for() looks for it:", " ".join(expect))
+              sys.exit("FAIL: engines missing from the archive: " + ", ".join(missing))
+
+          # 2. and coli can actually SELECT them.
+          #
+          # This check used to stop at step 1 and was named "coli would not resolve
+          # these next to itself", which reads as a dispatch check and is not one.
+          # It passed for the whole of v1.5.0 while `coli run --model <olmoe>` sent
+          # the request to the GLM engine, because model_arch() had no olmoe branch
+          # (#879). The binary was in the archive and unusable.
+          #
+          # Presence is not dispatch. Load the packaged launcher, hand it a
+          # config.json per family, and assert where the request would go.
+          loader = importlib.machinery.SourceFileLoader("coli_pkg", "coli")
+          spec = importlib.util.spec_from_loader(loader.name, loader)
+          cli = importlib.util.module_from_spec(spec)
+          loader.exec_module(cli)
+
+          bad = []
+          for model_type, label, _ in cli._BANNER_MODELS:
+              with tempfile.TemporaryDirectory() as d:
+                  with open(os.path.join(d, "config.json"), "w", encoding="utf-8") as f:
+                      json.dump({"model_type": model_type}, f)
+                  open(os.path.join(d, "tokenizer.json"), "w").close()
+                  engine = os.path.basename(cli.engine_for(d))
+                  arch = cli.model_arch(d)
+              if model_type != "glm" and arch == "glm":
+                  bad.append("%s (%s) -> the GLM engine; the banner names a family "
+                             "the launcher cannot dispatch" % (label, model_type))
+          if bad:
+              sys.exit("FAIL: packaged launcher misroutes:\n  " + "\n  ".join(bad))
+          print("OK: every engine is packaged AND coli dispatches to it:", " ".join(expect))
           PYCHK
           out=$(python3 coli info 2>&1 || true)
           echo "$out"
