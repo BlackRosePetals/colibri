@@ -938,6 +938,47 @@ class ClientHangupTest(unittest.TestCase):
                      timeout=2) as response:
             self.assertEqual(json.load(response)["status"], "ok")
 
+    def _abort(self, *args):
+        """Windows' spelling of the same disconnect, raised where it really lands.
+
+        In #854's log the traceback runs do_GET -> send_json -> end_headers ->
+        flush_headers -> wfile.write -> sendall, so raising from end_headers
+        reproduces the exact shape on any platform.
+        """
+        raise ConnectionAbortedError(
+            10053, "An established connection was aborted by the software in your "
+                   "host machine")
+
+    def test_windows_aborted_connection_is_not_an_error(self):
+        """ConnectionAbortedError is a SIBLING of BrokenPipeError and
+        ConnectionResetError under ConnectionError, not a subclass of either --
+        so catching the pair caught the POSIX spellings and let the Windows one
+        escape. #854 is pages of WinError 10053 tracebacks from a healthy start.
+        """
+        self.assertFalse(
+            issubclass(ConnectionAbortedError, (BrokenPipeError, ConnectionResetError)),
+            "the old except clause would have covered this; the test proves nothing")
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass                      # the client sees a broken response; that is fine
+            time.sleep(0.3)
+        self.assertEqual(self.errors, [],
+                         "WinError 10053 surfaced as a server error (#854)")
+
+    def test_the_server_survives_an_aborted_connection(self):
+        """Same as the hangup case: the damage is a lost handler, not the log."""
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass
+            time.sleep(0.3)
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
+
 
 class StaticServingTest(unittest.TestCase):
     def setUp(self):
