@@ -294,8 +294,13 @@ def env_for_engine(a, arch):
                 env.setdefault("OMP_PLACES", "cores")
     if a.ngen: env["NGEN"] = str(a.ngen)
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
-    if arch == "deepseek_v4":
+    # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
+    # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
+    # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
+    # user's session ran itself out of memory with the flag apparently set.
+    if arch in ("deepseek_v4", "kimi"):
         if a.ram: env["RAM_GB"] = str(a.ram)
+    if arch == "deepseek_v4":
         if a.ctx: env["CTX"] = str(a.ctx)
         # Speculation stays opt-in. Real multi-turn chat measured only 1/15
         # accepted prompt-lookup candidates; recurrent-state replay dominated
