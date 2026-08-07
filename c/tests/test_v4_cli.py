@@ -57,6 +57,31 @@ class V4CliTest(unittest.TestCase):
         self.assertEqual(env["RAM_GB"], "64")
         self.assertEqual(env["CTX"], "4096")
 
+    def test_kimi_engine_environment_forwards_ram(self):
+        """#855: `--ram` reached the environment for deepseek_v4 only, so on Kimi
+        K3 it was set and never read -- the flag a user reaches for to bound
+        memory did nothing, and the reported session ran itself out of RAM with
+        it apparently in effect. kimi_k3 reads RAM_GB now, so coli must send it.
+        """
+        args = argparse.Namespace(ngen=8, temp=0.0, ram=242, ctx=0)
+        env = self.cli.env_for_engine(args, "kimi")
+        self.assertEqual(env["RAM_GB"], "242")
+
+    def test_kimi_without_ram_stays_unset(self):
+        """Absent --ram, the engine budgets from MemAvailable itself. Sending an
+        empty or zero RAM_GB would read as an explicit ceiling of zero."""
+        args = argparse.Namespace(ngen=8, temp=0.0, ram=0, ctx=0)
+        env = self.cli.env_for_engine(args, "kimi")
+        self.assertNotIn("RAM_GB", env)
+
+    def test_kimi_does_not_get_v4_only_settings(self):
+        """The widening is RAM_GB alone; CTX and the V4 speculation defaults stay
+        where they were."""
+        args = argparse.Namespace(ngen=8, temp=0.0, ram=242, ctx=4096)
+        env = self.cli.env_for_engine(args, "kimi")
+        self.assertNotIn("CTX", env)
+        self.assertNotIn("V4_MTP", env)
+
     def test_windows_v4_run_passes_chinese_prompt_as_utf8_file(self):
         directory, root = self.make_model()
         prompt = "请用中文解释：存储、内存和显存如何协同推理？"

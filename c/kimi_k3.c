@@ -77,6 +77,10 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#endif
 #include "st.h"
 #include "tok.h"
 #include "quant.h"
@@ -176,6 +180,47 @@ typedef struct {
 } Model;
 
 static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec*1e-9; }
+
+/* How many expert slots per layer fit a budget. PURE -- no globals, no model,
+ * no I/O -- so the arithmetic that #855 got wrong can be tested against the
+ * reported numbers without a 600 GB checkpoint. Returns the cap; writes the
+ * bytes left for experts through `for_experts_out` when non-NULL.
+ *
+ * reserve = page cache + activations + KV, all in GB. `cap_requested` is what
+ * K3_EXPERT_GB asked for: this only ever LOWERS it, never raises it, so an
+ * explicit small cache stays small. */
+static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_gb,
+                          double slot_gb, int nmoe, int cap_requested,
+                          int n_experts, double *for_experts_out){
+    double for_experts = budget_gb - resident_gb - reserve_gb;
+    if(for_experts_out) *for_experts_out = for_experts;
+    if(nmoe < 1) nmoe = 1;
+    if(!(slot_gb > 0.0)) return cap_requested;
+    int fits = for_experts > 0.0 ? (int)(for_experts/(slot_gb*(double)nmoe)) : 0;
+    if(fits > n_experts) fits = n_experts;
+    return fits < cap_requested ? fits : cap_requested;
+}
+
+/* Memory the OS says is still reclaimable without swapping, in GB; 0 if unknown.
+ * The same quantity colibri.c's cap_for_ram() budgets against -- Linux
+ * MemAvailable, Windows ullAvailPhys, macOS free+inactive+purgeable. #855. */
+static double k3_mem_avail(void){
+#ifdef _WIN32
+    double total=0, avail=0; compat_meminfo(&total,&avail); return avail;
+#elif defined(__APPLE__)
+    int64_t pgsz=0; size_t sl=sizeof(pgsz);
+    if(sysctlbyname("hw.pagesize",&pgsz,&sl,NULL,0)||pgsz<=0) pgsz=16384;
+    vm_statistics64_data_t vs; mach_msg_type_number_t nc=HOST_VM_INFO64_COUNT;
+    if(host_statistics64(mach_host_self(),HOST_VM_INFO64,(host_info64_t)&vs,&nc)!=KERN_SUCCESS)
+        return 0;
+    return (double)(vs.free_count+vs.inactive_count+vs.purgeable_count)*(double)pgsz/1e9;
+#else
+    FILE *f=fopen("/proc/meminfo","r"); if(!f) return 0;
+    char ln[256]; double kb=0;
+    while(fgets(ln,sizeof(ln),f)) if(sscanf(ln,"MemAvailable: %lf",&kb)==1) break;
+    fclose(f); return kb/1e6;
+#endif
+}
 static double rss_gb(void){ struct rusage r; getrusage(RUSAGE_SELF,&r);
 #if defined(__APPLE__)
     return r.ru_maxrss/(1024.0*1024.0*1024.0);
@@ -636,6 +681,94 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
      * regardless of K3_EXPERT_GB. */
     if(cap<1) cap=1;
     if(cap>c->n_experts) cap=c->n_experts;
+
+    /* ---- RAM budget (#855) --------------------------------------------------
+     * K3_EXPERT_GB used to be the whole story: cap = egb / slot / layers, with
+     * nothing subtracted for what is already resident, no MemAvailable, no
+     * reserve for KV or the page cache, and no guard during the run.
+     *
+     * Reported on a 256 GB box with K3_EXPERT_GB=220:
+     *
+     *     136 slots x 17.5 MB x 93 layers = 216.2 GB   cache, once it fills
+     *                          + 35.2 GB               already resident
+     *                          = 251.4 GB              peak, of 256
+     *
+     * The cache is EMPTY when the init line prints and fills as the session
+     * runs, so the first request answers and a later one dies -- which is what
+     * "colibri engine exited unexpectedly" was.
+     *
+     * And --ram was inert here. `grep -c RAM_GB kimi_k3.c` returned 0 against 10
+     * in colibri.c: the one flag a user would reach for to prevent exactly this
+     * reached the environment and was never read. Same defect shape as #805 and
+     * #858 -- a mechanism that lands in one engine and not its siblings.
+     *
+     * Unlike colibri.c's cap_for_ram this runs AFTER the dense weights are in,
+     * so the resident set is MEASURED rather than projected. rss_gb() is the
+     * truth here, not a model of it, which makes this budget the simpler of the
+     * two rather than the more elaborate. */
+    {
+        double resident = rss_gb();
+        double avail_now = k3_mem_avail();
+        double ram_env = getenv("RAM_GB") ? atof(getenv("RAM_GB")) : 0.0;
+        /* Explicit --ram is a ceiling on the WHOLE process. Absent, take 88% of
+         * what the OS still offers and add what we already hold -- the same
+         * fraction colibri.c uses, and for the same reason: overshooting means
+         * an OOM kill mid-generation, which is far worse than a smaller cache. */
+        double budget = ram_env > 0 ? ram_env : resident + avail_now*0.88;
+
+        /* KV is allocated later, at the first request, so it has to be projected
+         * here. n_layers x max_t x (kv_lora + qk_rope) x 4, skipping KDA layers,
+         * with the same K3_MAXT default the serve path uses. */
+        int max_t = getenv("K3_MAXT") ? atoi(getenv("K3_MAXT")) : 8192;
+        if(max_t < 1) max_t = 8192;
+        int nkv = 0; for(int i=0;i<c->n_layers;i++) if(!m->L[i].kda) nkv++;
+        double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
+        /* 2.5 GB page cache -- measured on Linux 2026-07-06: strangling it drops
+         * buffered pread from ~800 to ~180 MB/s and the last GB of LRU costs
+         * more in lost bandwidth than it returns. 1.2 GB activations/logits. */
+        double reserve = 2.5 + 1.2 + kv_gb;
+        double for_experts = 0.0;
+
+        double slot_gb = (double)m->e_slot/1e9;
+        int cap_fit = k3_cap_for_ram(budget, resident, reserve, slot_gb,
+                                     nmoe, cap, c->n_experts, &for_experts);
+
+        if(cap_fit < cap){
+            /* Name every term. The user's number is not being ignored, it is
+             * being clamped, and they cannot check the clamp without the parts. */
+            fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
+                "(page cache 2.5, activations 1.2, KV %dx%d %.1f) -> %.1f GB for experts; "
+                "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
+                budget, ram_env>0?"":" auto", resident, reserve, nkv, max_t, kv_gb,
+                for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
+                slot_gb*1000.0, nmoe,
+                resident + reserve + (double)(cap_fit>0?cap_fit:1)*slot_gb*nmoe);
+            if(getenv("K3_EXPERT_GB"))
+                fprintf(stderr,"[K3] K3_EXPERT_GB=%.0f does not fit alongside the "
+                    "%.1f GB already resident. It is a request, not a reservation.\n",
+                    egb, resident);
+            cap = cap_fit;
+        }
+
+        if(cap < 1){
+            /* Not even one slot per layer. Saying cap=1 and continuing turns
+             * "does not fit" into "overruns", which is the OOM kill this exists
+             * to avoid -- and the kernel kills with SIGKILL, so the engine dies
+             * with no error and no log at all. Refuse, unless told otherwise. */
+            cap = 1;
+            double peak = resident + reserve + slot_gb*nmoe;
+            fprintf(stderr,"[K3] WARNING: cap=1 is the floor and the projected peak is "
+                "%.1f GB, %.1f GB over the budget.\n", peak, peak-budget);
+            if(avail_now > 0 && peak > resident + avail_now &&
+               !(getenv("COLI_RAM_OVERCOMMIT") && atoi(getenv("COLI_RAM_OVERCOMMIT")))){
+                fprintf(stderr,"[K3] refusing to start: that peak also exceeds the %.1f GB "
+                    "this machine actually has left, so the kernel would kill this run "
+                    "mid-generation.\n[K3] lower K3_MAXT, raise --ram if the box really has "
+                    "it, or set COLI_RAM_OVERCOMMIT=1 to override.\n", resident + avail_now);
+                exit(2);
+            }
+        }
+    }
     { int ncl=c->n_layers>0?c->n_layers:1;
       m->ecache=calloc((size_t)ncl,sizeof(LCache)); }
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
