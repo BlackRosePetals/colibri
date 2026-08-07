@@ -6051,13 +6051,34 @@ static int grammar_draft(GrDraft *g, int *draft, int cap){
  * killing the engine; :more can continue the interrupted answer. Armed only
  * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
 static volatile sig_atomic_t g_intr=0;
+/* #810: SIGINT and SIGTERM mean different things and cannot share a flag. SIGINT is a
+ * SOFT stop -- it ends the current turn and the serve loop clears g_intr and keeps
+ * serving. SIGTERM is a request to shut down, so it needs a flag the loop does NOT
+ * clear. It sets g_intr too, so the in-flight turn unwinds through the ordinary path
+ * (stats, usage_save, KV append, END sentinel) instead of being torn down. */
+static volatile sig_atomic_t g_shutdown=0;
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static void intr_sig(int s){ (void)s; g_intr=1; }
+static void term_sig(int s){ (void)s; g_intr=1; g_shutdown=1; }
 static void intr_install(void){
     struct sigaction sa; memset(&sa,0,sizeof(sa));
     sa.sa_handler=intr_sig; sigemptyset(&sa.sa_mask);
     sa.sa_flags=SA_RESTART;              /* getline/pread non devono vedere EINTR */
     sigaction(SIGINT,&sa,NULL);
+    /* SIGTERM deliberately WITHOUT SA_RESTART. The serve loop blocks in getline()
+     * waiting for the next request, and SA_RESTART would silently resume that read
+     * after the handler ran -- the flag would be set and never looked at again, so
+     * `systemctl stop` would hang until its TimeoutStopSec expired into SIGKILL.
+     * Without it, getline() returns -1/EINTR and the loop exits through its normal
+     * end. The original reason for SA_RESTART was "getline/pread must not see EINTR",
+     * and the pread half no longer applies: every read path retries EINTR itself
+     * (st.h st_pread_full, the mirror loop here, uring.h). getline is the only caller
+     * that needed protecting, and it is precisely the one a shutdown must interrupt.
+     * select() in run_serve_mux is unaffected: it tests `> 0`, so an EINTR return is
+     * just "no input this round" and the next iteration sees the flag. */
+    sa.sa_handler=term_sig;
+    sa.sa_flags=0;
+    sigaction(SIGTERM,&sa,NULL);
 }
 #else
 static void intr_install(void){}
@@ -7302,6 +7323,11 @@ static void run_serve_mux(Model *m, const char *snap){
                                           * via normale di mux_done (DONE+stats+KV coerenti) */
             for(int i=0;i<nctx;i++) if(req[i].active) mux_done(m,&ctx[i],&req[i]);
         }
+        /* #810: SIGTERM. Ordered AFTER the mux_done sweep above on purpose -- the
+         * in-flight requests finish through their normal path first, then the loop
+         * ends. With no active request select() blocks with a NULL timeout, so the
+         * EINTR from an un-restarted SIGTERM is what wakes us to reach this line. */
+        if(g_shutdown) break;
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
@@ -7466,7 +7492,7 @@ static void run_serve(Model *m, const char *snap){
     intr_install();                      /* Ctrl-C = fine turno, non fine processo */
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     tiers_emit(m);
-    while((nr=getline(&line,&cap,stdin))>0){
+    while(!g_shutdown && (nr=getline(&line,&cap,stdin))>0){
         g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
