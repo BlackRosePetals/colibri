@@ -2263,8 +2263,34 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     int64_t wtot=tw[0]->nbytes+tw[1]->nbytes+tw[2]->nbytes;
     int64_t ftot=(tq[0]->nbytes+tq[1]->nbytes+tq[2]->nbytes)/4;
     /* rialloca se lo slot (riusato tra layer) e' troppo piccolo per QUESTO expert:
-     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini */
-    if(!s->slab || wtot+8192 > s->slab_cap){
+     * pread oltre la mappatura = short-read o CORRUZIONE silenziosa dei vicini
+     *
+     * ...and reallocate when it is too LARGE, which is #856. Slabs do not stay in
+     * the row that grew them: the LRU promotion swaps ws[q] with a cache slot
+     * (search "promozione LRU"), so a ws[] slot widened to hold an int8 MTP expert
+     * comes back on the next token, loads a narrow int4 routed expert without
+     * resizing, and is then swapped into a MAIN layer's cache -- still carrying the
+     * MTP width. Up to 64 slabs per token bleed that way, so given enough tokens
+     * every cache slot in the model costs the widest width in the container.
+     *
+     * That is why cap_for_ram() charged every row the widest width: the pessimism
+     * was the true asymptote, not paranoia. It also halved the cache on GLM-5.2
+     * (154 -> 77 slots per row, measured in #856). Shrinking here removes the bleed,
+     * which is what lets the cap be computed from each row's REAL width.
+     *
+     * Hysteresis, not exact fit: alignment rounding alone makes slab_cap exceed the
+     * request under COLI_METAL, and a shrink for a few KB would churn the allocator
+     * on every miss. 25% is relative so it scales with the model; the floor only has
+     * to clear that 16 KB rounding. Experts within a row share a shape, so the only
+     * thing that crosses this threshold is a slab that came from a DIFFERENT row --
+     * which is exactly the migration being stopped.
+     *
+     * Never arena slices (aslab): those are interior pointers into one per-layer
+     * allocation and must not be freed. They are already per-layer-width, so they
+     * have nothing to shrink. */
+    int64_t want=wtot+8192;
+    int64_t hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;   /* 64 KB clears the 16 KB METAL rounding */
+    if(!s->slab || want > s->slab_cap || (!s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
         if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -2280,7 +2306,10 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         numa_slab_bind(s->slab,(size_t)s->slab_cap);
 #endif
     }
-    if(!s->fslab || ftot > s->fslab_cap){
+    /* The scales migrate with their weights, so they shrink on the same rule (#856).
+     * fslab_cap counts FLOATS, so the hysteresis is in floats too. */
+    int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
+    if(!s->fslab || ftot > s->fslab_cap || (!s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         /* page-align + register: the GPU reads the scales in place (unified memory).
          * Honours `fatal` exactly like the CPU arm below — a speculative pilot load
@@ -2486,7 +2515,12 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
     int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
     int64_t ftot=(l->tq[0]->nbytes+l->tq[1]->nbytes+l->tq[2]->nbytes)/4;
     if(wtot<=0 || ftot<=0) return uring_load_error(l,EINVAL,"io_uring expert size"),li;
-    if(!s->slab || wtot+8192>s->slab_cap){
+    /* Same shrink rule as the pread path (#856): a slot that once held a wider
+     * expert must not carry that width into a narrower row, or the per-row cap
+     * cap_for_ram() computes stops being true. Same hysteresis, same arena guard. */
+    int64_t want=wtot+8192, hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;
+    int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
+    if(!s->slab || want>s->slab_cap || (!s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
         compat_aligned_free(s->slab);
@@ -2501,7 +2535,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         s->slab_cap=wtot+8192;
 #endif
     }
-    if(!s->fslab || ftot>s->fslab_cap){
+    if(!s->fslab || ftot>s->fslab_cap || (!s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
         free(s->fslab); size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
@@ -6524,9 +6558,14 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
     int64_t io=atomic_load_explicit(&g_prof_io,memory_order_relaxed)-b->io;
     uint64_t dh=m->hits-b->hits, dm=m->miss-b->miss, dq=m->ereq-b->ereq;
     double hitp=(dh+dm)?100.0*dh/(dh+dm):100.0;
-    double eb=(double)expert_bytes_probe(m,m->ebits);
-    int pinned=0,lru=0;
-    for(int i=0;i<=c->n_layers;i++){ if(m->npin)pinned+=m->npin[i]; if(m->ecn)lru+=m->ecn[i]; }
+    /* Per-row widths (#856): "resident experts: N (X GB)" is the line people quote
+     * when they compare the engine's own accounting against free RAM. */
+    int pinned=0,lru=0; double pin_b=0,lru_b=0;
+    for(int i=0;i<=c->n_layers;i++){
+        double w=(double)expert_bytes_row(m,i,m->ebits);
+        if(m->npin){ pinned+=m->npin[i]; pin_b+=(double)m->npin[i]*w; }
+        if(m->ecn){ lru+=m->ecn[i];      lru_b+=(double)m->ecn[i]*w; }
+    }
     double io_w=m->t_ewait-b->ewait;    /* stall the compute thread felt */
     double io_svc=edisk_s()-b->edisk;   /* read service on the loading threads (overlaps compute) */
     uint64_t dhp=m->hit_pin-b->hit_pin, dhe=m->hit_ecache-b->hit_ecache;   /* split #336 */
@@ -6573,7 +6612,7 @@ static void prof_report(Model *m, const ProfBase *b, double elapsed, int tokens,
         }
     }
     fprintf(f,"[PROF] resident experts: %d pinned (%.1f GB) + %d in LRU (%.1f GB, cap %d/layer)\n",
-        pinned,pinned*eb/1e9,lru,lru*eb/1e9,m->ecap);
+        pinned,pin_b/1e9,lru,lru_b/1e9,m->ecap);
     double emm=m->t_emm-b->emm, ecpu=m->t_ecpu-b->ecpu, egpu=m->t_egpu-b->egpu;
     double route=m->t_route-b->route,p2p=m->t_p2p-b->p2p;
     uint64_t np2p=m->n_p2p-b->n_p2p;
@@ -8357,11 +8396,12 @@ static double autopin_lru_reserve(double expert_available, double bytes_per_slot
     return (double)cap*bytes_per_slot;
 }
 
+/* #856: nsp*widest -> the sum of each row's REAL width. The "nsp+=2" was an
+ * approximation of one wide MTP row while every OTHER row was charged the narrow
+ * width; once the probe started returning the widest for all of them the two
+ * compounded, and the autopin reserve inherited the same halving as the cap. */
 static double expert_cache_bytes_per_slot(Model *m, int ebits){
-    int nsp=0;
-    for(int i=0;i<m->c.n_layers;i++) if(m->L[i].sparse) nsp++;
-    if(m->has_mtp) nsp+=2;
-    return (double)nsp*(double)expert_bytes_probe(m,ebits);
+    return expert_cache_row_bytes(m,ebits);
 }
 
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
@@ -8369,8 +8409,13 @@ static double expert_cache_bytes_per_slot(Model *m, int ebits){
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
 static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     Cfg *c=&m->c; int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    if(m->has_mtp) nsp+=2;                       /* riga cache MTP: conta ~doppia (expert int8 = 2x int4) */
+    if(m->has_mtp) nsp++;                        /* la riga MTP e' una riga; la sua LARGHEZZA
+                                                  * la porta row_b, non piu' un "conta doppio" */
+    /* eb = the WIDEST width in the container: correct for ws[], which is shared across
+     * rows, and only for that. row_b = the sum of the widths the rows really hold,
+     * which is what one LRU slot per row costs (#856). */
     int64_t eb=expert_bytes_probe(m,ebits);
+    double row_b=expert_cache_row_bytes(m,ebits);
     int auto_b = ram_gb<=0;
     if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
@@ -8400,7 +8445,7 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     double pc_b  = 2.5e9;
     double slack = 1.2e9 + pc_b + ws_b + kv_b + kvb_b;
     double avail = ram_gb*1e9 - (double)m->resident_bytes - slack;
-    int capmax = (avail>0 && nsp>0) ? (int)(avail/((double)nsp*eb)) : 0;
+    int capmax = (avail>0 && row_b>0) ? (int)(avail/row_b) : 0;
     int floored = capmax<1;   /* il budget non regge nemmeno UNO slot per layer */
     if(capmax<1) capmax=1;
     /* Il floor a 1 e' una bugia comoda: con avail negativo capmax sarebbe 0, cioe'
@@ -8410,14 +8455,16 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
      * nessun log, il motore muore muto (issue #305). Dirlo, e fermarsi se il picco
      * non entra nemmeno nella RAM realmente disponibile misurata all'avvio. */
     if(floored){
-        double peak = (double)m->resident_bytes + (double)capmax*nsp*eb + slack;
-        /* eb is printed because it is the one term nobody can check from outside:
-         * every projection here divides by it, so a wrong width is indistinguishable
-         * from a wrong budget in this message (#766). */
+        double peak = (double)m->resident_bytes + (double)capmax*row_b + slack;
+        /* The width is printed because it is the one term nobody can check from
+         * outside: every projection here divides by it, so a wrong width is
+         * indistinguishable from a wrong budget in this message (#766). Report the
+         * per-row AVERAGE, since that is now the divisor -- printing the widest while
+         * dividing by something else is how #856 stayed invisible for a release. */
         fprintf(stderr,"[RAM_GB=%.1f%s] WARNING: cap=1 is the floor, projected peak %.1f GB is "
-            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB).%s\n",
+            "%.1f GB OVER the budget (resident %.1f GB + reserve %.1f GB, expert %.1f MB avg/row).%s\n",
             ram_gb,auto_b?" auto":"",peak/1e9,(peak-ram_gb*1e9)/1e9,
-            m->resident_bytes/1e9,slack/1e9,(double)eb/1e6,
+            m->resident_bytes/1e9,slack/1e9,row_b/(nsp>0?nsp:1)/1e6,
             getenv("PIN_GB")?" PIN_GB is inflating the resident set: lower it or drop it.":"");
 #ifdef COLI_CUDA
         /* #686: on a single GPU that also holds host copies of the VRAM tier, the
@@ -8440,11 +8487,11 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     }
     if(capmax < m->ecap){
         fprintf(stderr,"[RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB (ws %.1f, KV %dx%d %.1f, kvb %.1f), "
-            "experts %.1f MB x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
+            "experts %.1f MB avg x %d layers -> cap lowered %d->%d (projected peak %.1f GB)\n",
             ram_gb,auto_b?" auto":"",m->resident_bytes/1e9,slack/1e9,ws_b/1e9,
             kv_slot_count(),max_ctx,kv_b/1e9,kvb_b/1e9,
-            eb/1e6, nsp, m->ecap, capmax,
-            (m->resident_bytes + (double)capmax*nsp*eb + slack)/1e9);
+            row_b/(nsp>0?nsp:1)/1e6, nsp, m->ecap, capmax,
+            (m->resident_bytes + (double)capmax*row_b + slack)/1e9);
         m->ecap=capmax;
     } else {
         /* AUTO-RAISE (issue #12): il budget consente PIU' cache di quella chiesta.
@@ -8468,11 +8515,11 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
             fprintf(stderr,"[RAM_GB=%.1f%s] cap raised %d->%d: budget allows it "
                 "(projected peak %.1f GB; set CAP_RAISE=0 to disable)\n",
                 ram_gb, auto_b?" auto":"", m->ecap, newcap,
-                (m->resident_bytes + (double)newcap*nsp*eb + slack)/1e9);
+                (m->resident_bytes + (double)newcap*row_b + slack)/1e9);
             m->ecap=newcap;
         } else
             fprintf(stderr,"[RAM_GB=%.1f%s] cap=%d ok (projected peak %.1f GB)\n", ram_gb, auto_b?" auto":"", m->ecap,
-                (m->resident_bytes + (double)m->ecap*nsp*eb + slack)/1e9);
+                (m->resident_bytes + (double)m->ecap*row_b + slack)/1e9);
     }
 }
 
@@ -8509,15 +8556,21 @@ static void prof_config(Model *m, double ram_env, int est_ctx){
     if(g_metal_enabled) backend="Metal";
 #endif
     int nsp=0; for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse) nsp++;
-    int rows=nsp+(m->has_mtp?2:0);               /* stessa convenzione di cap_for_ram (MTP int8 = 2x) */
-    int pinned=0; for(int i=0;i<=c->n_layers;i++) if(m->npin) pinned+=m->npin[i];
-    double eb=(double)expert_bytes_probe(m,m->ebits);
+    /* #856: the cache figure comes from the same per-row sum the cap is computed
+     * from. Printing a projection derived differently from the cap is how the
+     * halving stayed invisible through a whole release. */
+    int pinned=0; double pin_b=0;
+    for(int i=0;i<=c->n_layers;i++) if(m->npin){
+        pinned+=m->npin[i];
+        pin_b+=(double)m->npin[i]*(double)expert_bytes_row(m,i,m->ebits);
+    }
+    (void)nsp;
     fprintf(stderr,"[PROF] machine: %s | %d cores (%d omp threads) | RAM %.1f GB total, %.1f GB available | backend %s\n",
         cpu[0]?cpu:"unknown CPU",cores,omp_get_max_threads(),rt,ra,backend);
     fprintf(stderr,"[PROF] config: RAM_GB=%s%.1f CTX=%d | expert cache cap %d/layer (up to %.1f GB) | pinned %d (%.1f GB) | "
         "DRAFT=%d PIPE=%d DIRECT=%d MMAP=%d IDOT=%d DSA=%s PILOT=%d CACHE_ROUTE=%d\n",
         ram_env<=0?"auto ":"",ram_env<=0?g_mem_avail_boot*0.88:ram_env,est_ctx,
-        m->ecap,(double)m->ecap*rows*eb/1e9,pinned,pinned*eb/1e9,
+        m->ecap,(double)m->ecap*expert_cache_row_bytes(m,m->ebits)/1e9,pinned,pin_b/1e9,
         g_draft,g_pipe,g_direct,g_mmap,g_idot,
         (m->has_dsa&&c->index_topk)?"on":"off",g_pilot,g_cache_route);
 }
