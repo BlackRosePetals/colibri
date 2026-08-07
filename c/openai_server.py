@@ -1910,7 +1910,14 @@ class APIHandler(BaseHTTPRequestHandler):
                              % self.address_string())
             self.close_connection = True
             return
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
+            # ConnectionError, not (BrokenPipeError, ConnectionResetError): those two
+            # are SIBLINGS of ConnectionAbortedError under it, so the pair caught the
+            # POSIX spellings and let the Windows one through. #854's log is pages of
+            # `ConnectionAbortedError: [WinError 10053] An established connection was
+            # aborted by the software in your host machine` escaping to socketserver,
+            # from a `coli web` start that was otherwise healthy.
+            #
             # The client hung up mid-response. That is not an error here, it is
             # how HTTP clients behave: `coli chat` polls /health while the model
             # loads and drops each connection as soon as it has its answer, and
@@ -2187,8 +2194,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self._fail(error, request_id)
         except ClientCancelled:
             pass
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except ConnectionError:
+            pass                      # same widening as handle_one_request, same reason
         except Exception as error:
             self.log_error("request failed: %s", error)
             try:

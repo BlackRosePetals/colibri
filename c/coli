@@ -1223,13 +1223,30 @@ def cmd_web(a):
     if not getattr(a, "no_browser", False):
         import threading, urllib.request, webbrowser
         def opener():
-            for _ in range(600):                    # the 744B engine takes minutes to load
-                time.sleep(2)
+            # No iteration cap. It used to be `for _ in range(600)` with a 2 s sleep --
+            # a 20-minute budget, sized when "the engine takes minutes to load" meant
+            # GLM. #854 reported Kimi K3 never opening the browser on a 256 GB Windows
+            # box, and the log explains itself: `[K3] init done in 2540.5s`. The thread
+            # gave up 22 minutes before the server first answered /health, so the
+            # message promising it opens automatically was simply false.
+            #
+            # A ceiling here can only ever be wrong in one direction: too low fails
+            # silently on a slow load, too high costs a sleeping daemon thread. The
+            # thread is a daemon, so it cannot outlive the server it is waiting for --
+            # there is nothing for the cap to protect against.
+            waited = 0
+            while True:
+                time.sleep(2); waited += 2
                 try:
-                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=2)
-                    webbrowser.open(url); return
+                    urllib.request.urlopen(f"http://{a.host}:{a.port}/health", timeout=5)
                 except OSError:
+                    # Say something once, rather than looking hung. A 93-layer K3 load
+                    # is 40+ minutes and the user has no way to tell waiting from stuck.
+                    if waited == 300:
+                        print(f"still loading; the dashboard will open at {url} when the "
+                              f"engine is ready (Ctrl-C to stop, or --no-browser to skip)")
                     continue
+                webbrowser.open(url); return
         threading.Thread(target=opener, daemon=True).start()
     print(f"dashboard: {url}  (opens automatically when the engine is ready)")
     cmd_serve(a)
