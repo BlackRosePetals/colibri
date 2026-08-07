@@ -705,6 +705,44 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
     return "".join(parts)
 
 
+def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """OLMoE-Instruct's native chat_template (tokenizer_config.json): one
+    bos_token, then per-message <|system|>/<|user|>/<|assistant|> turns each
+    closed by a newline, prior assistant turns also closed by eos_token
+    (bos_token == eos_token == "|||IP_ADDRESS|||", a PII-scrubbing artifact
+    repurposed as this tokenizer's BOS/EOS marker), and a trailing
+    "<|assistant|>\\n" generation prompt. No tool-call syntax and no thinking
+    mode exist in this template, so both parameters are accepted but unused.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet.",
+                       "tools", "unsupported_parameter")
+    boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
+    parts = [boundary]
+    last = len(messages) - 1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            parts.append(f"<|system|>\n{text}\n")
+        elif role == "user":
+            parts.append(f"<|user|>\n{text}\n")
+        else:
+            parts.append(f"<|assistant|>\n{text}{boundary}")
+            if index != last:
+                parts.append("\n")
+    parts.append("<|assistant|>\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -880,7 +918,8 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
     renderer = (render_chat_kimi if ARCH == "kimi" else
-                render_chat_v4 if ARCH == "deepseek_v4" else render_chat)
+                render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_olmoe if ARCH == "olmoe" else render_chat)
     return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
@@ -1399,8 +1438,8 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 def model_arch(model):
     """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
-    (including an unreadable config) is glm."""
+    rule as coli's model_arch(): "inkling"/"kimi"/"olmoe" substring, everything
+    else (including an unreadable config) is glm."""
     try:
         with open(Path(model) / "config.json", encoding="utf-8") as fh:
             model_type = (json.load(fh).get("model_type") or "").lower()
@@ -1412,6 +1451,8 @@ def model_arch(model):
         return "kimi"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
+    if "olmoe" in model_type:
+        return "olmoe"
     return "glm"
 
 
@@ -2234,7 +2275,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi"):
+        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -2817,7 +2858,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4") and kv_slots != 1:
+    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -2854,7 +2895,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2885,6 +2926,7 @@ def main():
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
                          "kimi-k3-colibri" if ARCH == "kimi" else
                          "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
+                         "olmoe-colibri" if ARCH == "olmoe" else
                          "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,

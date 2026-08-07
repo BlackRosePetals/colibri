@@ -850,10 +850,12 @@ def cmd_run(a):
                 except OSError: pass
         sys.exit(result)
     if arch=="olmoe":
-        # OLMoE has a persistent stdin chat loop but not the gateway's SERVE
-        # protocol yet. Feed exactly one turn and close stdin: the engine emits
-        # the answer and exits cleanly. Keep this scoped to `coli run`; chat/web
-        # remain unavailable until OLMoE implements READY/SUBMIT/DATA/DONE.
+        # olmoe.c now speaks the gateway's SERVE protocol too (`coli chat`/
+        # `coli web`/`coli serve` use it), but `coli run` predates that and
+        # its one-shot contract is simpler without it: feed exactly one turn
+        # over the engine's plain stdin chat loop and close stdin, the engine
+        # emits the answer and exits cleanly. No reason to spin up the gateway
+        # for a single non-interactive prompt.
         result=subprocess.run(
             [engine, str(a.cap if a.cap is not None else 16), "8"],
             input=prompt+"\n", text=True, env=env_for_engine(a,arch), check=False)
@@ -995,7 +997,8 @@ def cmd_chat(a):
         engine=engine_for(a.model)
         need_model(a.model,engine)
         model_id=("kimi-k3-colibri" if arch=="kimi" else
-                  "inkling-colibri" if arch=="inkling" else "deepseek-v4-colibri")
+                  "inkling-colibri" if arch=="inkling" else
+                  "olmoe-colibri" if arch=="olmoe" else "deepseek-v4-colibri")
         banner(f"chat · {model_id} · local server", model=a.model)
         import openai_server
         # --cap rides along so an explicit `coli chat --cap N` reaches the
@@ -1178,6 +1181,7 @@ def cmd_serve(a):
     model_id=a.model_id or ("kimi-k3-colibri" if arch=="kimi" else
                             "inkling-colibri" if arch=="inkling" else
                             "deepseek-v4-colibri" if arch=="deepseek_v4" else
+                            "olmoe-colibri" if arch=="olmoe" else
                             "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,

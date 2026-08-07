@@ -19,7 +19,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
+                           render_chat, render_chat_kimi, render_chat_olmoe, serve,
                            split_thinking_reply, stop_policy, tune_child_env)
 
 
@@ -113,6 +113,37 @@ class TemplateTest(unittest.TestCase):
                                "content": "answer"}], enable_thinking=True),
             "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
+
+    def test_olmoe_renders_native_chat_template(self):
+        # Matches allenai/OLMoE-1B-7B-0125-Instruct's tokenizer_config.json
+        # chat_template exactly: one leading bos_token, per-role turns closed
+        # by a trailing newline, a prior (non-final) assistant turn also closed
+        # by eos_token before that newline (bos_token == eos_token ==
+        # "|||IP_ADDRESS|||" in this tokenizer), and a trailing
+        # "<|assistant|>\n" generation prompt.
+        prompt = render_chat_olmoe([
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Continue"},
+        ])
+        self.assertEqual(
+            prompt,
+            "|||IP_ADDRESS|||<|system|>\nBe terse.\n<|user|>\nHi\n"
+            "<|assistant|>\nHello|||IP_ADDRESS|||\n<|user|>\nContinue\n"
+            "<|assistant|>\n",
+        )
+
+    def test_olmoe_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_olmoe([{"role": "user", "content": "Hi"}],
+                              tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_olmoe([{"role": "tool", "content": "result"}])
+
+    def test_olmoe_rejects_empty_messages(self):
+        with self.assertRaisesRegex(APIError, "non-empty array"):
+            render_chat_olmoe([])
 
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
@@ -661,6 +692,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("glm", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
+        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -671,6 +703,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
+        self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
         self.assertEqual(model_arch("/nonexistent"), "glm")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
