@@ -199,7 +199,15 @@ typedef struct {
 #ifdef COLI_VULKAN
     ColiVkTensor *vk; int vk_eligible;   /* resident on the Vulkan expert tier */
 #endif
-    int cuda_eligible, cuda_failed, cuda_device;  /* resident tensor, never a reused expert slot */
+    int cuda_eligible, cuda_device;   /* resident tensor, never a reused expert slot */
+    /* #767: the row count of the smallest call that has failed on this tensor, or 0 if
+     * none has. A CUDA failure here is almost always a scratch cudaMalloc under memory
+     * pressure, and that pressure scales with S -- so it is a property of the CALL, not
+     * of the tensor. Recording S instead of a boolean lets a narrower call retry: a
+     * prefill chunk that OOMs at S=512 does not condemn decode at S=1. A genuine device
+     * fault fails at S=1, records 1, and is never retried -- the old behaviour, reached
+     * as a special case of the general rule rather than as a separate one. */
+    int cuda_fail_s;
 } QT;
 static int64_t qt_bytes(const QT *t){    /* byte residenti del tensore */
     int64_t n=(int64_t)t->O*t->I;
@@ -519,22 +527,27 @@ static int g_cuda_devices[COLI_CUDA_MAX_DEVICES], g_cuda_ndev, g_cuda_rr;
 static int64_t g_cuda_dense_projected[COLI_CUDA_MAX_DEVICES];
 static void qt_cuda_reset(QT *t){
     if(t->cuda){ coli_cuda_tensor_free(t->cuda); t->cuda=NULL; }
-    t->cuda_failed=0;
+    t->cuda_fail_s=0;
 }
-/* #687: a resident tensor that fails to upload is disabled PERMANENTLY and silently
- * falls back to CPU. The per-tensor line below is easy to lose in a busy log, and the
- * end state -- GPU fully allocated, ~0% useful -- reads as healthy. Count them and say
- * it once, loudly, naming the knob that actually fixes it. */
+/* #687: a resident tensor that fails to upload falls back to CPU silently. The
+ * per-tensor line below is easy to lose in a busy log, and the end state -- GPU fully
+ * allocated, ~0% useful -- reads as healthy. Count them and say it once, loudly,
+ * naming the knob that actually fixes it.
+ *
+ * Since #767 the fallback is per-width rather than permanent (see cuda_fail_s), so a
+ * tensor counted here may recover on its own at a narrower S. The count is still worth
+ * shouting about: it means the tier left too little VRAM for the prompt being run. */
 static int g_cuda_disabled_n;
 static void cuda_disabled_note(void){
     enum { CUDA_DISABLED_LOUD_AT = 8 };
     if(++g_cuda_disabled_n != CUDA_DISABLED_LOUD_AT) return;
     fprintf(stderr,
-        "[CUDA] ***** %d resident tensors have been disabled and moved to CPU *****\n"
-        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is now\n"
-        "[CUDA] on CPU: this run will be at or below CPU speed while the card stays\n"
-        "[CUDA] allocated. The usual cause is the expert tier claiming all VRAM and\n"
-        "[CUDA] leaving nothing for the lazily-uploaded resident tensors.\n"
+        "[CUDA] ***** %d resident tensors have fallen back to CPU *****\n"
+        "[CUDA] The GPU still holds its expert tier, but the dense/attention path is\n"
+        "[CUDA] running on CPU at this prompt width: expect at or below CPU speed while\n"
+        "[CUDA] the card stays allocated. They are retried at narrower S, so decode may\n"
+        "[CUDA] recover even when prefill does not. The usual cause is the expert tier\n"
+        "[CUDA] claiming all VRAM and leaving nothing for the lazily-uploaded tensors.\n"
         "[CUDA] Fix: set an explicit CUDA_EXPERT_GB below the auto value (leave room\n"
         "[CUDA] per device for dense + attention + workspace). See issue #687.\n",
         CUDA_DISABLED_LOUD_AT);
@@ -600,8 +613,8 @@ static void cuda_stats_print(void){
     /* #687: say it again at the end -- by now the per-tensor lines are thousands of
      * log lines back, and this is the number that explains a CPU-speed "GPU" run. */
     if(g_cuda_disabled_n) fprintf(stderr,
-        "[CUDA] %d tensors ran on CPU after failed uploads: this run did NOT use the GPU for "
-        "them. Lower CUDA_EXPERT_GB (#687).\n", g_cuda_disabled_n);
+        "[CUDA] %d tensors fell back to CPU after failed uploads at least once. Lower "
+        "CUDA_EXPERT_GB to leave room for them (#687, #767).\n", g_cuda_disabled_n);
     if(g_cuda_ndev>1) for(int i=0;i<g_cuda_ndev;i++){
         coli_cuda_stats(g_cuda_devices[i],&n,&b);
         fprintf(stderr,"[CUDA]   device %d: %zu tensors, %.2f GB\n",g_cuda_devices[i],n,b/1e9);
@@ -879,15 +892,18 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * cuda_boot): quant_matmul dispatches it by format, deriving the 128x128
      * block-scale geometry from the dims alone. Without the LUT (old DLL) it is
      * excluded up front — same silent-and-immediate idiom as fmt=5. */
-    if(g_cuda_enabled && w->cuda_eligible && !w->cuda_failed && w->fmt!=5 &&
-       (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
+    if(g_cuda_enabled && w->cuda_eligible && (!w->cuda_fail_s || S < w->cuda_fail_s) &&
+       w->fmt!=5 && (w->fmt!=8 || g_cuda_fp8_ready) && !omp_in_parallel()){
         const void *weights = w->fmt==0 ? (const void*)w->qf
                             : (w->fmt==1||w->fmt==8) ? (const void*)w->q8 : (const void*)w->q4;
-        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)) return;
-        w->cuda_failed=1;
+        if(coli_cuda_matmul(&w->cuda,y,x,weights,w->s,w->fmt,S,w->I,w->O,w->cuda_device,w->gs)){
+            w->cuda_fail_s=0;          /* it fits again: forget the width that did not */
+            return;
+        }
+        w->cuda_fail_s = S;
         if(g_cuda_disabled_n < 8)      /* keep the detail for the first few, then the summary */
-            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d disabled after an error; falling back to CPU\n",
-                w->O,w->I,w->cuda_device);
+            fprintf(stderr,"[CUDA] tensor [%d,%d] on device %d fell back to CPU at S=%d; "
+                "narrower calls will still try the GPU\n", w->O,w->I,w->cuda_device,S);
         cuda_disabled_note();
     }
 #endif
