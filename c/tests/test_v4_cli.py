@@ -50,6 +50,58 @@ class V4CliTest(unittest.TestCase):
         finally:
             directory.cleanup()
 
+    def test_model_arch_selects_olmoe(self):
+        directory, root = self.make_model("olmoe")
+        try:
+            self.assertEqual(self.cli.model_arch(str(root)), "olmoe")
+        finally:
+            directory.cleanup()
+
+    def test_engine_for_selects_olmoe_binary(self):
+        directory, root = self.make_model("olmoe")
+        try:
+            expected = "olmoe.exe" if os.name == "nt" else "olmoe"
+            self.assertEqual(Path(self.cli.engine_for(str(root))).name, expected)
+        finally:
+            directory.cleanup()
+
+    def test_olmoe_environment_enters_chat_mode(self):
+        args = argparse.Namespace(ngen=32, temp=0.25, ram=0, ctx=0)
+        env = self.cli.env_for_engine(args, "olmoe")
+        self.assertEqual(env["CHAT"], "1")
+        self.assertEqual(env["MAX_NEW"], "32")
+        self.assertEqual(env["TEMP"], "0.25")
+
+    def test_olmoe_run_uses_its_engine_and_writes_one_prompt_line(self):
+        directory, root = self.make_model("olmoe")
+        args = argparse.Namespace(
+            model=str(root), prompt=["hello", "world"], ngen=32, ram=0,
+            temp=0.25, ctx=0, cap=None,
+        )
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured["command"] = command
+            captured.update(kwargs)
+            return argparse.Namespace(returncode=0)
+
+        try:
+            with mock.patch.object(self.cli, "engine_for", return_value="/engines/olmoe"), \
+                 mock.patch.object(self.cli, "need_model"), \
+                 mock.patch.object(self.cli, "banner"), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=6), \
+                 mock.patch.object(self.cli.subprocess, "run", side_effect=fake_run):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.cli.cmd_run(args)
+            self.assertEqual(stopped.exception.code, 0)
+            self.assertEqual(captured["command"], ["/engines/olmoe", "16", "8"])
+            self.assertEqual(captured["input"], "hello world\n")
+            self.assertTrue(captured["text"])
+            self.assertEqual(captured["env"]["CHAT"], "1")
+            self.assertEqual(captured["env"]["MAX_NEW"], "32")
+        finally:
+            directory.cleanup()
+
     def test_v4_engine_environment_forwards_ram_and_context(self):
         args = argparse.Namespace(ngen=8, temp=0.0, ram=64, ctx=4096)
         env = self.cli.env_for_engine(args, "deepseek_v4")

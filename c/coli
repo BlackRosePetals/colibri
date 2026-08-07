@@ -236,6 +236,8 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "olmoe" in model_type:
+        return "olmoe"
     if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
         return "deepseek_v4"
     return "glm"
@@ -244,7 +246,7 @@ def engine_for(model):
     arch = model_arch(model)
     if arch == "glm" or os.environ.get("COLI_ENGINE"):
         return GLM
-    name = {"inkling": "inkling", "kimi": "kimi_k3",
+    name = {"inkling": "inkling", "kimi": "kimi_k3", "olmoe": "olmoe",
             "deepseek_v4": "deepseek_v4"}[arch]
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
@@ -260,6 +262,7 @@ def need_model(model, engine=None):
     if not os.path.exists(engine):
         arch = model_arch(model)
         target = ("kimi_k3" if arch == "kimi" else "inkling" if arch == "inkling" else
+                  "olmoe" if arch == "olmoe" else
                   "deepseek-v4" if arch == "deepseek_v4" else "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
@@ -294,6 +297,10 @@ def env_for_engine(a, arch):
                 env.setdefault("OMP_PLACES", "cores")
     if a.ngen: env["NGEN"] = str(a.ngen)
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
+    if arch == "olmoe":
+        env["CHAT"] = "1"
+        if a.ngen: env["MAX_NEW"] = str(a.ngen)
+        if a.temp is not None: env["TEMP"] = str(a.temp)
     # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
@@ -685,7 +692,7 @@ def cmd_build(a):
         sys.exit(f"{C.yel}coli build{C.r} only works from a source checkout (this is an installed copy).\n"
                   f"  Clone https://github.com/JustVugg/colibri and run ./setup.sh, or make -C c colibri.")
     arch=model_arch(a.model) if a.model else "glm"
-    target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3",
+    target={"glm":"colibri","inkling":"inkling","kimi":"kimi_k3","olmoe":"olmoe",
             "deepseek_v4":"deepseek-v4"}[arch]
     sys.exit(subprocess.call(["make","-C",HERE,target]))
 
@@ -842,6 +849,15 @@ def cmd_run(a):
                 try: os.unlink(prompt_path)
                 except OSError: pass
         sys.exit(result)
+    if arch=="olmoe":
+        # OLMoE has a persistent stdin chat loop but not the gateway's SERVE
+        # protocol yet. Feed exactly one turn and close stdin: the engine emits
+        # the answer and exits cleanly. Keep this scoped to `coli run`; chat/web
+        # remain unavailable until OLMoE implements READY/SUBMIT/DATA/DONE.
+        result=subprocess.run(
+            [engine, str(a.cap if a.cap is not None else 16), "8"],
+            input=prompt+"\n", text=True, env=env_for_engine(a,arch), check=False)
+        sys.exit(result.returncode)
     # template ufficiale GLM-5.2: niente \n dopo i ruoli; <think></think> = risposta diretta (nothink).
     # THINK=1 lascia <think> aperto, stessa convenzione del serve mode (glm.c). EN: THINK=1 leaves
     # <think> open so the engine emits its reasoning block; the default stays nothink.
