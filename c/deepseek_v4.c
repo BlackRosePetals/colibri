@@ -6319,6 +6319,45 @@ static int v4_dspark_full_wanted(
     return mtp && atoi(mtp) != 0 && draft && atoi(draft) > 0;
 }
 
+/* The native full drafter is a three-stage DSpark profile.  The ordinary
+ * Flash checkpoint exposes only the standard MTP tensors, while the official
+ * DSpark supplement keeps num_nextn_predict_layers=1 and adds these markers.
+ * The full loader remains the authority for detailed dtype/shape validation;
+ * this cheap probe only decides whether its cache should enter the plan. */
+enum {
+    V4_DSPARK_PROFILE_BLOCK = 5,
+    V4_DSPARK_PROFILE_RANK = 256,
+};
+
+static int v4_dspark_full_profile_present(
+    const ColiSafetensorsIndex *index,
+    const ColiDeepSeekV4Config *config) {
+    if (!index || !config) return 0;
+
+    /* Converted checkpoints may omit these optional fields, but an explicit
+     * incompatible profile must not reserve memory for this fixed loader. */
+    if ((config->dspark_block_size > 0 &&
+         config->dspark_block_size != V4_DSPARK_PROFILE_BLOCK) ||
+        (config->dspark_markov_rank > 0 &&
+         config->dspark_markov_rank != V4_DSPARK_PROFILE_RANK))
+        return 0;
+
+    /* Cover the entry projection, middle and final stages, and the distinctive
+     * output heads. v4_ds_load_all() performs the complete validation later. */
+    static const char *profile_tensors[] = {
+        "mtp.0.main_proj.weight", "mtp.0.main_proj.scale",
+        "mtp.1.attn.wq_a.weight", "mtp.1.attn.wq_a.scale",
+        "mtp.2.attn.wq_a.weight", "mtp.2.attn.wq_a.scale",
+        "mtp.2.confidence_head.proj.weight",
+        "mtp.2.markov_head.markov_w1.weight",
+        "mtp.2.markov_head.markov_w2.weight",
+    };
+    for (size_t item = 0;
+         item < sizeof(profile_tensors) / sizeof(profile_tensors[0]); item++)
+        if (!coli_st_find(index, profile_tensors[item])) return 0;
+    return 1;
+}
+
 static uint64_t v4_dspark_full_reserve_bytes(void) {
     double cache = coli_v4_dspark_cache_gb() * 1e9;
     /* The released Flash checkpoint has ~0.56 GiB of resident MTP dense,
@@ -6533,7 +6572,16 @@ int coli_v4_engine_open(ColiV4Engine **output,
         goto fail;
     engine->owns_index = 1;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
-    int want_full_dspark = v4_dspark_full_wanted(options);
+    int requested_full_dspark = v4_dspark_full_wanted(options);
+    int want_full_dspark = requested_full_dspark &&
+                           v4_dspark_full_profile_present(
+                               engine->target_index, &engine->config);
+    if (requested_full_dspark && !want_full_dspark)
+        fprintf(stderr,
+                "v4_dspark warning=unsupported-checkpoint "
+                "expected_full_profile=3stage actual_mtp_layers=%d; "
+                "continuing-target-only\n",
+                engine->config.num_nextn_predict_layers);
     int want_dspark = !want_full_dspark && v4_dspark_markov_wanted(options);
     if (want_dspark && v4_dspark_markov_probe(engine, &dspark_w1,
                                                &dspark_w2)) {
