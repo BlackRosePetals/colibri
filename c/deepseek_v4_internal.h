@@ -112,6 +112,17 @@ int coli_v4_rope_precompute(float *cosines, float *sines,
                             int original_sequence_length, float base,
                             float factor, int beta_fast, int beta_slow);
 
+int coli_v4_rope_precompute_range(float *cosines, float *sines,
+                                  int dimension, int start_position,
+                                  int sequence_length,
+                                  int original_sequence_length, float base,
+                                  float factor, int beta_fast, int beta_slow);
+
+int coli_v4_rope_position(float *cosines, float *sines,
+                          int dimension, int position,
+                          int original_sequence_length, float base,
+                          float factor, int beta_fast, int beta_slow);
+
 int coli_v4_rope_apply(float *vectors, int vector_count, int dimension,
                        const float *cosines, const float *sines, int inverse);
 
