@@ -1212,7 +1212,16 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 m->t_eload+=now_s()-t0;
             }
 #ifdef COLI_VULKAN
-            if(g_k3_vk&&qof[j]>=0) vk_expert_try_upload(m,li,uids[base+j],use[j]);
+            /* #848: offer EVERY expert used this layer, not only the ones that just
+             * came off disk. qof[j]>=0 means "this was a RAM-cache miss", which is the
+             * right gate for the readiness wait above and the wrong one here: it made
+             * the VRAM tier reachable only through disk reads, so the fill stopped the
+             * moment the RAM cache went warm and never resumed. K3_VK_GB was then a cap
+             * that could not be reached rather than the thing that stopped the fill.
+             * Re-offering a resident expert is nearly free -- vk_expert_try_upload
+             * returns on `v->w1` before it touches the per-step quota -- and it reads
+             * only s->buf, which an LRU slot and a ws[] slot populate identically. */
+            if(g_k3_vk) vk_expert_try_upload(m,li,uids[base+j],use[j]);
 #endif
             int f=pfirst[base+j];
             for(int p2=0;p2<pcnt[base+j];p2++){
