@@ -83,6 +83,12 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #ifdef COLI_VULKAN
 #include "backend_vulkan.h"
 #endif
+/* Declared unconditionally (not just under COLI_METAL): on a non-Metal build it just sits
+ * at 0 forever, which is the correct value there (no Metal backend => never enabled). Kept
+ * outside the #ifdef so portable code — e.g. kvb_fmt_gate_notice below — can read "is Metal
+ * active" without needing COLI_METAL (and the backend_metal.h / Metal framework link it
+ * would drag in) on every platform's test build. */
+static int g_metal_enabled;
 #ifdef COLI_METAL
 #include "backend_metal.h"
 /* No <omp.h> here: the guarded include above already provides it under _OPENMP
@@ -93,6 +99,7 @@ static inline void omp_set_num_threads(int n){ (void)n; }
  * single-threaded"). */
 static int g_metal_enabled;
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
+static int g_moe_exact=0;
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
 static const float *g_pre_sh;
 #endif
@@ -881,7 +888,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
      * fmt 1/2/4 in this build, so it fails CLOSED to the CPU branch below (matmul_fp8)
      * rather than being silently misread. coli_metal_gemm() also carries its own
      * internal fmt!=1&&fmt!=2&&fmt!=4 guard, so this is belt-and-braces. */
-    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||w->fmt==4) && !omp_in_parallel()){
+    if(g_metal_enabled && S>=g_metal_gemm_min && !spec_pinned() && (w->fmt==1||w->fmt==2||(w->fmt==4&&!g_moe_exact)) && !omp_in_parallel()){
         const void *wp = w->fmt==1 ? (const void*)w->q8 : (const void*)w->q4;
         if(coli_metal_gemm(y,x,wp,w->s,w->fmt,S,w->I,w->O,w->gs)) return;
     }
@@ -1769,6 +1776,29 @@ static void layer_cuda_shard_kvb(Layer *l,int H,int Q,int V){
 }
 #endif
 
+/* KV_B FMT-GATE NOTICE (#kvb): kernel contract — the fused Metal attention kernels
+ * (attention_rows' coli_metal_attn_decode and layer_forward_rows' coli_metal_layer_decode,
+ * both gated on `l->kv_b.fmt==2||l->kv_b.fmt==4`) only run against kv_b_proj stored INT4,
+ * either per-row (fmt=2) or grouped (fmt=4, since #587's kv_b grouped-int4 addition); any
+ * OTHER format silently falls through to the CPU absorb path for decode attention on that
+ * layer. v1-class mixed-precision containers can mint kv_b_proj at a format outside that
+ * pair, so this is a real trap, not a hypothetical: print it once (called from model_init,
+ * after all layer tensors are resolved) so it isn't silent. NOTICE ONLY — no gate/behavior
+ * change here. */
+static void kvb_fmt_gate_notice(Model *m){
+    Cfg *c=&m->c;
+    if(!g_metal_enabled) return;
+    int bad=0, first_fmt=-1;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kv_b.fmt!=2 && m->L[i].kv_b.fmt!=4){
+        bad++; if(first_fmt<0) first_fmt=m->L[i].kv_b.fmt; }
+    if(bad) fprintf(stderr,
+        "[METAL] kv_b_proj is fmt=%d (not int4) on %d/%d layer%s: the fused Metal "
+        "attention path requires kv_b in int4, per-row (fmt=2) or grouped (fmt=4), so "
+        "those layers run decode attention on the CPU absorb path instead. Requantize "
+        "kv_b to int4 (per-row --kvb-bits 4, or grouped) to re-enable the fused path.\n",
+        first_fmt, bad, c->n_layers, bad==1?"":"s");
+}
+
 static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits){
     memset(m,0,sizeof(*m)); m->ebits=ebits; m->dbits=dbits;
     load_cfg(&m->c,snap);
@@ -1844,6 +1874,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
         }
         #undef P
     }
+    kvb_fmt_gate_notice(m);                       /* once per load, after all layer kv_b resolved */
     /* testa MTP (layer n_layers): presente solo se convertita con --mtp */
     {
         /* MTP attiva SOLO se il set e' COMPLETO (i tensori vivono su 3 shard: durante la
@@ -3271,7 +3302,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * flow through the shared per-fmt shader. */
     if(g_metal_enabled && !kvs && g_absorb!=0 && (S<=4 || g_metal_prefill) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
-       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2
+       && c->qk_rope==64 && vh==256 && (l->kv_b.fmt==2||(l->kv_b.fmt==4&&!g_moe_exact))
        && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
        && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)){
         int sel_active = m->has_dsa && layer<c->n_layers && c->idx_type[layer] && (pos_base+S) > c->index_topk;
@@ -3287,7 +3318,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
                 WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
                 WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
-                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt, l->kv_b.gs,
                 WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
                 m->Lc[layer], m->Rc[layer], S, pos_base, m->kv_start[layer], c->eps, c->theta, c->attn_scale, out);
             #undef WP_
@@ -3823,6 +3854,18 @@ static void metal_stage_rot_e8(float *mxg, const int *mrows, int p, int D){
     }
 }
 #endif
+/* moe()'s MB_BUILD subset builder (review F2): coli_metal_moe_block(_begin) take ONE
+ * fmt/qgs for an entire GPU batch of experts (+ optionally the fused shared expert), so
+ * a candidate member at (fmt,gs) is only safe to fold into a batch already established
+ * at (est_fmt,est_gs) if it can't disagree about layout: fmt=4 (grouped int4) is the
+ * only format with a group size to disagree ON, so this is a no-op (always compatible)
+ * for est_fmt!=4 (nothing established yet, or the batch isn't grouped) or fmt!=4 (the
+ * candidate itself isn't grouped -- its own fmt mismatch is a separate, pre-existing gap
+ * this guard does not cover, see MB_BUILD's comment). Pulled out of MB_BUILD as its own
+ * function so it's independently testable (see tests/test_moe_gs_guard.c). */
+static int mb_gs_compat(int est_fmt, int est_gs, int fmt, int gs){
+    return !(est_fmt==4 && fmt==4 && gs!=est_gs);
+}
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
@@ -4253,19 +4296,37 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
          * batch's rows all share s, so this is one FWHT per token in practice. The down
          * input is rotated on-GPU by moe_fwht inside moe_submit. */
         int is_miss[64]={0}; ColiMetalMoeHandle *mh=NULL;
-        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, sh_in=0;
+        int cpu_res=1, cpu_miss=1, mh_shared=0, nbb=0, Rtot=0, mfmt=-1, mgs=0, mgs_ok=1, sh_in=0;
         const void *MG[65],*MU[65],*MD[65]; const float *MGS[65],*MUS[65],*MDS[65];
         int xoffb[65],nrb[65];
         float *mxg=NULL; int *mrows=NULL; float *mrw=NULL;
-        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH) */
+        /* subset builder: experts with is_miss==WANTMISS (+ shared expert when TRY_SH).
+         * mgs_ok (review F2): moe_submit takes ONE fmt/qgs for the WHOLE batch, so a
+         * fmt=4 subset needs every member's group size to agree with the first expert's
+         * (mgs) -- fmt equality alone (already checked below for the shared expert) isn't
+         * enough once fmt=4 has a group size to disagree on. Routed experts get the same
+         * guard against each other (first-expert-gs consistency): a v1-class mixed-
+         * precision container could in principle mint routed experts at different gs
+         * within one layer (qt_resolve_fmt derives fmt/gs per-tensor from the file, with
+         * no uniformity enforced across experts at load time), even though a normal
+         * single-pass conversion never would. mgs_ok=0 does NOT drop the mismatched
+         * expert's rows: it leaves nbb's bookkeeping untouched and instead suppresses the
+         * GPU submit call at the two call sites below, which leaves cpu_res/cpu_miss at
+         * their initial 1 -- the same state a genuine GPU submission failure leaves them
+         * in, so the existing CPU fallback loop (metal_done false) redoes this whole
+         * nb-expert block correctly regardless of the mismatch. (Not checked, and out of
+         * scope for this guard: per-expert fmt agreement across g/u/d, and gs agreement
+         * across sh_gate/sh_up/sh_down or across a single expert's own g/u/d -- see
+         * WORKER_REPORT UNCERTAINTIES.) */
         #define MB_BUILD(WANTMISS, TRY_SH) do{ \
-            nbb=0; Rtot=0; mfmt=-1; sh_in=0; \
+            nbb=0; Rtot=0; mfmt=-1; mgs=0; mgs_ok=1; sh_in=0; \
             for(int j=0;j<nb;j++){ if(is_miss[j]!=(WANTMISS)) continue; \
                 int eid=uniq[base+j]; ESlot *e=use[j]; int cnt=0; \
                 for(int s=0;s<S;s++) for(int kk=0;kk<keff[s];kk++) \
                     if(idxs[(int64_t)s*K+kk]==eid){ cnt++; break; } \
                 if(!cnt) continue; \
-                if(mfmt<0) mfmt=e->g.fmt; \
+                if(mfmt<0){ mfmt=e->g.fmt; mgs=e->g.gs; } \
+                else if(!mb_gs_compat(mfmt,mgs,e->g.fmt,e->g.gs)) mgs_ok=0; \
                 MG[nbb]=e->g.fmt==1?(const void*)e->g.q8:(const void*)e->g.q4; \
                 MU[nbb]=e->u.fmt==1?(const void*)e->u.q8:(const void*)e->u.q4; \
                 MD[nbb]=e->d.fmt==1?(const void*)e->d.q8:(const void*)e->d.q4; \
@@ -4273,8 +4334,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 xoffb[nbb]=Rtot; nrb[nbb]=cnt; Rtot+=cnt; nbb++; \
             } \
             if(TRY_SH){ int shf = mfmt<0 ? l->sh_gate.fmt : mfmt; \
-                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf){ \
-                    if(mfmt<0) mfmt=shf; \
+                if(c->n_shared==1 && sI==I && l->sh_gate.fmt==shf && l->sh_up.fmt==shf && l->sh_down.fmt==shf \
+                   && mb_gs_compat(mfmt,mgs,shf,l->sh_gate.gs)){ \
+                    if(mfmt<0){ mfmt=shf; mgs=l->sh_gate.gs; } \
                     MG[nbb]=shf==1?(const void*)l->sh_gate.q8:(const void*)l->sh_gate.q4; \
                     MU[nbb]=shf==1?(const void*)l->sh_up.q8  :(const void*)l->sh_up.q4; \
                     MD[nbb]=shf==1?(const void*)l->sh_down.q8:(const void*)l->sh_down.q4; \
@@ -4295,13 +4357,15 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             mxg=falloc((int64_t)(nb+1)*S*D);
             mrows=xalloc((size_t)(nb+1)*S*sizeof(int),"moe mrows"); mrw=xalloc((size_t)(nb+1)*S*sizeof(float),"moe mrw");
             MB_BUILD(0, base==0 && !g_pre_sh);
-            if(nbb>0){
+            if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
-                mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
+                mh=coli_metal_moe_block_begin(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw);
                 m->t_emm += now_s()-t0;
                 if(mh){ cpu_res=0; mh_shared=sh_in; }
-            } else cpu_res=0;
+            } else if(!nbb) cpu_res=0;   /* nbb==0: nothing in this subset. nbb>0 && !mgs_ok
+                                          * (F2): gs-heterogeneous fmt=4 subset -- leave
+                                          * cpu_res=1 so the CPU loop below redoes it. */
         }
 #endif
         /* Expert loads run HERE, after the resident-experts GPU submit above: under METAL the
@@ -4358,12 +4422,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int q=0;q<nmiss;q++) pipe_wait(q);
                 m->t_ewait += now_s()-tw; }
             MB_BUILD(1, 0);                                   /* missed experts, now loaded */
-            if(nbb>0){
+            if(nbb>0 && mgs_ok){
                 double t0=now_s();
                 if(mfmt==6) metal_stage_rot_e8(mxg,mrows,Rtot,D);
-                if(coli_metal_moe_block(nbb,D,I,mfmt,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
+                if(coli_metal_moe_block(nbb,D,I,mfmt,mgs,MG,MU,MD,MGS,MUS,MDS,mxg,xoffb,nrb,mrows,mrw,out,S)) cpu_miss=0;
                 m->t_emm += now_s()-t0;
-            } else cpu_miss=0;
+            } else if(!nbb) cpu_miss=0;   /* see the resident-subset call site above */
             if(mh){ double t0=now_s();
                 if(coli_metal_moe_block_end(mh,out)){ if(mh_shared) shared_on_gpu=1; }
                 else cpu_res=1;
@@ -5549,7 +5613,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
     if(g_metal_enabled && !kvs && S<=4 && li<c->n_layers && l->sparse
        && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[li]==0
        && D==6144 && c->n_heads==64 && c->q_lora==2048 && c->kv_lora==512
-       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && l->kv_b.fmt==2
+       && c->qk_nope==192 && c->qk_rope==64 && c->v_head==256 && (l->kv_b.fmt==2||(l->kv_b.fmt==4&&!g_moe_exact))
        && c->n_experts==256 && c->topk==8 && c->n_shared==1 && c->moe_inter==2048
        && metal_fused_fmt_ok(l->q_a.fmt) && metal_fused_fmt_ok(l->q_b.fmt)
        && metal_fused_fmt_ok(l->kv_a.fmt) && metal_fused_fmt_ok(l->o.fmt)
@@ -5568,7 +5632,7 @@ static void layer_forward_rows(Model *m, Layer *l, int li, float *x, int S, int 
                 WP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a.gs, l->q_a_ln,
                 WP_(l->q_b), l->q_b.s, l->q_b.fmt, l->q_b.gs,
                 WP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a.gs, l->kv_a_ln,
-                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WP_(l->kv_b), l->kv_b.s, l->kv_b.fmt, l->kv_b.gs,
                 WP_(l->o), l->o.s, l->o.fmt, l->o.gs,
                 WP_(l->sh_gate), l->sh_gate.s, l->sh_gate.fmt, l->sh_gate.gs,
                 WP_(l->sh_up),   l->sh_up.s,   l->sh_up.fmt,   l->sh_up.gs,
@@ -9324,6 +9388,7 @@ int main(int argc, char **argv){
         fprintf(stderr,"[METAL] mode: batched routed experts on GPU (unified-memory zero-copy)\n");
         if(getenv("COLI_METAL_SPIN") && atoi(getenv("COLI_METAL_SPIN"))){ coli_metal_spin_start(); fprintf(stderr,"[METAL] keep-alive spinner ON\n"); }
         if(getenv("COLI_METAL_GEMM_MIN")) g_metal_gemm_min=atoi(getenv("COLI_METAL_GEMM_MIN"));
+        { const char *e=getenv("COLI_METAL_MOE_EXACT"); g_moe_exact=(e&&e[0]&&e[0]!='0'); }
     }
 #else
     if(getenv("COLI_METAL") && atoi(getenv("COLI_METAL"))){
