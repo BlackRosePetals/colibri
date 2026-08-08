@@ -266,6 +266,15 @@ def need_model(model, engine=None):
                   "deepseek-v4" if arch == "deepseek_v4" else "colibri")
         sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
 
+# One-shot runs keep the historic 1024. Interactive sessions get 16384, because
+# the browser and the TUI both offer a per-request limit and the server treats
+# --ngen as a hard ceiling it clamps to (#260) -- so a low ceiling makes the
+# user's own control inert instead of merely cautious. Still a ceiling, not a
+# target: generation ends at EOS either way.
+def ngen_for(a, interactive=False):
+    if getattr(a, "ngen", None): return a.ngen
+    return 16384 if interactive else 1024
+
 def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
@@ -295,11 +304,11 @@ def env_for_engine(a, arch):
             if sys.platform != "win32":
                 env.setdefault("OMP_PROC_BIND", "close")
                 env.setdefault("OMP_PLACES", "cores")
-    if a.ngen: env["NGEN"] = str(a.ngen)
+    env["NGEN"] = str(ngen_for(a))          # ngen_for keeps the historic 1024 here
     if a.temp is not None: env["COLI_TEMP"] = str(a.temp)
     if arch == "olmoe":
         env["CHAT"] = "1"
-        if a.ngen: env["MAX_NEW"] = str(a.ngen)
+        env["MAX_NEW"] = str(ngen_for(a))
         if a.temp is not None: env["TEMP"] = str(a.temp)
     # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
@@ -416,7 +425,7 @@ def env_for(a):
         e.setdefault("PILOT_REAL", "1")
     e["COLI_POLICY"]=a.policy
     if a.ram:  e["RAM_GB"]=str(a.ram)
-    if a.ngen: e["NGEN"]=str(a.ngen)
+    e["NGEN"]=str(ngen_for(a))
     if a.topp: e["TOPP"]=str(a.topp)
     if a.topk: e["TOPK"]=str(a.topk)
     if a.temp is not None: e["COLI_TEMP"]=str(a.temp)   # 0 = greedy; default motore: 1.0 + nucleus 0.95
@@ -840,7 +849,7 @@ def cmd_run(a):
                 cmd += ["--prompt-file",prompt_path]
             else:
                 cmd.append(prompt)
-            cmd += ["--max-tokens",str(a.ngen)]
+            cmd += ["--max-tokens",str(ngen_for(a,interactive=True))]
             if a.ram: cmd += ["--memory-gb",str(a.ram)]
             if os.environ.get("COLI_THINK","0")=="1": cmd.append("--thinking")
             result=subprocess.call(cmd,env=env_for_engine(a,arch))
@@ -913,7 +922,7 @@ def chat_attached(a, base, model_id):
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         msgs.append({"role":"user","content":msg})
         body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
-                         "max_tokens":a.ngen}).encode()
+                         "max_tokens":ngen_for(a,interactive=True)}).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
@@ -1008,7 +1017,7 @@ def cmd_chat(a):
         # legacy 8, an explicit value -- 0 included -- passes verbatim).
         cmd=[sys.executable,openai_server.__file__,"--model",a.model,
              "--engine",engine,"--arch",arch,"--model-id",model_id,
-             "--host","127.0.0.1","--port","8000","--max-tokens",str(a.ngen)]
+             "--host","127.0.0.1","--port","8000","--max-tokens",str(ngen_for(a,interactive=True))]
         if a.cap is not None: cmd+=["--cap",str(a.cap)]
         if a.api_key: cmd+=["--api-key",a.api_key]
         p=subprocess.Popen(cmd,env=env_for_engine(a,arch))
@@ -1148,8 +1157,8 @@ def cmd_chat(a):
                 print(f"\r  {C.dgray}└─ {st['tok']} tok · {st['tps']:.2f} tok/s · hit {st['hit']:.0f}% · RSS {st['rss']:.1f} GB · {el:.0f}s{C.r}")
                 if st.get("interrupted"):
                     print(f"  {C.yel}⏹ interrupted; type :more to continue the response{C.r}")
-                elif st["tok"]>=a.ngen:
-                    print(f"  {C.yel}…stopped at --ngen ({a.ngen}); type :more to continue the response{C.r}")
+                elif st["tok"]>=ngen_for(a,interactive=True):
+                    print(f"  {C.yel}…stopped at --ngen ({ngen_for(a,interactive=True)}); type :more to continue the response{C.r}")
                 print()
             else:
                 if st.get("interrupted"): print(f"  {C.yel}⏹ interrupted{C.r}")
@@ -1185,7 +1194,7 @@ def cmd_serve(a):
                             "glm-5.2-colibri")
     try:
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,a.ngen,engine,env_for_engine(a,arch),a.cors_origin,
+              a.cap,ngen_for(a,interactive=True),engine,env_for_engine(a,arch),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))
@@ -1371,7 +1380,11 @@ def main():
     # legacy 8 (openai_server.cap_for_arch). An explicit --cap N -- 0 included --
     # reaches the engine verbatim; see colibri.c's coli_resolve_cap().
     common.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
-    common.add_argument("--ngen", type=int, default=1024)  # rete di sicurezza: la fine vera la decidono gli stop token
+    # default None, resolved per command by ngen_for() below. 1024 is a sensible
+    # safety net for a one-shot `coli run`; it is the wrong number for a session
+    # where the browser shows a "max output tokens" control, because the server
+    # clamps to it and the control silently does nothing above 1024 (#889).
+    common.add_argument("--ngen", type=int, default=None)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     ap=argparse.ArgumentParser(prog="coli", parents=[common], description="colibri — run GLM-5.2 locally")
