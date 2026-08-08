@@ -3301,9 +3301,8 @@ typedef struct {
 } ExpertLoadHandle;
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-#ifndef COLI_V4_EXPERT_LOADER_COUNT
-#define COLI_V4_EXPERT_LOADER_COUNT 3
-#endif
+/* COLI_V4_EXPERT_LOADER_COUNT defaults in deepseek_v4_internal.h so the CLI
+ * sees the same worker count when sizing the OpenMP team. */
 enum { DUAL_EXPERT_LOADER_COUNT = COLI_V4_EXPERT_LOADER_COUNT };
 
 typedef struct {
@@ -6720,6 +6719,9 @@ int coli_v4_prompt_build(char **output, size_t *output_length,
 #include <sys/resource.h>                         /* getrusage/RUSAGE_SELF for v4_serve_rss_gb;
                                                    * on Windows compat.h supplies the shim. */
 #endif
+#ifdef _OPENMP
+#include <omp.h>                                  /* team sizing around the expert loaders */
+#endif
 
 #define main coli_v4_first_token_legacy_main
 /* ---- begin include tools/deepseek_v4_first_token.c ---- */
@@ -8573,7 +8575,32 @@ static int v4_serve_main(void) {
 
 
 #ifndef COLI_V4_SKIP_GENERATE_MAIN
+#ifdef _OPENMP
+/* Size the OpenMP team so the block pipeline's persistent expert-loader
+ * workers keep whole CPUs. The OpenMP default team spans every logical CPU,
+ * which schedules compute threads onto the CPUs the loaders need -- and on a
+ * disk-bound decode the loaders are doing the rate-limiting work (the same
+ * rationale omp_tune.h records for the spin-wait half of the GLM tuning: a
+ * busy team steals cores from the I/O pool). An explicit OMP_NUM_THREADS or
+ * COLI_NO_OMP_TUNE=1 wins, exactly like the other engines' tuning. */
+static void v4_omp_reserve_loader_cpus(void) {
+    if (getenv("COLI_NO_OMP_TUNE")) return; /* family-wide kill-switch */
+    if (getenv("OMP_NUM_THREADS")) return;  /* the user already chose */
+    int logical = omp_get_max_threads();
+    int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
+    if (team < 2) return; /* tiny machine: leave the OpenMP default alone */
+    omp_set_num_threads(team);
+    fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
+                    "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
+                    "overrides, COLI_NO_OMP_TUNE=1 disables\n",
+            team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _OPENMP
+    v4_omp_reserve_loader_cpus();
+#endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
         return v4_serve_main();
     double process_started = spec_now();
