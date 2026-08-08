@@ -7118,6 +7118,7 @@ int main(int argc, char **argv) {
            text_mode ? generated_count : token_count,
            (unsigned long long)stats.misses,
            (unsigned long long)stats.bytes_read);
+
     if (text_mode) {
         size_t text_capacity = (size_t)generated_count * 256 + 1;
         char *text = malloc(text_capacity);
@@ -8759,6 +8760,10 @@ int main(int argc, char **argv) {
     };
     ColiV4SessionGenerateStats gen_stats;
     memset(&gen_stats, 0, sizeof(gen_stats));
+    /* clock_gettime inline rather than a helper: the amalgamated build compiles
+     * this file once per COLI_V4_UNIT_*, and hot_now() is static to another one. */
+    struct timespec tune_a, tune_b;
+    clock_gettime(CLOCK_MONOTONIC, &tune_a);
     if (coli_v4_session_generate(session, prompt, prompt_length, &gen_opts,
                                  NULL, NULL, &gen_stats, error,
                                  sizeof(error))) {
@@ -8784,6 +8789,18 @@ int main(int argc, char **argv) {
            (unsigned long long)stats_end.hits,
            (unsigned long long)stats_end.misses, stats_hit_rate(stats_end),
            (unsigned long long)stats_end.bytes_read, target_only);
+    /* One line, every engine, one format: `coli tune` sweeps scheduling knobs and
+     * needs tokens-and-elapsed to compare candidates. Before this only colibri
+     * emitted a parseable throughput line (REPLAY decode), so the tuner was
+     * GLM-only and bannered the right model while launching the wrong engine
+     * (#898). stdout, which is what autotune captures -- the v4_* diagnostics
+     * above go to stderr. Tokens and seconds rather than tok/s: the ratio is
+     * derived by the caller at full precision (#852). */
+    clock_gettime(CLOCK_MONOTONIC, &tune_b);
+    printf("TUNE decode: %d tokens in %.3fs\n", gen_stats.generated_tokens,
+           (double)(tune_b.tv_sec - tune_a.tv_sec) +
+           (tune_b.tv_nsec - tune_a.tv_nsec) * 1e-9);
+    fflush(stdout);
     fprintf(stderr, "generated_text=");
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
