@@ -279,6 +279,26 @@ int main(void){
         CHECK(main_cache.slab_cap >= narrow);  /* and still holds what it holds */
     }
 
+    /* ---- E. the diagnostic switch actually gates the shrink ---------------- */
+    /* g_slab_shrink is set from COLI_SLAB_SHRINK in main(), which this test does
+     * not run -- so it is set directly here. Verifying the switch by exporting
+     * the variable would have proved nothing, and very nearly did. */
+    {
+        ESlot s2; memset(&s2,0,sizeof s2);
+        g_slab_shrink = 0;
+        CHECK(expert_load(&m,N_LAYERS,0,&s2,0,0)==0);          /* wide */
+        int64_t wide_cap = s2.slab_cap;
+        CHECK(expert_load(&m,FIRST_DENSE,0,&s2,0,0)==0);       /* then narrow */
+        printf("E. shrink OFF: %lld B -> %lld B (must not move)\n",
+            (long long)wide_cap,(long long)s2.slab_cap);
+        CHECK(s2.slab_cap == wide_cap);        /* grow-only: the wide slab stays */
+        g_slab_shrink = 1;
+        CHECK(expert_load(&m,FIRST_DENSE,1,&s2,0,0)==0);       /* narrow again, shrink on */
+        printf("E. shrink ON : %lld B -> %lld B (must come down)\n",
+            (long long)wide_cap,(long long)s2.slab_cap);
+        CHECK(s2.slab_cap < wide_cap);
+    }
+
     /* ---- C. arena slices must never be shrunk ------------------------------ */
     /* pin_arena_bind hands slots interior pointers into ONE per-layer allocation
      * (#419). Freeing one would corrupt the heap, and they are already per-layer
