@@ -79,6 +79,61 @@ jobs:
         # compiled decode arm; it just had no job to run in.
         run: make -C c fuzz-rans
 
+  # The Vulkan backend, COMPILED AND RUN. Before this job, `grep -rn "VK=1\|glslc\|vulkan"
+  # .github/workflows/` returned nothing: backend_vulkan.c and the four GLSL shaders were
+  # never built by any job, so they could be broken on dev and every check would stay green.
+  # Three Vulkan PRs were open at the time this landed, all written by people without the
+  # hardware and reviewed by reading the diff.
+  #
+  # Lavapipe (Mesa's software Vulkan) is what makes running it possible without a GPU. It
+  # says NOTHING about performance -- it is a CPU rasteriser and will be slower than the
+  # ordinary CPU path -- and it does not reproduce driver-specific behaviour, such as the
+  # VK_EXT_memory_budget under-reporting on RADV RX 6000 reported in #891. What it does
+  # prove is that the shaders compile, the device and queue negotiation works, the expert
+  # tier initialises, and the code path executes at all.
+  vulkan:
+    name: Vulkan (Lavapipe, software)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the Vulkan toolchain and a software driver
+        run: |
+          sudo apt-get update
+          # libvulkan-dev: headers + loader. glslc: compiles the .comp shaders to SPIR-V --
+          # neither is present on the runner by default, which is half of why VK=1 was
+          # never built here. mesa-vulkan-drivers carries Lavapipe (lvp).
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan-dev glslc mesa-vulkan-drivers
+      - name: Build with VK=1
+        run: |
+          cd c
+          make colibri VK=1
+          # The shaders are a separate failure mode from the C: glslc can reject a .comp
+          # while backend_vulkan.c compiles perfectly. Assert all four exist.
+          ls -l shaders/qmatmul.spv shaders/qmatmul_gate_up.spv \
+                shaders/attention_absorb.spv shaders/rmsnorm.spv
+          ldd colibri | grep -q libvulkan || { echo "FAIL: built without linking libvulkan"; exit 1; }
+      - name: Initialise the backend against Lavapipe
+        run: |
+          cd c
+          # A config.json is enough to reach coli_vk_init(): it runs before any weight is
+          # read, so the run fails afterwards on the missing model and that is expected.
+          # What is asserted is the [VK] banner, not a successful load.
+          mkdir -p /tmp/vkprobe
+          echo '{"model_type":"glm_moe_dsa"}' > /tmp/vkprobe/config.json
+          VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+          COLI_NO_OMP_TUNE=1 COLI_VULKAN=1 SNAP=/tmp/vkprobe \
+            timeout 120 ./colibri > vk.log 2>&1 || true
+          cat vk.log
+          # coli_vk_init() returns 0 and the engine exits 2 with "Vulkan backend
+          # unavailable" when the loader finds no device or the shaders are missing, so
+          # this line is the whole gate.
+          grep -q "\[VK\] ready:" vk.log || {
+            echo "FAIL: the Vulkan backend did not initialise"; exit 1; }
+          grep -q "expert tier active" vk.log || {
+            echo "FAIL: Vulkan initialised but the expert tier did not activate"; exit 1; }
+          echo "OK: shaders compiled, device negotiated, expert tier active"
+
   engines-all-platforms:
     name: All engines (${{ matrix.name }})
     strategy:
