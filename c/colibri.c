@@ -89,6 +89,21 @@ static inline void omp_set_num_threads(int n){ (void)n; }
  * active" without needing COLI_METAL (and the backend_metal.h / Metal framework link it
  * would drag in) on every platform's test build. */
 static int g_metal_enabled;
+/* COLI_SLAB_SHRINK=0 disables the #856 slab shrink at runtime.
+ *
+ * The shrink stops a wide slab migrating into a narrow row through the
+ * ws[]<->LRU swap, which is what lets the cap be priced per row. It is also the
+ * only new allocator work in that change: a slot alternating between the int8
+ * MTP row and the int4 main rows reallocates instead of staying wide, and at
+ * ~19-38 MB glibc serves that with mmap/munmap plus page faults on first touch.
+ * #869 stated that cost was unmeasured; #885 then measured five runs on an
+ * int4-g64 container at 1.12/0.98/1.11/0.97/1.05 -- spread 0.15, bimodal --
+ * against <=0.02 on every other arm of the same box.
+ *
+ * This exists so that hypothesis can be A/B'd without a rebuild. Setting it to 0
+ * restores grow-only and re-introduces the migration, so the per-row cap becomes
+ * optimistic again: a diagnostic, not a supported configuration. */
+static int g_slab_shrink = 1;
 #ifdef COLI_METAL
 #include "backend_metal.h"
 /* No <omp.h> here: the guarded include above already provides it under _OPENMP
@@ -97,7 +112,9 @@ static int g_metal_enabled;
  * stock macOS -- exactly the platform this backend targets -- even though the
  * Makefile advertises the single-threaded path ("libomp not found: building
  * single-threaded"). */
-static int g_metal_enabled;
+/* g_metal_enabled is declared unconditionally above (#587) so portable code can
+ * read it; the duplicate that used to sit here was a tentative definition the
+ * linker merged, hence no warning and no symptom. */
 static int g_metal_gemm_min=16;   /* COLI_METAL_GEMM_MIN: min rows to send a matmul_qt GEMM to GPU */
 static int g_moe_exact=0;
 /* output dello shared expert gia' calcolato su GPU (solo Metal layer-CB) */
@@ -2337,7 +2354,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
      * have nothing to shrink. */
     int64_t want=wtot+8192;
     int64_t hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;   /* 64 KB clears the 16 KB METAL rounding */
-    if(!s->slab || want > s->slab_cap || (!s->aslab && s->slab_cap > want+hyst)){
+    if(!s->slab || want > s->slab_cap || (g_slab_shrink && !s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         /* page-align + zero-copy wrap: the GPU reads this slab in place (unified memory) */
         if(s->slab && g_metal_enabled) coli_metal_unregister(s->slab);
@@ -2356,7 +2373,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
     /* The scales migrate with their weights, so they shrink on the same rule (#856).
      * fslab_cap counts FLOATS, so the hysteresis is in floats too. */
     int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
-    if(!s->fslab || ftot > s->fslab_cap || (!s->afslab && s->fslab_cap > ftot+fhyst)){
+    if(!s->fslab || ftot > s->fslab_cap || (g_slab_shrink && !s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         /* page-align + register: the GPU reads the scales in place (unified memory).
          * Honours `fatal` exactly like the CPU arm below — a speculative pilot load
@@ -2567,7 +2584,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
      * cap_for_ram() computes stops being true. Same hysteresis, same arena guard. */
     int64_t want=wtot+8192, hyst=want/4; if(hyst<(1<<16)) hyst=1<<16;
     int64_t fhyst=ftot/4; if(fhyst<(1<<14)) fhyst=1<<14;   /* floats, so 64 KB again */
-    if(!s->slab || want>s->slab_cap || (!s->aslab && s->slab_cap > want+hyst)){
+    if(!s->slab || want>s->slab_cap || (g_slab_shrink && !s->aslab && s->slab_cap > want+hyst)){
 #ifdef COLI_METAL
         if(s->slab&&g_metal_enabled) coli_metal_unregister(s->slab);
         compat_aligned_free(s->slab);
@@ -2582,7 +2599,7 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
         s->slab_cap=wtot+8192;
 #endif
     }
-    if(!s->fslab || ftot>s->fslab_cap || (!s->afslab && s->fslab_cap > ftot+fhyst)){
+    if(!s->fslab || ftot>s->fslab_cap || (g_slab_shrink && !s->afslab && s->fslab_cap > ftot+fhyst)){
 #ifdef COLI_METAL
         if(s->fslab&&g_metal_enabled) coli_metal_unregister(s->fslab);
         free(s->fslab); size_t fb=(((size_t)ftot*sizeof(float))+16383)&~(size_t)16383;
@@ -9215,6 +9232,11 @@ int main(int argc, char **argv){
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_pipe_block = getenv("COLI_PIPE_BLOCK")?atoi(getenv("COLI_PIPE_BLOCK")):0; /* blocking pipe_wait (default: spin) */
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
+    g_slab_shrink = getenv("COLI_SLAB_SHRINK") ? atoi(getenv("COLI_SLAB_SHRINK")) : 1;
+    if(!g_slab_shrink)
+        fprintf(stderr,"[SLAB] shrink disabled (COLI_SLAB_SHRINK=0): reused slots keep the widest "
+                       "width they have held, so the per-row cap is optimistic again. Diagnostic "
+                       "for #885 -- not a supported configuration.\n");
     { const char *dh=getenv("COLI_DISKCLASS_WINDOW");        /* DISK-CLASS recency window, see its declaration */
       if(dh){ g_direct_heat_ticks=(uint32_t)strtoul(dh,NULL,10); g_direct_heat_explicit=1; } }
     g_uring = getenv("URING")?atoi(getenv("URING")):0;
@@ -9548,10 +9570,30 @@ int main(int argc, char **argv){
               m.ecap,&preserved_cap);
           double pin_bytes=autopin_preserve_lru(
               planned_pin,expert_available,lru_reserve);
-          if(pin_bytes+1.0<planned_pin)
-              fprintf(stderr,"[PIN] auto: %.1f GB plan capped to %.1f GB to preserve "
-                  "the no-pin LRU cap %d/layer\n",
-                  planned_pin/1e9,pin_bytes/1e9,preserved_cap);
+          /* Print every term, every time, capped or not.
+           *
+           * This line used to appear ONLY when the clamp bit (pin_bytes <
+           * planned_pin), which makes "the reserve was zero" and "the reserve
+           * did not bind" indistinguishable from the outside -- and those are
+           * the two hypotheses anyone debugging placement is choosing between.
+           * #885 took fourteen instrumented runs on a 128 GB host to establish
+           * numbers this line already had in registers. @mohamedmastouri2000-boop
+           * asked for exactly this, twice, before anyone acted on it.
+           *
+           * budget  = what expert_avail() left after resident + slack
+           * plan    = 0.5 * budget * confidence(history), the autopin quota
+           * reserve = cap * per-row width, held back for the adaptive LRU (#815)
+           * max_pin = budget - reserve, the ceiling the plan is clamped to
+           *
+           * A reserve near the budget means the pin is being starved by a
+           * reservation the LRU may never claim, since the LRU is demand-filled
+           * and only allocates on a miss. That is visible here at a glance. */
+          fprintf(stderr,"[PIN] auto: budget %.1f GB | plan %.1f GB (conf %.2f, %lld selections) | "
+              "LRU reserve %.1f GB (cap %d/layer x %.1f MB/row-set) | max_pin %.1f GB -> pinning %.1f GB%s\n",
+              expert_available/1e9, planned_pin/1e9, conf, (long long)hist,
+              lru_reserve/1e9, preserved_cap, expert_cache_bytes_per_slot(&m,ebits)/1e6,
+              (expert_available-lru_reserve)/1e9, pin_bytes/1e9,
+              pin_bytes+1.0<planned_pin ? "  [CAPPED by the LRU reserve]" : "");
           double pin_gb=pin_bytes/1e9;
           if(pin_gb>=0.5) pin_load(&m, g_usage_path, pin_gb, 0);   /* auto-discovered: not trusted */
       }
