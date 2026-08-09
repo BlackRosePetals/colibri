@@ -79,6 +79,38 @@ class AutotuneUnitTest(unittest.TestCase):
         )
         self.assertEqual(result["tok_s"], 1234.56)
 
+    def test_accepts_the_common_TUNE_line_from_the_sibling_engines(self):
+        """#898: only colibri emitted a parseable throughput line, so the tuner
+        was GLM-only. The four sibling engines now print `TUNE decode: N tokens
+        in T.TTTs` at the end of an ordinary greedy run."""
+        result = parse_replay("TUNE decode: 16 tokens in 8.000s\n")
+        self.assertAlmostEqual(result["tok_s"], 2.0)
+
+    def test_refuses_output_with_neither_line(self):
+        """An engine that printed nothing parseable used to raise 'did not emit
+        REPLAY throughput'. It must still refuse rather than score it as zero."""
+        with self.assertRaises(ValueError):
+            parse_replay("no decode line here\n")
+
+    def test_glm_only_knobs_are_not_swept_on_other_engines(self):
+        """PIPE and DIRECT are read by colibri alone -- 3 and 1 occurrences in
+        colibri.c, 0 in each of the other four. Sweeping them elsewhere spends
+        the replay budget proving two identical runs are identical, then reports
+        the 0% difference as a measurement."""
+        plan = {"cpu": {"physical_cores": 8, "sockets": 1},
+                "tiers": {"disk": {"cold_expert_bytes": 1 << 30}, "vram": {"devices": []}}}
+        glm = dict(candidate_steps(plan, {}, "glm"))
+        self.assertIn("direct-on", glm)
+        self.assertIn("io-pipe-on", glm)
+        for arch in ("deepseek_v4", "kimi", "inkling", "olmoe"):
+            with self.subTest(arch=arch):
+                steps = dict(candidate_steps(plan, {}, arch))
+                self.assertNotIn("direct-on", steps)
+                self.assertNotIn("io-pipe-on", steps)
+                # OMP and NUMA are engine-agnostic and must survive, or the
+                # sweep has nothing left to measure on those engines.
+                self.assertTrue(any(name.startswith("omp-") for name in steps), steps)
+
     def test_profile_round_trip_and_explicit_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "engine"
