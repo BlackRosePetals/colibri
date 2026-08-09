@@ -126,6 +126,26 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("RAM_GB", env)
 
+    def test_ngen_default_differs_for_interactive_commands(self):
+        """#889: `coli web` passed --max-tokens 1024, and openai_server clamps a
+        request to that ceiling (#260), so the browser's own "max output tokens"
+        control silently did nothing above 1024. One-shot runs keep 1024; a
+        session where the user has a control gets a ceiling that is not in the
+        way. An explicit --ngen always wins."""
+        run = argparse.Namespace(ngen=None)
+        self.assertEqual(self.cli.ngen_for(run), 1024)
+        self.assertEqual(self.cli.ngen_for(run, interactive=True), 16384)
+        explicit = argparse.Namespace(ngen=300)
+        self.assertEqual(self.cli.ngen_for(explicit), 300)
+        self.assertEqual(self.cli.ngen_for(explicit, interactive=True), 300)
+
+    def test_one_shot_env_still_carries_the_historic_ngen(self):
+        """The default moved to None so the two cases can be told apart. These
+        sites must not become "unset": before, NGEN was always exported."""
+        args = argparse.Namespace(ngen=None, temp=None, ram=0, ctx=0)
+        env = self.cli.env_for_engine(args, "deepseek_v4")
+        self.assertEqual(env["NGEN"], "1024")
+
     def test_kimi_does_not_get_v4_only_settings(self):
         """The widening is RAM_GB alone; CTX and the V4 speculation defaults stay
         where they were."""
