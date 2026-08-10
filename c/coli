@@ -26,6 +26,16 @@ Configuration through environment variables or flags (also valid after the subco
 """
 import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
 
+# input() only gets line editing and UP/DOWN history once the readline module
+# has been LOADED — without it the terminal's arrow-key escape sequences are
+# echoed raw into the prompt (#922). Guarded: Windows has no readline module
+# and the console provides its own editing; on FreeBSD Python links libedit,
+# which this activates the same way.
+try:
+    import readline  # noqa: F401 — importing it is the activation
+except ImportError:
+    pass
+
 # The engine mmaps every shard (144+ files); macOS default RLIMIT_NOFILE is 256.
 if sys.platform != "win32":
     try:
