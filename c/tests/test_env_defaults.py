@@ -132,6 +132,20 @@ class CudaAutoEnableTest(unittest.TestCase):
         self.assertNotIn("COLI_GPUS", e)
         self.assertNotIn("CUDA_EXPERT_GB", e)
 
+    def test_win32_does_not_auto_enable_an_unqualified_gpu(self):
+        # A device whose free memory is not qualified as a placement budget
+        # (free_bytes is None -- a Windows AMD part found through hipInfo) is
+        # discovered and worth reporting, but auto-enable is an automatic
+        # placement decision and must not be made from it. Bare `coli chat`
+        # stays on the CPU path, exactly as if nothing had been found.
+        identity_only = {"index": 0, "name": "AMD Radeon(TM) 8060S Graphics",
+                         "arch": "gfx1151", "total_bytes": 78 * 1024 ** 3,
+                         "free_bytes": None, "unified_memory": True}
+        e = self._env_for("win32", cuda=True, gpus=[identity_only])
+        self.assertNotIn("COLI_CUDA", e)
+        self.assertNotIn("COLI_GPUS", e)
+        self.assertNotIn("CUDA_EXPERT_GB", e)
+
     def test_win32_cpu_build_stays_silent(self):
         # No coli_cuda.dll (cuda=False) -> CPU build, nothing GPU-related emitted.
         e = self._env_for("win32", cuda=False, gpus=[self._fake_gpu()])
