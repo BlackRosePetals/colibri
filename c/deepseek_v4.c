@@ -3302,8 +3302,36 @@ typedef struct {
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 /* COLI_V4_EXPERT_LOADER_COUNT defaults in deepseek_v4_internal.h so the CLI
- * sees the same worker count when sizing the OpenMP team. */
+ * sees the same worker count when sizing the OpenMP team.
+ *
+ * The COUNT is only the DEFAULT lane count now: V4_LOADER_LANES=<1..16>
+ * raises or lowers it at runtime.  Measured on a 12-core streaming the real
+ * V4-Flash checkpoint from a VHDX: one 13.4 MB cold expert read costs ~48 ms
+ * with 3 lanes and ~29.6 ms with 10, because the disk scales almost linearly
+ * with queue depth (86 MB/s at QD1, 696 MB/s aggregate at QD8, measured with
+ * O_DIRECT dd on the same shards) while a lane spends its life blocked in
+ * pread.  Decode moved 6.2 -> 4.9 s/token on the same box.
+ *
+ * v4_omp_reserve_loader_cpus() deliberately keeps subtracting the COMPILE
+ * default, not the env value: lanes block in pread and do not need whole
+ * CPUs, and subtracting 10 from a 12-CPU box would leave the compute team
+ * at 2 threads -- the reservation and the pool depth are two consumers of
+ * this constant with OPPOSITE correctness directions, so the env knob moves
+ * only the pool. */
 enum { DUAL_EXPERT_LOADER_COUNT = COLI_V4_EXPERT_LOADER_COUNT };
+enum { DUAL_EXPERT_LOADER_MAX = 16 };
+
+static int dual_loader_lanes(void) {
+    static int lanes;
+    if (!lanes) {
+        const char *value = getenv("V4_LOADER_LANES");
+        int n = value ? atoi(value) : DUAL_EXPERT_LOADER_COUNT;
+        if (n < 1) n = DUAL_EXPERT_LOADER_COUNT;
+        if (n > DUAL_EXPERT_LOADER_MAX) n = DUAL_EXPERT_LOADER_MAX;
+        lanes = n;
+    }
+    return lanes;
+}
 
 typedef struct {
     pthread_t thread;
@@ -3319,7 +3347,7 @@ typedef struct {
     pthread_cond_t ready;
     pthread_cond_t complete;
     pthread_cond_t idle;
-    DualExpertLoaderSlot slots[DUAL_EXPERT_LOADER_COUNT];
+    DualExpertLoaderSlot slots[DUAL_EXPERT_LOADER_MAX];
 } DualExpertLoaderPool;
 
 static DualExpertLoaderPool dual_loader_pool = {
@@ -3352,11 +3380,11 @@ static void *dual_expert_loader_worker(void *argument) {
 
 static void dual_expert_loader_shutdown(void) {
     pthread_mutex_lock(&dual_loader_pool.mutex);
-    for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++)
+    for (int i = 0; i < dual_loader_lanes(); i++)
         dual_loader_pool.slots[i].stopping = 1;
     pthread_cond_broadcast(&dual_loader_pool.ready);
     pthread_mutex_unlock(&dual_loader_pool.mutex);
-    for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++)
+    for (int i = 0; i < dual_loader_lanes(); i++)
         if (dual_loader_pool.slots[i].available) {
             pthread_join(dual_loader_pool.slots[i].thread, NULL);
             dual_loader_pool.slots[i].available = 0;
@@ -3365,7 +3393,7 @@ static void dual_expert_loader_shutdown(void) {
 
 static void dual_expert_loader_init(void) {
     int available = 0;
-    for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++) {
+    for (int i = 0; i < dual_loader_lanes(); i++) {
         DualExpertLoaderSlot *slot = &dual_loader_pool.slots[i];
         if (!pthread_create(&slot->thread, NULL,
                             dual_expert_loader_worker, slot)) {
@@ -3383,14 +3411,14 @@ static int dual_expert_load_start(ExpertLoadHandle *handle,
     int selected = -1;
     while (selected < 0) {
         int available = 0;
-        for (int i = 0; i < DUAL_EXPERT_LOADER_COUNT; i++) {
+        for (int i = 0; i < dual_loader_lanes(); i++) {
             DualExpertLoaderSlot *slot = &dual_loader_pool.slots[i];
             if (!slot->available) continue;
             available++;
             if (!slot->job && !slot->pending) { selected = i; break; }
         }
         if (!available ||
-            (selected < 0 && available < DUAL_EXPERT_LOADER_COUNT)) {
+            (selected < 0 && available < dual_loader_lanes())) {
             pthread_mutex_unlock(&dual_loader_pool.mutex);
             return -1;
         }
@@ -3411,7 +3439,7 @@ static int dual_expert_load_start(ExpertLoadHandle *handle,
 
 static int dual_expert_load_finish(ExpertLoadHandle *handle) {
     if (!handle->active || handle->loader_slot < 0 ||
-        handle->loader_slot >= DUAL_EXPERT_LOADER_COUNT) return -1;
+        handle->loader_slot >= dual_loader_lanes()) return -1;
     pthread_mutex_lock(&dual_loader_pool.mutex);
     DualExpertLoaderSlot *slot =
         &dual_loader_pool.slots[handle->loader_slot];
@@ -3673,12 +3701,12 @@ static int moe_token_pipeline(float *output,
 
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    ExpertLoadJob jobs[DUAL_EXPERT_LOADER_COUNT] = {{0}};
-    ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_COUNT] = {{0}};
-    int loader_active[DUAL_EXPERT_LOADER_COUNT] = {0};
+    ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    int loader_active[DUAL_EXPERT_LOADER_MAX] = {0};
     if (!result) {
-        int preload = selected < DUAL_EXPERT_LOADER_COUNT
-            ? selected : DUAL_EXPERT_LOADER_COUNT;
+        int preload = selected < dual_loader_lanes()
+            ? selected : dual_loader_lanes();
         for (int i = 0; i < preload; i++) {
             jobs[i].store = store;
             jobs[i].key = (ColiExpertKey){weights->plan.layer, expert_ids[i]};
@@ -3715,7 +3743,7 @@ static int moe_token_pipeline(float *output,
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
     for (int current = 0; !result && current < selected; current++) {
-        int slot = current % DUAL_EXPERT_LOADER_COUNT;
+        int slot = current % dual_loader_lanes();
         if (!loader_active[slot] ||
             profiled_expert_load_finish(&loaders[slot]) != 0) {
             result = -1; break;
@@ -3724,7 +3752,7 @@ static int moe_token_pipeline(float *output,
         if (jobs[slot].result) { result = -1; break; }
         ColiExpertView expert = jobs[slot].view;
 
-        int next = current + DUAL_EXPERT_LOADER_COUNT;
+        int next = current + dual_loader_lanes();
         if (next < selected) {
             memset(&jobs[slot], 0, sizeof(jobs[slot]));
             jobs[slot].store = store;
@@ -3744,7 +3772,7 @@ static int moe_token_pipeline(float *output,
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
     }
-    for (int slot = 0; slot < DUAL_EXPERT_LOADER_COUNT; slot++)
+    for (int slot = 0; slot < dual_loader_lanes(); slot++)
         if (loader_active[slot]) {
             profiled_expert_load_finish(&loaders[slot]);
             if (!jobs[slot].result)

@@ -32,7 +32,8 @@ CFLAGS = -D_GNU_SOURCE -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp \
 	-include pthread.h -Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
-	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -static -pthread
 V4_BINARY := deepseek_v4.exe
 else
@@ -42,7 +43,8 @@ CFLAGS = -D_GNU_SOURCE -O3 -march=$(ARCH) -fopenmp -pthread -include pthread.h \
 	-Wall -Wextra -Wno-unused-parameter \
 	-Wno-misleading-indentation -Wno-unused-function \
 	-DCOLI_V4_MAX_PIN_SLOTS_PER_LAYER=16 \
-	-DCOLI_V4_PIN_RAMP_REQUESTS=24
+	-DCOLI_V4_PIN_RAMP_REQUESTS=24 \
+	-DCOLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
 LDFLAGS = -lm -fopenmp -pthread
 V4_BINARY := deepseek_v4
 endif
