@@ -225,6 +225,111 @@ class ResourcePlanTest(unittest.TestCase):
             devices = _discover_nvidia_gpus()
         self.assertTrue(devices[0]["unified_memory"])
 
+    # --- identity-only devices -------------------------------------------
+    # A device can be discovered without its free memory being qualified as a
+    # Colibri placement budget. That is the state of a Windows AMD device found
+    # through hipInfo: the runtime may well report a free figure, but on an
+    # integrated part it describes the same physical pages the host RAM tier is
+    # already counting. Until a later slice qualifies that relationship, such a
+    # device carries free_bytes=None -- "unknown for planning", which is NOT the
+    # same claim as free_bytes=0 ("measured, and none is free").
+
+    def _identity_only_gpu(self):
+        return {"index": 0, "name": "AMD Radeon(TM) 8060S Graphics",
+                "total_bytes": 78 * GB, "free_bytes": None,
+                "unified_memory": True}
+
+    def test_identity_only_gpu_is_planned_without_a_free_memory_value(self):
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[self._identity_only_gpu()],
+                          physical_cpus=8, cpu_sockets=1)
+        # It is still reported: the hardware exists and the user should see it.
+        names = [gpu["name"] for gpu in plan["tiers"]["vram"]["devices"]]
+        self.assertIn("AMD Radeon(TM) 8060S Graphics", names)
+        text = format_plan(plan)
+        self.assertIn("8060S", text)
+        # ...and the reader is told why it earns no tier, rather than being
+        # left to read "0.0 GB hot tier" as "the card is full".
+        self.assertIn("identity only", text)
+        self.assertTrue(any("not qualified as a placement budget" in warning
+                            for warning in plan["warnings"]))
+        # But it buys no tier.
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(plan["tiers"]["vram"]["expert_capacity"], 0)
+
+    def test_plan_wording_is_backend_neutral_without_a_gpu(self):
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[], physical_cpus=8,
+                          cpu_sockets=1)
+        text = format_plan(plan)
+        self.assertIn("no supported GPU detected", text)
+        self.assertNotIn("NVIDIA", text)
+
+    def test_identity_only_gpu_decides_nothing_a_cpu_only_host_would_not(self):
+        gpu_plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[self._identity_only_gpu()],
+                              physical_cpus=8, cpu_sockets=1)
+        cpu_plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                              available_disk=1, gpus=[], physical_cpus=8,
+                              cpu_sockets=1)
+        # Presence alone must not reclassify the bottleneck or move DRAFT.
+        self.assertEqual(gpu_plan["bottleneck_class"], cpu_plan["bottleneck_class"])
+        self.assertNotEqual(gpu_plan["bottleneck_class"], "mixed")
+        self.assertEqual(gpu_plan["tune"].get("DRAFT"), cpu_plan["tune"].get("DRAFT"))
+        # Nor may it switch on the resident pipeline.
+        self.assertNotIn("COLI_CUDA_PIPE", gpu_plan["tune"])
+        # The strongest statement of the contract: for the same inputs, the
+        # recommended environment is byte-identical to the CPU-only host's.
+        # PIN_GB=all may legitimately appear in BOTH -- that is the no-GPU
+        # residency advice (_auto_tune, `not has_gpu`), not a VRAM-derived
+        # budget -- so equality is the assertion, not absence.
+        env = environment_for_plan(gpu_plan, {"PIN": "stats.txt"})
+        cpu_env = environment_for_plan(cpu_plan, {"PIN": "stats.txt"})
+        self.assertEqual(env, cpu_env)
+        self.assertNotIn("COLI_CUDA_PIPE", env)
+        self.assertNotIn("COLI_CUDA", env)
+        self.assertNotIn("COLI_GPU", env)
+        self.assertNotIn("CUDA_EXPERT_GB", env)
+        self.assertNotEqual(env.get("PIN_GB"), f"{gpu_plan['tiers']['vram']['budget_bytes'] / GB:.3f}")
+
+    def test_identity_only_gpu_does_not_claim_vram_is_in_use(self):
+        # The "already in use" warning divides free by total. With no qualified
+        # free value there is nothing to divide, and telling the user to stop a
+        # running engine would be a fabricated diagnosis.
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=[self._identity_only_gpu()],
+                          physical_cpus=8, cpu_sockets=1)
+        self.assertFalse(any("already in use" in warning
+                             for warning in plan["warnings"]))
+
+    def test_measured_zero_free_memory_still_plans_as_before(self):
+        # free_bytes=0 is a MEASUREMENT, not the unqualified state, and keeps
+        # every behaviour it had: the tier is empty because the card is full,
+        # the pipeline knob is still offered, and the in-use warning still fires.
+        gpus = [{"index": 0, "name": "full-gpu", "total_bytes": 12 * GB,
+                 "free_bytes": 0}]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus, physical_cpus=8,
+                          cpu_sockets=1)
+        self.assertEqual(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(plan["tune"]["COLI_CUDA_PIPE"]["value"], "1")
+        self.assertTrue(any("already in use" in warning
+                            for warning in plan["warnings"]))
+
+    def test_mixed_fleet_plans_only_the_qualified_device(self):
+        gpus = [self._identity_only_gpu(),
+                {"index": 1, "name": "discrete", "total_bytes": 12 * GB,
+                 "free_bytes": 10 * GB}]
+        plan = build_plan(self.model, ram_gb=16, available_memory=32 * GB,
+                          available_disk=1, gpus=gpus, physical_cpus=8,
+                          cpu_sockets=1)
+        env = environment_for_plan(plan)
+        # The qualified card earns a tier; the unqualified one must not be
+        # named to the engine as a placement target.
+        self.assertGreater(plan["tiers"]["vram"]["budget_bytes"], 0)
+        self.assertEqual(env.get("COLI_GPU"), "1")
+        self.assertNotIn("COLI_GPUS", env)
+
     def test_auto_tier_thread_count_uses_physical_cores(self):
         # End-to-end for #325: build_plan + environment_for_plan must export the
         # physical (not logical SMT) core count as OMP_NUM_THREADS. The original

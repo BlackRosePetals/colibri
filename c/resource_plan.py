@@ -338,6 +338,26 @@ def _discover_amd_gpus():
     return devices
 
 
+def plans_placement(gpu):
+    """Whether a discovered device's memory is qualified to drive placement.
+
+    Discovery is a fact; a placement budget is a policy decision, and the two
+    are not the same thing. ``free_bytes`` normally carries both, because a
+    discrete card's free VRAM *is* the budget. It is ``None`` for a device that
+    exists and is worth reporting but whose free memory has not been qualified
+    as a Colibri budget -- today, a Windows AMD part found through hipInfo,
+    where the runtime's free figure describes the same physical pages the host
+    RAM tier is already counting.
+
+    ``None`` is deliberately distinct from ``0``. Zero is a measurement ("the
+    card is full") and keeps every behaviour it has always had. ``None`` says
+    "not measured in a way this planner may spend", which is a different claim
+    and must not silently collapse into the other -- hence ``is not None``
+    rather than a truthiness test.
+    """
+    return gpu.get("free_bytes") is not None
+
+
 def _physical_cores_warn(message):
     """Visibility for a mis-detected core count: a silent "1" here becomes
     OMP_NUM_THREADS=1 and pins the whole run to a single core (#325). Emit on
@@ -566,7 +586,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         wanted = set(gpu_indices)
         gpus = [gpu for gpu in gpus if gpu["index"] in wanted]
 
-    unified = any(gpu.get("unified_memory", False) for gpu in gpus)
+    # Every discovered device is reported; only the ones whose free memory is a
+    # qualified budget may steer placement. Keeping the two lists apart is what
+    # stops "a GPU exists" from being read as "a GPU should be used" -- see
+    # plans_placement().
+    planning_gpus = [gpu for gpu in gpus if plans_placement(gpu)]
+
+    unified = any(gpu.get("unified_memory", False) for gpu in planning_gpus)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
     layers = int(cfg.get("num_hidden_layers") or 0) + 1
@@ -582,7 +608,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     gpu_plan = []
     safe_vram = 0
     for gpu in gpus:
-        usable = max(0, gpu["free_bytes"] - reserve)
+        usable = max(0, gpu["free_bytes"] - reserve) if plans_placement(gpu) else 0
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
@@ -623,8 +649,14 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
-    if gpus and vram_budget < requested_vram_before_clamp:
+    if planning_gpus and vram_budget < requested_vram_before_clamp:
         warnings.append("VRAM tier was clamped by free VRAM, shared memory, or model expert size")
+    for gpu in gpus:
+        if not plans_placement(gpu):
+            warnings.append(
+                f"GPU {gpu['index']} ({gpu['name']}) was detected but its free memory is "
+                "not qualified as a placement budget on this platform; it is reported "
+                "only and drives no automatic tier")
     if unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")
@@ -633,9 +665,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # pessimistic hit rate that describe nothing. That is exactly when a user
     # reaches for `coli plan` -- before changing a live deployment -- so say so
     # rather than let the numbers be read as a capacity answer.
-    if gpus:
-        gpu_total = sum(g["total_bytes"] for g in gpus)
-        gpu_free = sum(g["free_bytes"] for g in gpus)
+    if planning_gpus:
+        gpu_total = sum(g["total_bytes"] for g in planning_gpus)
+        gpu_free = sum(g["free_bytes"] for g in planning_gpus)
         if gpu_total and gpu_free < 0.75 * gpu_total:
             warnings.append(
                 f"{format_bytes(gpu_total - gpu_free)} of VRAM is already in use "
@@ -652,11 +684,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if cold_bytes:
         bottleneck = "disk expert misses"
         bottleneck_class = "disk"
-    elif warm_bytes and gpus:
+    elif warm_bytes and planning_gpus:
         bottleneck = "CPU expert tail and GPU compute"
         bottleneck_class = "mixed"
     elif projected_hit >= 0.99:
-        if gpus:
+        if planning_gpus:
             bottleneck = "GPU compute and interconnect"
         else:
             bottleneck = "CPU expert compute (fully resident)"
@@ -665,7 +697,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         bottleneck = "CPU expert compute and RAM bandwidth"
         bottleneck_class = "memory"
 
-    tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
+    tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
                       plan_has_metal=False)
     probe_state, probe_gbs = ssd_probe_state(info["path"])
 
@@ -736,7 +768,9 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
 
     vram = plan["tiers"]["vram"]
-    devices = [device["index"] for device in vram["devices"]]
+    # Report every device, but only name the placement-qualified ones to the
+    # engine: COLI_GPU/COLI_GPUS is an instruction, not an inventory.
+    devices = [device["index"] for device in vram["devices"] if plans_placement(device)]
     if not cuda_enabled or not devices or vram["budget_bytes"] <= 0:
         return result
     if result.get("COLI_CUDA", "1") == "0":
@@ -770,11 +804,16 @@ def format_plan(plan):
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:
-        names = ", ".join(f"{gpu['index']}:{gpu['name']}" for gpu in vram["devices"])
+        names = ", ".join(
+            f"{gpu['index']}:{gpu['name']}"
+            + ("" if plans_placement(gpu) else " (identity only)")
+            for gpu in vram["devices"])
         lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
-        lines.append("VRAM   no NVIDIA device detected · CPU path")
+        # Backend-neutral, matching the accelerator wording #903 settled on:
+        # an AMD or Intel host that finds nothing is not "no NVIDIA device".
+        lines.append("VRAM   no supported GPU detected · CPU path")
     if plan.get("ssd_probe_gbs") is not None:
         lines.append(f"ssd    {plan['ssd_probe_gbs']:.1f} GB/s F_NOCACHE (cached probe, #379)")
     elif plan.get("ssd_probe_state") in SSD_PROBE_PENDING:
