@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int set_error(char *error, size_t size, const char *format, ...) {
     if (error && size) {
@@ -286,6 +287,272 @@ int coli_tensor_load_f32(ColiFloatTensor *output,
     memcpy(output->shape, tensor->shape, sizeof(output->shape));
     return 0;
 }
+
+/* ==== begin dual-SSD mirror (port of colibri.c COLI_MODEL_MIRROR) ====
+ * COLI_MODEL_MIRROR=<dir>[;<dir>...] registers additional read-only copies of
+ * the model on other drives; expert reads split across all copies according to
+ * COLI_DISK_WEIGHTS=<primary>,<mirror>[,<mirror2>...] (relative bandwidth;
+ * without the env it is measured at startup with the engine's own access
+ * pattern). The V4 engine streams FP4 experts off disk per token, so two NVMe
+ * drives reading in parallel roughly halve the cold-decode disk wait. */
+
+#define V4_MIR_REPS (1 + ST_MAX_MIR)
+
+static int g_v4_mirror = 0;        /* 1 = mirror active (at least one shard accepted) */
+static int g_v4_mir_nrep = 1;      /* replicas incl. the primary */
+static int g_v4_mir_cut[V4_MIR_REPS] = {256};  /* cumulative hash cuts of 256 */
+
+uint64_t g_v4_mir_bytes[V4_MIR_REPS];
+uint64_t g_v4_mir_nread[V4_MIR_REPS];
+
+static double v4_mirror_now_s(void) {
+    struct timespec value;
+    clock_gettime(CLOCK_MONOTONIC, &value);
+    return (double)value.tv_sec + value.tv_nsec * 1e-9;
+}
+
+/* replica of one expert: DETERMINISTIC hash of (layer,eid). Determinism is a
+ * requirement, not a style choice: the readahead and the demand pread must hit
+ * the same fd/page-cache, and in buffered mode an expert must never be cached
+ * twice (one copy per drive). */
+static inline int v4_expert_route(int layer, int eid) {
+    if (!g_v4_mirror) return 0;
+    uint32_t h = (uint32_t)layer * 2654435761u ^ (uint32_t)eid * 0x9E3779B9u;
+    h ^= h >> 16; h *= 0x45d9f3bu; h ^= h >> 16;
+    int hv = (int)(h & 255), r = 0;
+    while (hv >= g_v4_mir_cut[r]) r++;  /* cut[nrep-1]==256 terminates the scan */
+    return r;
+}
+
+int coli_st_expert_route(int layer, int eid) {
+    return v4_expert_route(layer, eid);
+}
+
+int coli_st_mirror_active(void) { return g_v4_mirror; }
+int coli_st_mirror_nrep(void) { return g_v4_mir_nrep; }
+
+/* DUAL-SSD: measure one replica's read bandwidth with the engine's own access
+ * pattern (parallel ~19 MB reads, O_DIRECT twin when available). Reads the
+ * largest shard at deterministic spread-out offsets; ~150 MB per drive. */
+static double v4_mirror_probe_bw(const ColiSafetensorsIndex *index, int rep) {
+    int big = -1; int64_t bsz = 0;
+    for (int i = 0; i < index->nfd; i++) {
+        if (rep && index->mfds[rep - 1][i] < 0) continue;
+        int64_t sz = lseek(rep ? index->mfds[rep - 1][i] : index->fds[i], 0, SEEK_END);
+        if (sz > bsz) { bsz = sz; big = i; }
+    }
+    const int64_t blk = 19ll << 20; const int NB = 8;
+    if (big < 0 || bsz < blk * (NB + 1)) return 0;
+    int dfd = rep ? index->mdfds[rep - 1][big] : index->dfds[big];
+    int fd = dfd >= 0 ? dfd : (rep ? index->mfds[rep - 1][big] : index->fds[big]);
+    if (dfd < 0)
+        fprintf(stderr, "[MIRROR] no O_DIRECT on replica %d: the probe may read the "
+                        "page cache — set COLI_DISK_WEIGHTS for an accurate split\n", rep);
+    double t0 = v4_mirror_now_s(); int64_t tot = 0;
+    #pragma omp parallel for schedule(dynamic,1) reduction(+:tot)
+    for (int i = 0; i < NB; i++) {
+        void *buf;
+        if (!posix_memalign(&buf, 4096, (size_t)blk)) {
+            int64_t off = (((bsz - blk) / NB) * i) & ~4095ll;
+            ssize_t r = pread(fd, buf, (size_t)blk, off);
+            if (r > 0) tot += r;
+            compat_aligned_free(buf);
+        }
+    }
+    double dt = v4_mirror_now_s() - t0;
+    return (dt > 0 && tot > 0) ? tot / 1e9 / dt : 0;
+}
+
+/* Register every mirror copy listed in COLI_MODEL_MIRROR (';' or ',' separated
+ * dirs), derive the read split from COLI_DISK_WEIGHTS or a startup bandwidth
+ * probe. Runs after the expert-store index is open and BEFORE any expert load,
+ * so the OMP-parallel pin warmup streams from all drives. */
+int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir) {
+    if (!index) return 0;
+    const char *mirror_dir = getenv("COLI_MODEL_MIRROR");
+    if (!mirror_dir || !*mirror_dir) mirror_dir = getenv("SNAP_MIRROR");
+    if (!mirror_dir || !*mirror_dir) return 0;
+    st_mirror_reset(index);
+    int nrep = 1;
+    {   char buf[4096]; snprintf(buf, sizeof(buf), "%s", mirror_dir);
+        char *p = buf;
+        while (p && *p) {
+            char *sep = p; while (*sep && *sep != ';' && *sep != ',') sep++;
+            int last = (*sep == 0); *sep = 0;
+            while (*p == ' ') p++;
+            size_t plen = strlen(p); while (plen > 0 && p[plen - 1] == ' ') p[--plen] = 0;
+            if (*p) {
+                if (model_dir && !strcmp(model_dir, p))
+                    fprintf(stderr, "[MIRROR] %s equals the model dir — ignored\n", p);
+                else if (nrep >= V4_MIR_REPS)
+                    fprintf(stderr, "[MIRROR] %s: too many mirrors (max %d) — ignored\n", p, ST_MAX_MIR);
+                else {
+                    int nf = st_mirror_add(index, p);
+                    if (nf <= 0)
+                        fprintf(stderr, "[MIRROR] %s: no usable shard (missing or divergent copy) — skipped\n", p);
+                    else {
+                        fprintf(stderr, "[MIRROR] %s: %d/%d shards (replica %d)\n", p, nf, index->nfd, nrep);
+                        nrep++;
+                    }
+                }
+            }
+            p = last ? NULL : sep + 1;
+        }
+    }
+    if (nrep < 2) {
+        fprintf(stderr, "[MIRROR] no usable mirror — running on the primary drive only\n");
+        return 0;
+    }
+    g_v4_mirror = 1; g_v4_mir_nrep = nrep;
+    double wt[V4_MIR_REPS]; int have = 0;
+    const char *w = getenv("COLI_DISK_WEIGHTS"); const char *how = "COLI_DISK_WEIGHTS";
+    if (w && *w) {
+        char wb[256]; snprintf(wb, sizeof(wb), "%s", w); int wn = 0, bad = 0;
+        for (char *tok = strtok(wb, ", "); tok; tok = strtok(NULL, ", ")) {
+            double v = atof(tok);
+            if (v <= 0 || wn >= V4_MIR_REPS) { bad = 1; break; }
+            wt[wn++] = v;
+        }
+        if (!bad && wn == nrep) have = 1;
+        else fprintf(stderr, "[MIRROR] invalid COLI_DISK_WEIGHTS '%s' (want %d positive "
+                            "comma-separated weights, e.g. 9,3) — probing instead\n", w, nrep);
+    }
+    if (!have) {
+        have = 1; how = "measured";
+        for (int r = 0; r < nrep; r++) { wt[r] = v4_mirror_probe_bw(index, r); if (wt[r] <= 0) have = 0; }
+        if (have) {
+            fprintf(stderr, "[MIRROR] probe:");
+            for (int r = 0; r < nrep; r++) fprintf(stderr, "%s %s %.2f GB/s",
+                r ? " |" : "", r ? "mirror" : "primary", wt[r]);
+            fprintf(stderr, "\n");
+        } else { for (int r = 0; r < nrep; r++) wt[r] = 1; how = "fallback 1:1 (probe failed)"; }
+    }
+    double W = 0; for (int r = 0; r < nrep; r++) W += wt[r];
+    int acc = 0; double cum = 0;
+    for (int r = 0; r < nrep; r++) {
+        cum += wt[r];
+        int c = (int)(256.0 * cum / W + 0.5);
+        if (c <= acc) c = acc + 1;
+        if (c > 256) c = 256;
+        g_v4_mir_cut[r] = c; acc = c;
+    }
+    g_v4_mir_cut[nrep - 1] = 256;
+    fprintf(stderr, "[MIRROR] %d drives | read split", nrep);
+    for (int r = 0; r < nrep; r++) { int lo = r ? g_v4_mir_cut[r - 1] : 0;
+        fprintf(stderr, "%s %.0f%%", r ? " /" : "", 100.0 * (g_v4_mir_cut[r] - lo) / 256); }
+    fprintf(stderr, " (%s)\n", how);
+    return 1;
+}
+
+/* Buffered fd of the replica, falling back to the primary if not mirrored. */
+static inline int v4_rep_fd(const ColiSafetensorsIndex *index, int fd, int rep) {
+    int r = st_fd_rep((shards *)index, fd, rep);
+    return r < 0 ? fd : r;
+}
+
+/* pread on the chosen replica with fallback to the primary on error/short-read.
+ * Accounts bytes per drive. Returns 0 = ok, -1 = real error/EOF. */
+static int v4_pread_rep(const ColiSafetensorsIndex *index, int fd, int rep,
+                        void *buf, size_t n, uint64_t off) {
+    int rfd = st_fd_rep((shards *)index, fd, rep);
+    int used = (rep && rfd >= 0) ? rep : 0;
+    if (rfd < 0) rfd = fd;
+    unsigned char *output = buf;
+    size_t done = 0;
+    while (done < n) {
+        ssize_t count = pread(rfd, output + done, n - done, (off_t)(off + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) {
+            if (used) { used = 0; rfd = fd; done = 0; continue; }
+            return -1;
+        }
+        done += (size_t)count;
+    }
+    __atomic_fetch_add(&g_v4_mir_bytes[used], (uint64_t)n, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_v4_mir_nread[used], 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+int coli_st_read_at_rep(const ColiSafetensorsIndex *index, int shard, int rep,
+                        uint64_t offset, size_t length, void *destination) {
+    if (!index || !destination || shard < 0 || shard >= index->nfd ||
+        index->sizes[shard] < 0 || offset > (uint64_t)index->sizes[shard] ||
+        length > (uint64_t)index->sizes[shard] - offset)
+        return -1;
+    return v4_pread_rep(index, index->fds[shard], rep, destination, length, offset);
+}
+
+int coli_st_read_at_streaming_rep(const ColiSafetensorsIndex *index, int shard,
+                                  int rep, uint64_t offset, size_t length,
+                                  void *destination) {
+    if (!index || !destination || shard < 0 || shard >= index->nfd ||
+        index->sizes[shard] < 0 || offset > (uint64_t)index->sizes[shard] ||
+        length > (uint64_t)index->sizes[shard] - offset)
+        return -1;
+    if (!length) return 0;
+    if (!coli_st_streaming_direct_available(index, shard) ||
+        (rep && index->mdfds[rep - 1][shard] < 0))
+        return coli_st_read_at_rep(index, shard, rep, offset, length, destination);
+
+    const uint64_t alignment = 4096;
+    uint64_t base = offset & ~(alignment - 1);
+    uint64_t pad = offset - base;
+    if ((uint64_t)length > UINT64_MAX - pad) return -1;
+    uint64_t needed = pad + (uint64_t)length;
+    if (needed > UINT64_MAX - (alignment - 1) ||
+        needed + alignment - 1 > SIZE_MAX) return -1;
+    size_t allocation_bytes = (size_t)((needed + alignment - 1) & ~(alignment - 1));
+    unsigned char *bounce = NULL;
+    if (posix_memalign((void **)&bounce, (size_t)alignment, allocation_bytes) != 0)
+        return coli_st_read_at_rep(index, shard, rep, offset, length, destination);
+
+    int rfd = st_fd_rep((shards *)index, index->fds[shard], rep);
+    int used = (rep && rfd >= 0) ? rep : 0;
+    if (rfd < 0) rfd = index->fds[shard];
+    int dfd = rep ? index->mdfds[rep - 1][shard] : index->dfds[shard];
+
+    uint64_t file_bytes = (uint64_t)index->sizes[shard];
+    uint64_t available = file_bytes - base;
+    uint64_t direct_bytes = allocation_bytes;
+    if (direct_bytes > available) direct_bytes = available & ~(alignment - 1);
+    size_t done = 0;
+    int failed = 0;
+    while ((uint64_t)done < direct_bytes) {
+        ssize_t count = pread(dfd, bounce + done, (size_t)(direct_bytes - done),
+                              (off_t)(base + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { failed = 1; break; }
+        done += (size_t)count;
+    }
+    if (failed) {
+        compat_aligned_free(bounce);
+        return coli_st_read_at_rep(index, shard, rep, offset, length, destination);
+    }
+    while ((uint64_t)done < needed) {
+        ssize_t count = pread(rfd, bounce + done, (size_t)(needed - done),
+                              (off_t)(base + done));
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) { compat_aligned_free(bounce); return -1; }
+        done += (size_t)count;
+    }
+    memcpy(destination, bounce + pad, length);
+    compat_aligned_free(bounce);
+    __atomic_fetch_add(&g_v4_mir_bytes[used], (uint64_t)length, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_v4_mir_nread[used], 1, __ATOMIC_RELAXED);
+    return 0;
+}
+
+int coli_st_prefetch_at_rep(const ColiSafetensorsIndex *index, int shard,
+                            int rep, uint64_t offset, size_t length) {
+    if (!index || shard < 0 || shard >= index->nfd ||
+        index->sizes[shard] < 0 || offset > (uint64_t)index->sizes[shard] ||
+        length > (uint64_t)index->sizes[shard] - offset)
+        return -1;
+    int fd = v4_rep_fd(index, index->fds[shard], rep);
+    return posix_fadvise(fd, (off_t)offset, (off_t)length, POSIX_FADV_WILLNEED);
+}
+/* ==== end dual-SSD mirror ==== */
+
 #endif /* COLI_V4_UNIT_ST */
 
 
@@ -5509,11 +5776,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         /* A short read must never expose a partially overwritten old slot. */
         slot->expert = -1;
-        if (coli_st_read_at_streaming(
-                state->index, record->shard, record->scale_offset,
+        /* DUAL-SSD: this expert's replica (deterministic per layer,eid). */
+        int rep = coli_st_expert_route(key.layer, key.expert);
+        if (coli_st_read_at_streaming_rep(
+                state->index, record->shard, rep, record->scale_offset,
                 (size_t)record->scale_bytes, slot->slab) != 0 ||
-            coli_st_read_at_streaming(
-                state->index, record->shard, record->weight_offset,
+            coli_st_read_at_streaming_rep(
+                state->index, record->shard, rep, record->weight_offset,
                 (size_t)record->weight_bytes,
                 slot->slab + record->scale_bytes) != 0) {
             pthread_mutex_unlock(&state->mutex);
@@ -5593,10 +5862,13 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
     for (size_t i = 0; i < count; i++) {
         V4ExpertRecord *record = get_record(state, keys[i]);
         if (!record) continue;
-        if (coli_st_prefetch_at(state->index, record->shard, record->scale_offset,
-                                (size_t)record->scale_bytes) == 0 &&
-            coli_st_prefetch_at(state->index, record->shard, record->weight_offset,
-                                (size_t)record->weight_bytes) == 0)
+        int rep = coli_st_expert_route(keys[i].layer, keys[i].expert);
+        if (coli_st_prefetch_at_rep(state->index, record->shard, rep,
+                                    record->scale_offset,
+                                    (size_t)record->scale_bytes) == 0 &&
+            coli_st_prefetch_at_rep(state->index, record->shard, rep,
+                                    record->weight_offset,
+                                    (size_t)record->weight_bytes) == 0)
             accepted++;
     }
 #endif
@@ -5657,6 +5929,10 @@ int coli_deepseek_v4_expert_store_open(
     state->experts_per_layer = options->experts_per_layer;
     if (coli_st_index_open(&state->index, options->model_dir, error, error_size) != 0)
         goto fail;
+    /* DUAL-SSD: register COLI_MODEL_MIRROR copies and derive the read split
+     * before any expert load, so pin warmup and demand reads stream from all
+     * drives. */
+    coli_st_mirror_setup(state->index, options->model_dir);
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
     state->records = calloc(record_count, sizeof(*state->records));
     if (!state->records) {
@@ -5933,10 +6209,14 @@ static int v4_pread_full_try(int fd, void *destination, size_t length,
 }
 
 static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
-                                 unsigned char *slab, uint64_t offset,
+                                 int rep, unsigned char *slab, uint64_t offset,
                                  size_t length, size_t destination_offset) {
-    if (!state || !state->index || shard < 0 || shard >= state->index->nfd ||
-        state->index->dfds[shard] < 0) return -1;
+    if (!state || !state->index || shard < 0 || shard >= state->index->nfd) return -1;
+    /* DUAL-SSD: prefer the routed replica's O_DIRECT twin. */
+    int dfd = rep ? state->index->mdfds[rep - 1][shard] : state->index->dfds[shard];
+    if (dfd < 0) return -1;
+    int fd = rep ? state->index->mfds[rep - 1][shard] : state->index->fds[shard];
+    if (fd < 0) fd = state->index->fds[shard];
     const uint64_t alignment = 4096;
     uint64_t base = offset & ~(alignment - 1);
     size_t pad = (size_t)(offset - base);
@@ -5949,23 +6229,27 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
     uint64_t available = file_bytes - base;
     if ((uint64_t)direct_length > available)
         direct_length = (size_t)(available & ~(alignment - 1));
-    if (direct_length && v4_pread_full_try(
-            state->index->dfds[shard], slab, direct_length, base)) return -1;
+    if (direct_length && v4_pread_full_try(dfd, slab, direct_length, base)) return -1;
     if (direct_length < wanted && v4_pread_full_try(
-            state->index->fds[shard], slab + direct_length,
+            fd, slab + direct_length,
             wanted - direct_length, base + direct_length)) return -1;
     memmove(slab + destination_offset, slab + pad, length);
+    if (rep) {
+        __atomic_fetch_add(&g_v4_mir_bytes[rep], (uint64_t)length, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_v4_mir_nread[rep], 1, __ATOMIC_RELAXED);
+    }
     return 0;
 }
 
 static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
-                                 V4ExpertSlot *slot) {
+                                 V4ExpertSlot *slot, int rep) {
     int direct_available = slot->aligned_slab &&
-        coli_st_streaming_direct_available(state->index, record->shard);
+        coli_st_streaming_direct_available(state->index, record->shard) &&
+        (!rep || state->index->mdfds[rep - 1][record->shard] >= 0);
     if (direct_available &&
         record->scale_offset + record->scale_bytes == record->weight_offset &&
-        !v4_read_direct_window(state, record->shard, slot->slab,
+        !v4_read_direct_window(state, record->shard, rep, slot->slab,
                                record->scale_offset,
                                (size_t)record->record_bytes, 0)) {
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
@@ -5977,7 +6261,7 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
     }
 
     int weight_direct = direct_available && !v4_read_direct_window(
-        state, record->shard, slot->slab, record->weight_offset,
+        state, record->shard, rep, slot->slab, record->weight_offset,
         (size_t)record->weight_bytes, (size_t)record->scale_bytes);
     if (weight_direct) {
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
@@ -5987,13 +6271,14 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
         if (direct_available)
             __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
                                __ATOMIC_RELAXED);
-        if (coli_st_read_at(state->index, record->shard,
+        if (coli_st_read_at_rep(state->index, record->shard, rep,
                             record->weight_offset,
                             (size_t)record->weight_bytes,
                             slot->slab + record->scale_bytes)) return -1;
     }
-    return coli_st_read_at(state->index, record->shard, record->scale_offset,
-                           (size_t)record->scale_bytes, slot->slab);
+    return coli_st_read_at_rep(state->index, record->shard, rep,
+                               record->scale_offset,
+                               (size_t)record->scale_bytes, slot->slab);
 }
 
 static void hot_fill_view(ColiTensorView *view,
@@ -6154,7 +6439,8 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     state->active_leases++;
     slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
-    int read_result = v4_read_expert_record(state, record, slot);
+    int rep = coli_st_expert_route(key.layer, key.expert);
+    int read_result = v4_read_expert_record(state, record, slot, rep);
     pthread_mutex_lock(&state->mutex);
     if (read_result) {
         slot->references = 0; slot->expert = -1;
@@ -9139,6 +9425,17 @@ int main(int argc, char **argv) {
            (double)(tune_b.tv_sec - tune_a.tv_sec) +
            (tune_b.tv_nsec - tune_a.tv_nsec) * 1e-9);
     fflush(stdout);
+    if (coli_st_mirror_active()) {
+        fprintf(stderr, "v4_mirror drives=%d", coli_st_mirror_nrep());
+        for (int r = 0; r < coli_st_mirror_nrep(); r++)
+            fprintf(stderr, " %s=%.2fGiB/%llu",
+                    r ? "mirror" : "primary",
+                    __atomic_load_n(&g_v4_mir_bytes[r], __ATOMIC_RELAXED)
+                        / 1073741824.0,
+                    (unsigned long long)__atomic_load_n(
+                        &g_v4_mir_nread[r], __ATOMIC_RELAXED));
+        fprintf(stderr, "\n");
+    }
     fprintf(stderr, "generated_text=");
     if (out_len) fwrite(out_text, 1, out_len, stderr);
     fprintf(stderr, "\ntiming time_to_first_token=%.3fs after_first=%.3fs\n",
@@ -9698,11 +9995,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         /* A short read must never expose a partially overwritten old slot. */
         slot->expert = -1;
-        if (coli_st_read_at_streaming(
-                state->index, record->shard, record->scale_offset,
+        /* DUAL-SSD: this expert's replica (deterministic per layer,eid). */
+        int rep = coli_st_expert_route(key.layer, key.expert);
+        if (coli_st_read_at_streaming_rep(
+                state->index, record->shard, rep, record->scale_offset,
                 (size_t)record->scale_bytes, slot->slab) != 0 ||
-            coli_st_read_at_streaming(
-                state->index, record->shard, record->weight_offset,
+            coli_st_read_at_streaming_rep(
+                state->index, record->shard, rep, record->weight_offset,
                 (size_t)record->weight_bytes,
                 slot->slab + record->scale_bytes) != 0) {
             pthread_mutex_unlock(&state->mutex);
@@ -9782,10 +10081,13 @@ static int prefetch(ColiExpertStore *store, const ColiExpertKey *keys,
     for (size_t i = 0; i < count; i++) {
         V4ExpertRecord *record = get_record(state, keys[i]);
         if (!record) continue;
-        if (coli_st_prefetch_at(state->index, record->shard, record->scale_offset,
-                                (size_t)record->scale_bytes) == 0 &&
-            coli_st_prefetch_at(state->index, record->shard, record->weight_offset,
-                                (size_t)record->weight_bytes) == 0)
+        int rep = coli_st_expert_route(keys[i].layer, keys[i].expert);
+        if (coli_st_prefetch_at_rep(state->index, record->shard, rep,
+                                    record->scale_offset,
+                                    (size_t)record->scale_bytes) == 0 &&
+            coli_st_prefetch_at_rep(state->index, record->shard, rep,
+                                    record->weight_offset,
+                                    (size_t)record->weight_bytes) == 0)
             accepted++;
     }
 #endif
