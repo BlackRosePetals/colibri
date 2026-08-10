@@ -7388,7 +7388,8 @@ static void v4_cli_usage(FILE *stream, const char *program) {
         "  --oracle FILE        validate against an oracle JSON fixture\n"
         "  --teacher-forcing N  oracle: compare top-1 on N prompt positions\n"
         "  --greedy N           oracle: compare N greedy continuation tokens\n"
-        "  --record-oracle FILE write greedy tokens + tf_pred to JSON\n",
+        "  --record-oracle FILE write greedy tokens + tf_pred to JSON\n"
+        "  CTX=N (environment)  context window in tokens (default: 4096)\n",
         program, program, program);
 }
 
@@ -8618,6 +8619,9 @@ int main(int argc, char **argv) {
             .target_model_dir = cli.model_dir,
             .no_dspark = cli.no_dspark,
             .pin_slots_per_layer = -1,
+            /* Same contract as v4_serve_main: CTX sets the session plan;
+             * unset or invalid falls back to the engine default (4096). */
+            .context_tokens = getenv("CTX") ? atoi(getenv("CTX")) : 0,
         };
         if (cli.memory_gib > 0.0)
             open_opts.memory_limit_bytes =
