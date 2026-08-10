@@ -148,17 +148,27 @@ python3 tools/residency_sim.py sweep \
   --json-out cnre-sweep.json
 ```
 
-JSON preserves model specs, every allocation, per-trace source paths and
-metrics, and each complete sweep result. This is enough to compute category
-regressions outside the simulator without parsing human output.
+JSON preserves model specs, every allocation, resident and unused budget bytes,
+per-trace source paths and metrics, and each complete sweep result. This is
+enough to compute category regressions outside the simulator without parsing
+human output. Dynamic allocation evaluates every feasible per-layer capacity.
+Exact replay curves and per-layer frontiers are cached by current capacity and
+reused across nominal and sensitivity runs, so fixed breakpoints are
+unnecessary and cannot hide a useful intermediate capacity.
 
 `--policies` must include `lru`, because every decision is measured against the
 uniform-LRU baseline. Both `run` and every point in `sweep` report nominal and
 layer-cost-sensitivity verdicts.
 
 `--prof-log` stores the aggregate `PROF=1` felt-wait calibration in the JSON.
-Current GLM logs expose aggregate, not per-layer, felt wait; this is provenance
-and a global calibration check, not a claim of layer-specific measurement.
+The denominator is the physical miss count from the `N load` field;
+`loads/token` is retained separately as `requests_per_token` and is never
+treated as a count. Every requested log must contain at least one complete
+expert-I/O record; otherwise the calibration is marked incomplete. A legacy
+log without the physical count has
+`felt_us_per_physical_miss=null`. Current GLM logs expose aggregate, not
+per-layer, felt wait; this is provenance and a global calibration check, not a
+claim of layer-specific measurement.
 
 `run` also applies the Phase-0 decision gate directly. Categories receive equal
 weight regardless of their number or length of traces. A candidate passes only
@@ -191,13 +201,14 @@ gate. This is deliberately stricter than averaging all accesses: a large
 stationary win cannot hide a shifted-category regression beyond 3%. In the
 current fixture, uniform frequency admission fails that guard (`-4.76%` in the
 shifted category). Dynamic frequency admission narrowly passes the nominal
-gate (`+4.27%` worst category) but fails the layer-by-layer felt-cost
+gate (`-1.72%` worst category) but fails the layer-by-layer felt-cost
 sensitivity check at that 8 MB budget.
 
 The final demo table sweeps synthetic expert budgets from 2 to 32 MB. It shows
 that robustness is an operating region rather than a policy-wide property. For
 example, dynamic frequency admission is robust in the deliberately constrained
-2-6 MB fixture, fragile at 8-12 MB, and robust again at larger toy budgets. These
+2-6 MB fixture, fragile at 8-10 MB, and robust again from 12 MB in this toy
+fixture. These
 transitions are artifacts of the fixture, but they demonstrate why real traces
 must be swept across realistic RAM budgets rather than evaluated at one point.
 
@@ -246,7 +257,8 @@ The collection produced eight training traces and five held-out traces across
 coding, chat, reasoning, multilingual, and long-context prompts. These are
 small pilot traces, not a production benchmark corpus.
 
-At expert-cache budgets of 120, 160, and 200 GB, the offline simulator reported:
+At expert-cache budgets of 120, 160, and 200 GB, the original offline simulator
+reported:
 
 ```text
 budget   candidate             mean held-out gain   worst category
@@ -260,7 +272,9 @@ budget   candidate             mean held-out gain   worst category
 
 All frequency candidates passed the nominal category gate and the sampled
 layer-cost sensitivity at layers 3, 30, and 60. LRU dynamic allocation did not
-meet the 10% gate, with approximately 0.0-0.4% gain.
+meet the 10% gate, with approximately 0.0-0.4% gain. The dynamic rows predate
+exhaustive capacity evaluation and must be re-derived from the original traces;
+the uniform rows do not use that allocator.
 
 The runtime pilot is the necessary qualification. With `RAM_GB=120`, `PIPE=0`
 measured 1.66 tok/s at 57.2% hit; with `RAM_GB=200`, it measured 1.31 tok/s at
@@ -268,10 +282,13 @@ measured 1.66 tok/s at 57.2% hit; with `RAM_GB=200`, it measured 1.31 tok/s at
 same 57.2% hit. This means hit rate alone is not a performance result: I/O
 overlap, disk service, and compute contention materially change tok/s.
 
-Across the five held-out `PROF=1` logs, the aggregate runtime instrumentation
-reported 19.6 seconds of felt wait over 2,625 loads, or approximately 7.47 ms
-per load. This is a whole-run calibration signal, not a per-layer cost: the
-current GLM profile does not attribute felt wait to individual layers.
+An earlier version of this document described 19.6 seconds of felt wait over
+2,625 loads, or 7.47 ms per load. The value 2,625 was a sum of `loads/token`
+rates, not a count of physical misses, so that calibration is withdrawn. The
+corrected parser uses the physical `N load` field. The ephemeral pilot logs are
+not in the repository, so no corrected aggregate is claimed here. Even after
+recalculation this remains a whole-run signal: the current GLM profile does not
+attribute felt wait to individual layers.
 
 No runtime frequency-admission policy was implemented in this pilot. The
 current GLM cache admits every demand miss in `moe()` and promotes the bounded

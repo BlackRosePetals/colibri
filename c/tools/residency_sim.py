@@ -535,11 +535,13 @@ class LayerReplayCache:
         self.traces = traces
         self.specs = specs
         self.learned_counts = learned_counts or {}
-        self.layer_traces = {
+        self.layer_traces = base.layer_traces if base is not None else {
             layer: [[event for event in trace if event.layer == layer] for trace in traces]
             for layer in specs
         }
         self.cache = base.cache if base is not None else {}
+        self.miss_cache = base.miss_cache if base is not None else {}
+        self.frontier_cache = base.frontier_cache if base is not None else {}
 
     def layer_stats(self, policy_name, layer, capacity, trace_index):
         key = (policy_name, layer, capacity, trace_index)
@@ -565,11 +567,40 @@ class LayerReplayCache:
         return combined
 
     def layer_wait(self, policy_name, layer, capacity, specs):
-        misses = sum(
-            self.layer_stats(policy_name, layer, capacity, trace_index).misses
-            for trace_index in range(len(self.traces))
-        )
-        return misses * specs[layer].felt_miss_us
+        return self.layer_misses(policy_name, layer, capacity) * specs[layer].felt_miss_us
+
+    def layer_misses(self, policy_name, layer, capacity):
+        key = (policy_name, layer, capacity)
+        if key not in self.miss_cache:
+            self.miss_cache[key] = sum(
+                self.layer_stats(policy_name, layer, capacity, trace_index).misses
+                for trace_index in range(len(self.traces))
+            )
+        return self.miss_cache[key]
+
+    def allocation_target(self, policy_name, layer, current, affordable, spec):
+        """Best exact target up to ``affordable``, cached by current capacity."""
+        key = (policy_name, layer, current, spec.resident_bytes,
+               spec.max_experts, spec.felt_miss_us)
+        if key not in self.frontier_cache:
+            maximum = spec.max_experts
+            frontier = [None] * (maximum + 1)
+            current_wait = (self.layer_misses(policy_name, layer, current)
+                            * spec.felt_miss_us)
+            best_key = None
+            best_target = None
+            for target in range(current + 1, maximum + 1):
+                added_bytes = (target - current) * spec.resident_bytes
+                target_wait = (self.layer_misses(policy_name, layer, target)
+                               * spec.felt_miss_us)
+                benefit = current_wait - target_wait
+                candidate = (benefit / added_bytes, benefit, -added_bytes, target)
+                if best_key is None or candidate > best_key:
+                    best_key = candidate
+                    best_target = target
+                frontier[target] = best_target
+            self.frontier_cache[key] = frontier
+        return self.frontier_cache[key][affordable]
 
 
 class ScaledReplayCache(LayerReplayCache):
@@ -643,21 +674,40 @@ def profile_costs(log_paths):
     telemetry field.
     """
     waits = []
-    loads = []
+    physical_misses = []
+    requests_per_token = []
+    complete = bool(log_paths)
+    records = 0
     for path in log_paths or ():
         text = Path(path).read_text(encoding="utf-8")
+        path_records = 0
         for line in text.splitlines():
+            if "[PROF] expert I/O:" not in line:
+                continue
+            records += 1
+            path_records += 1
             match = re.search(r"([0-9.]+)s read service / ([0-9.]+)s felt wait", line)
-            load_match = re.search(r"\| ([0-9]+(?:\.[0-9]+)?) loads/token", line)
-            if match:
-                waits.append(float(match.group(2)))
-            if load_match:
-                loads.append(float(load_match.group(1)))
+            miss_match = re.search(r"\([^)]*/\s*([0-9]+) loads?\)", line)
+            request_match = re.search(r"\| ([0-9]+(?:\.[0-9]+)?) loads/token", line)
+            if not match or not miss_match or not request_match:
+                complete = False
+                continue
+            waits.append(float(match.group(2)))
+            physical_misses.append(int(miss_match.group(1)))
+            requests_per_token.append(float(request_match.group(1)))
+        if not path_records:
+            complete = False
+    miss_count = sum(physical_misses) if complete and records else None
     return {
         "logs": [str(path) for path in log_paths or ()],
         "felt_wait_seconds": sum(waits),
-        "loads": sum(loads),
-        "felt_us_per_load": (sum(waits) * 1e6 / sum(loads) if loads else None),
+        "physical_misses": miss_count,
+        "requests_per_token": requests_per_token,
+        "records": records,
+        "complete": complete,
+        "felt_us_per_physical_miss": (
+            sum(waits) * 1e6 / miss_count
+            if complete and miss_count else None),
         "scope": "aggregate; GLM PROF does not expose layer-level felt wait",
     }
 
@@ -735,13 +785,18 @@ def sensitivity_analysis(
     minimum_gain=0.10,
     maximum_regression=0.03,
     sensitivity_layers=None,
+    learned_counts=None,
+    train_cache=None,
+    evaluation_cache=None,
+    baseline_result=None,
 ):
-    learned_counts = training_counts(train)
+    learned_counts = learned_counts or training_counts(train)
     # Admission and hit/miss behavior is unchanged by a felt-cost scale within
     # one layer. Reuse the exact replay curves across perturbations and only
     # reweight their misses when optimizing dynamic capacity.
-    train_cache = LayerReplayCache(train, specs, learned_counts)
-    evaluation_cache = LayerReplayCache(evaluation, specs, learned_counts)
+    train_cache = train_cache or LayerReplayCache(train, specs, learned_counts)
+    evaluation_cache = evaluation_cache or LayerReplayCache(
+        evaluation, specs, learned_counts)
     perturbations = [("baseline", None, 1.0)]
     perturbations.extend(
         (f"layer-{layer}-x{felt_scale:g}", layer, felt_scale)
@@ -754,11 +809,14 @@ def sensitivity_analysis(
     scenarios = []
     for name, layer, felt_scale in perturbations:
         scenario_specs = scale_specs(specs, felt_scale, layer)
-        scenario_train_cache = ScaledReplayCache(train_cache, scenario_specs)
-        scenario_evaluation_cache = ScaledReplayCache(evaluation_cache, scenario_specs)
-        result = analyze(
-            train, evaluation, scenario_specs, budget_bytes, policies,
-            learned_counts, scenario_train_cache, scenario_evaluation_cache)
+        if name == "baseline" and baseline_result is not None:
+            result = baseline_result
+        else:
+            scenario_train_cache = ScaledReplayCache(train_cache, scenario_specs)
+            scenario_evaluation_cache = ScaledReplayCache(evaluation_cache, scenario_specs)
+            result = analyze(
+                train, evaluation, scenario_specs, budget_bytes, policies,
+                learned_counts, scenario_train_cache, scenario_evaluation_cache)
         scenarios.append({
             "name": name,
             "layer": layer,
@@ -815,30 +873,21 @@ def dynamic_capacities(
         best = None
         for layer, spec in specs.items():
             current = capacities[layer]
-            # Exact replay is retained for every candidate, but scanning every
-            # slot is prohibitively expensive on a 256-expert x 75-layer model.
-            # These fixed breakpoints expose the useful capacity regions while
-            # keeping the offline sweep bounded and deterministic.
-            targets = {1, 2, 4, 8, 16, 32, 48, 64, 96, 128, 160, 192, 256}
-            targets.add(spec.max_experts)
-            for trace_index in range(len(traces)):
-                sequence = replay_cache.layer_traces[layer][trace_index]
-                unique = len({expert for event in sequence for expert in event.experts})
-                targets.add(min(spec.max_experts, unique))
-            targets = {target for target in targets
-                       if current < target <= spec.max_experts}
-            for target in sorted(targets):
-                if target <= current:
-                    continue
-                added_bytes = (target - current) * spec.resident_bytes
-                if used + added_bytes > budget_bytes:
-                    break
-                wait = replay_cache.layer_wait(policy_name, layer, target, specs)
-                benefit = layer_waits[layer] - wait
-                candidate = (benefit / added_bytes, benefit, -added_bytes,
-                             -layer, layer, target, wait, added_bytes)
-                if best is None or candidate > best:
-                    best = candidate
+            affordable = min(
+                spec.max_experts,
+                current + (budget_bytes - used) // spec.resident_bytes,
+            )
+            if affordable <= current:
+                continue
+            target = replay_cache.allocation_target(
+                policy_name, layer, current, affordable, spec)
+            added_bytes = (target - current) * spec.resident_bytes
+            wait = replay_cache.layer_wait(policy_name, layer, target, specs)
+            benefit = layer_waits[layer] - wait
+            candidate = (benefit / added_bytes, benefit, -added_bytes,
+                          -layer, layer, target, wait, added_bytes)
+            if best is None or candidate > best:
+                best = candidate
         if best is None or best[1] <= 0:
             break
         (_ratio, _benefit, _neg_bytes, _neg_layer, layer, target,
@@ -874,6 +923,8 @@ def analyze(
         "capacities": {str(k): v for k, v in sorted(uniform.items())},
         "resident_bytes": capacity_bytes(uniform, specs),
     }
+    output["allocations"]["uniform"]["unused_bytes"] = (
+        budget_bytes - output["allocations"]["uniform"]["resident_bytes"])
     output["results"]["uniform"] = evaluate(
         evaluation, uniform, specs, policies, learned_counts, evaluation_cache)
     for policy in policies:
@@ -884,6 +935,8 @@ def analyze(
             "capacities": {str(k): v for k, v in sorted(capacities.items())},
             "resident_bytes": capacity_bytes(capacities, specs),
         }
+        output["allocations"][name]["unused_bytes"] = (
+            budget_bytes - output["allocations"][name]["resident_bytes"])
         output["results"][name] = evaluate(
             evaluation, capacities, specs, [policy], learned_counts, evaluation_cache)
     return output
@@ -895,7 +948,9 @@ def print_report(result):
     for allocation, policies in result["results"].items():
         caps = result["allocations"][allocation]["capacities"]
         resident = result["allocations"][allocation]["resident_bytes"]
-        print(f"capacities[{allocation}]={caps} resident_bytes={resident}")
+        unused = result["allocations"][allocation]["unused_bytes"]
+        print(f"capacities[{allocation}]={caps} resident_bytes={resident} "
+              f"unused_bytes={unused}")
         for policy, payload in policies.items():
             stats = payload["aggregate"]
             print(f"{allocation:18} {policy:11} {stats['hit_rate']:8.2%} "
@@ -1051,7 +1106,12 @@ def command_run(args):
         if any(not trace for trace in train):
             raise ValueError("--max-training-events removed every event from a trace")
     budget = int(args.expert_budget_gb * 1e9)
-    result = analyze(train, evaluation, specs, budget, args.policies)
+    learned_counts = training_counts(train)
+    train_cache = LayerReplayCache(train, specs, learned_counts)
+    evaluation_cache = LayerReplayCache(evaluation, specs, learned_counts)
+    result = analyze(
+        train, evaluation, specs, budget, args.policies, learned_counts,
+        train_cache, evaluation_cache)
     print_report(result)
     categories = trace_categories(evaluation, args.eval_category)
     gate = decision_gate(result, categories, args.minimum_gain, args.maximum_regression)
@@ -1059,7 +1119,8 @@ def command_run(args):
     sensitivity = sensitivity_analysis(
         train, evaluation, specs, budget, args.policies, categories,
         args.felt_scales, args.minimum_gain, args.maximum_regression,
-        args.sensitivity_layers)
+        args.sensitivity_layers, learned_counts, train_cache, evaluation_cache,
+        result)
     costs = profile_costs(args.prof_log)
     print("sensitivity " + " ".join(
         f"{row['allocation']}/{row['policy']}="
@@ -1084,9 +1145,15 @@ def command_sweep(args):
             raise ValueError("--max-training-events removed every event from a trace")
     categories = trace_categories(evaluation, args.eval_category)
     costs = profile_costs(args.prof_log)
+    learned_counts = training_counts(train)
+    train_cache = LayerReplayCache(train, specs, learned_counts)
+    evaluation_cache = LayerReplayCache(evaluation, specs, learned_counts)
     results = []
     for budget_gb in args.expert_budgets:
-        result = analyze(train, evaluation, specs, int(budget_gb * 1e9), args.policies)
+        budget_bytes = int(budget_gb * 1e9)
+        result = analyze(
+            train, evaluation, specs, budget_bytes, args.policies,
+            learned_counts, train_cache, evaluation_cache)
         results.append({
             "expert_budget_gb": budget_gb,
             "result": result,
@@ -1094,9 +1161,10 @@ def command_sweep(args):
             "gate": decision_gate(
                 result, categories, args.minimum_gain, args.maximum_regression),
             "sensitivity": sensitivity_analysis(
-                train, evaluation, specs, int(budget_gb * 1e9), args.policies,
+                train, evaluation, specs, budget_bytes, args.policies,
                 categories, args.felt_scales, args.minimum_gain,
-                args.maximum_regression, args.sensitivity_layers),
+                args.maximum_regression, args.sensitivity_layers,
+                learned_counts, train_cache, evaluation_cache, result),
         })
     for entry in results:
         print(f"\n=== expert budget {entry['expert_budget_gb']:g} GB ===")
