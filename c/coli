@@ -226,6 +226,79 @@ def hline(w): return f"{C.dgray}{'─'*w}{C.r}"
 # ---------- util ----------
 def term_w(): return min(shutil.get_terminal_size((80,20)).columns, 100)
 
+def _read_pasted_lines(stream):
+    """Collect complete lines already queued after an interactive paste.
+
+    ``input()`` is line-oriented on libedit (including the FreeBSD build), so a
+    pasted block can return its first line while the remaining lines stay in
+    the terminal input queue.  Read only data that is immediately ready; a
+    normal Enter therefore remains a one-line prompt and typing for the next
+    turn is not blocked here.
+    """
+    lines = []
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            pending = []
+            while msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    lines.append("".join(pending))
+                    pending = []
+                elif ch not in ("\x00", "\xe0"):
+                    pending.append(ch)
+            if pending:
+                lines.append("".join(pending))
+            return lines
+        import select
+        while select.select([stream], [], [], 0)[0]:
+            line = stream.readline()
+            if not line:
+                break
+            lines.append(line.rstrip("\r\n"))
+    except (ImportError, OSError, ValueError):
+        # Some stdin implementations (notably embedded consoles) cannot be
+        # polled.  Keeping the first line is safer than blocking the chat loop.
+        pass
+    return lines
+
+def read_prompt(prompt=""):
+    """Read one prompt, retaining additional lines from a pasted block."""
+    first = input(prompt)
+    if not TTY:
+        return first
+    return "\n".join([first, *_read_pasted_lines(sys.stdin)])
+
+def prompt_box_lines(message, width):
+    """Wrap a prompt for the terminal box without losing explicit newlines."""
+    lines = []
+    for logical in message.splitlines() or [""]:
+        lines.extend(textwrap.wrap(logical, width=max(1, width),
+                                   replace_whitespace=False,
+                                   drop_whitespace=False) or [""])
+    return lines
+
+def prompt_input_rows(message, columns):
+    """Return the number of terminal rows occupied by the readline input."""
+    rows = 0
+    for index, logical in enumerate(message.splitlines() or [""]):
+        prefix = 6 if index == 0 else 0  # ``  │ › `` before the first line
+        rows += max(1, (prefix + len(logical) + columns - 1) // columns)
+    return rows
+
+def redraw_prompt_box(message, width):
+    """Replace readline's raw echo with a wrapped, multiline prompt box."""
+    clean = message.strip("\r\n")
+    columns = shutil.get_terminal_size((80,20)).columns
+    used = prompt_input_rows(clean, columns)
+    sys.stdout.write(f"\x1b[{used}A\x1b[0J")
+    inner = width - 3
+    for index, line in enumerate(prompt_box_lines(clean, inner)):
+        prefix = f"{C.teal}{C.b}›{C.r}" if index == 0 else " "
+        print(f"  {C.dgray}│{C.r} {prefix} {line}{' '*(inner-len(line))}{C.dgray}│{C.r}")
+    print(f"  {C.dgray}╰{'─'*width}╯{C.r}")
+    return clean
+
 def model_arch(model):
     try:
         with open(os.path.join(model, "config.json"), encoding="utf-8") as f:
@@ -925,15 +998,16 @@ def chat_attached(a, base, model_id):
     while True:
         if TTY:
             print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
-            try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+            try: msg=read_prompt(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
             except EOFError: print(); break
-            print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
+            try: msg=redraw_prompt_box(msg, w)
+            except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
         else:
             try: msg=input()
             except EOFError: break
-        msg=msg.strip()
+        msg=msg.strip("\r\n")
         if msg in (":q",":quit","exit"): break
-        if not msg: continue
+        if not msg.strip(): continue
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         msgs.append({"role":"user","content":msg})
         body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
@@ -1107,32 +1181,20 @@ def cmd_chat(a):
     except Exception: pass
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :more continues · :reset clears memory · :q exits{C.r}\n")
     w=term_w()-4
-    def user_box(msg):
-        """ri-disegna il messaggio dentro una box che si ADATTA su piu' righe:
-        l'input grezzo (che sborda) viene cancellato e sostituito dal testo avvolto."""
-        cols=shutil.get_terminal_size((80,20)).columns
-        used=max(1, (6+len(msg)+cols-1)//cols)          # righe occupate dall'input ("  │ › "+msg)
-        sys.stdout.write(f"\x1b[{used}A\x1b[0J")        # su di N righe e pulisci fino in fondo
-        inner=w-3                                        # spazio utile: "  │ › "+testo+"│" = w+4 colonne
-        lines=textwrap.wrap(msg, inner) or [""]
-        for i,ln in enumerate(lines):
-            pre = f"{C.teal}{C.b}›{C.r}" if i==0 else " "
-            print(f"  {C.dgray}│{C.r} {pre} {ln}{' '*(inner-len(ln))}{C.dgray}│{C.r}")
-        print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
     try:
         while True:
             if TTY:
                 print(f"  {C.dgray}╭{'─'*w}╮{C.r}")
-                try: msg=input(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
+                try: msg=read_prompt(f"  {C.dgray}│{C.r} {C.teal}{C.b}›{C.r} ")
                 except EOFError: print(); break
-                try: user_box(msg.strip())
+                try: msg=redraw_prompt_box(msg, w)
                 except Exception: print(f"  {C.dgray}╰{'─'*w}╯{C.r}")
             else:
                 try: msg=input()
                 except EOFError: break
-            msg=msg.strip()
+            msg=msg.strip("\r\n")
             if msg in (":q",":quit","exit"): break
-            if not msg: continue
+            if not msg.strip(): continue
             if msg==":reset":
                 p.stdin.write(b"\x02RESET\n"); p.stdin.flush()
                 stream_turn(p, END, lambda b: None)
