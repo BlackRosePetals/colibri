@@ -8128,6 +8128,33 @@ static int pin_rec_cmp(const void *a,const void *b){
     const PinRec *x=a,*y=b; return x->c<y->c?1:x->c>y->c?-1:0;
 }
 
+/* A pin budget buys a popularity-ranked PREFIX, but mixed-width containers do
+ * not have one honest bytes-per-expert divisor.  GLM-5.2's routed rows are int4
+ * while its MTP row is int8: pricing every candidate at the widest row made a
+ * 51.1 GB budget buy the same 1,352 experts in both g64 and E8 containers even
+ * though their routed experts cost only 21.2 and 14.6 MB (#885).
+ *
+ * Keep the ranking semantics -- never skip a hot wide candidate to admit a
+ * colder narrow one -- and stop immediately before the first candidate that
+ * would cross the byte ceiling.  `from` lets CUDA_RELEASE_HOST exclude the
+ * transient VRAM prefix before spending the disjoint RAM budget. */
+static double pin_range_bytes(Model *m, const PinRec *r, int from, int to){
+    double used=0.0;
+    for(int a=from;a<to;a++) used+=(double)expert_bytes_row(m,r[a].l,m->ebits);
+    return used;
+}
+static int pin_count_for_budget(Model *m, const PinRec *r, int from, int n,
+                                double budget_b){
+    double used=0.0; int count=0;
+    if(budget_b<=0.0 || from>=n) return 0;
+    for(int a=from;a<n;a++){
+        double need=(double)expert_bytes_row(m,r[a].l,m->ebits);
+        if(need<=0.0 || used+need>budget_b) break;
+        used+=need; count++;
+    }
+    return count;
+}
+
 #ifdef __linux__
 /* #419: bind the pinned hot-store as ONE arena per layer instead of one mbind
  * per slab. Per-slab policies cost ~2 unmergeable VMAs each; a PIN_GB=all load
@@ -8214,20 +8241,21 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     }
     free(seen);
     qsort(r,(size_t)n,sizeof(*r),pin_rec_cmp);
-    int64_t eb=expert_bytes_probe(m,m->ebits);
     /* PIN_GB=all (#80): NON "tutti" alla lettera. Pinnare l'intero set ignora il
      * budget --ram e fa OOM-kill del kernel a meta' generazione (#229: host 92 GB
      * ucciso con --ram 78, anon-rss 89 GB). Clampa a quanti expert entrano nel
      * budget RAM, come AUTOPIN; il pin aggiorna resident_bytes, quindi cap_for_ram
      * dopo restringe la LRU di conseguenza (nessun doppio conteggio). */
-    int npin;
+    double pin_budget_b;
     if(gb<0){
         double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
         int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
         double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
-        npin=avail>0?(int)(avail/eb):0;
-    } else npin=(int)(gb*1e9/eb);
+        pin_budget_b=avail>0?avail:0.0;
+    } else pin_budget_b=gb*1e9;
+    int cpu_from=0;
 #ifdef COLI_CUDA
+    int64_t eb=expert_bytes_probe(m,m->ebits);  /* shared ws / CUDA staging ceiling */
     /* The VRAM budget must be known BEFORE npin is finalized: with
      * CUDA_RELEASE_HOST the VRAM-ranked prefix's host slabs are freed right
      * after upload, so those slots must NOT consume the RAM pin budget.
@@ -8262,9 +8290,11 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
             prefix_est=raw+(int)((budget-(double)raw*eb)/(0.80*eb))+g_cuda_ndev;
         }
 #endif
-        npin+=prefix_est;                       /* additive: prefix RAM is returned after upload */
+        if(prefix_est>n) prefix_est=n;
+        cpu_from=prefix_est;                    /* prefix RAM is returned after upload */
     }
 #endif
+    int npin=cpu_from+pin_count_for_budget(m,r,cpu_from,n,pin_budget_b);
     if(npin>n) npin=n;
     if(npin<1){ free(r); return; }
     int *cnt_l=calloc(c->n_layers+1,sizeof(int));   /* +1: riga MTP */
@@ -8273,7 +8303,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     int *slot_of=malloc((size_t)npin*sizeof(int)), *next=calloc(c->n_layers+1,sizeof(int));
     for(int a=0;a<npin;a++) slot_of[a]=next[r[a].l]++;
     for(int i=0;i<=c->n_layers;i++) m->npin[i]=cnt_l[i];
-    double t0=now_s();
+    double t0=now_s(), pin_host_released=0.0;
 #ifdef COLI_CUDA
     if(prefix_est>0){ gpu_prefix=prefix_est; if(gpu_prefix>npin) gpu_prefix=npin; }
 #else
@@ -8322,7 +8352,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     #pragma omp parallel for schedule(dynamic,1)
     for(int a=base;a<hi;a++)
         expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-    m->resident_bytes+=(int64_t)(hi-base)*eb;
+    m->resident_bytes+=(int64_t)pin_range_bytes(m,r,base,hi);
 #ifdef COLI_CUDA
     if(g_cuda_enabled && budget>0){
         for(int a=base;a<hi && m->gpu_expert_bytes<budget;a++){
@@ -8366,7 +8396,7 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
                         m->gpu_expert_count++; m->gpu_expert_bytes+=actual;
                         remaining[best]-=actual; placed_b[best]+=actual; placed_n[best]++;
                         placed_w[best]+=(double)r[a].c;
-                        if(g_cuda_release_host) expert_host_release(m,s);
+                        if(g_cuda_release_host){ expert_host_release(m,s); pin_host_released+=(double)need; }
                         placed=1;
                     } else {
                         qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d);
@@ -8416,10 +8446,12 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
         #pragma omp parallel for schedule(dynamic,1)
         for(int a=gpu_prefix;a<npin;a++)
             expert_load(m,r[a].l,r[a].e,&m->pin[r[a].l][slot_of[a]],1,0);   /* startup pin load; demand=0, never classified */
-        m->resident_bytes+=(int64_t)(npin-gpu_prefix)*eb;
+        m->resident_bytes+=(int64_t)pin_range_bytes(m,r,gpu_prefix,npin);
     }
+    double warm_b=pin_range_bytes(m,r,0,npin)-pin_host_released;
+    if(warm_b<0.0) warm_b=0.0;
     fprintf(stderr,"[PIN] placement: %d VRAM + %d RAM expert (%.1f GB warm) in %.0fs da %s\n",
-        m->gpu_expert_count,npin-m->gpu_expert_count,(npin-m->gpu_expert_count)*eb/1e9,now_s()-t0,statspath);
+        m->gpu_expert_count,npin-m->gpu_expert_count,warm_b/1e9,now_s()-t0,statspath);
     pin_wire(m);                                   /* inchioda in RAM (no compressione) / wire in RAM (no compression) */
     free(r); free(cnt_l); free(slot_of); free(next);
 }
