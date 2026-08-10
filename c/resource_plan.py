@@ -290,12 +290,129 @@ def _discover_nvidia_gpus():
     return devices
 
 
+_HIPINFO_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2,
+                  "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def _hipinfo_executable():
+    """Locate hipInfo.exe, preferring the runtime Colibri will actually bind.
+
+    rocm-smi does not exist on Windows -- neither the HIP SDK installer nor a
+    source build ships it -- so the rocm-smi probe below finds nothing there and
+    every Windows AMD host planned CPU-only. hipInfo.exe is what both shipped
+    SDKs do provide, and it sits in the same directory as amdhip64_7.dll.
+
+    Lookup order, and why:
+
+    1. ``COLI_HIP_RUNTIME_DIR`` -- the directory the loader binds the HIP
+       runtime from (docs/windows.md). hipInfo lives beside amdhip64_7.dll
+       there, so its answer describes the runtime the engine will actually
+       load.
+    2. ``HIP_PATH``\\bin -- the SDK root the Windows HIP SDK installer sets, and
+       the same variable c/Makefile derives HIP_SDK_ROOT from.
+    3. ``PATH``.
+
+    The order is the point on a host carrying more than one HIP install: a
+    stale ambient HIP_PATH must not describe the hardware through a runtime the
+    engine is not going to bind. No install location is hardcoded.
+    """
+    if sys.platform != "win32":
+        return None
+    candidates = []
+    runtime_dir = os.environ.get("COLI_HIP_RUNTIME_DIR")
+    if runtime_dir:
+        candidates.append(Path(runtime_dir.strip('"')) / "hipInfo.exe")
+    hip_path = os.environ.get("HIP_PATH")
+    if hip_path:
+        candidates.append(Path(hip_path.strip('"')) / "bin" / "hipInfo.exe")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    found = shutil.which("hipInfo")
+    return Path(found) if found else None
+
+
+def _hipinfo_bytes(value):
+    """``"89.39 GB"`` -> bytes, or None. hipInfo divides by 1024 (it prints a
+    65536-byte shared block as ``64.00 KB``), so the units are binary."""
+    match = re.match(r"([0-9.]+)\s*([KMGT]?B)\b", (value or "").strip())
+    if not match:
+        return None
+    try:
+        return int(float(match.group(1)) * _HIPINFO_UNITS[match.group(2)])
+    except (ValueError, KeyError, OverflowError):
+        return None
+
+
+def _parse_hipinfo(text):
+    """Devices from hipInfo output, one block per ``device#`` line.
+
+    A block that does not carry both a name and a total is dropped rather than
+    completed with zeros: a half-trusted device is worse than no device,
+    because the zeros would read as measurements.
+
+    ``memInfo.free`` is deliberately NOT carried into ``free_bytes``. hipInfo
+    does report it, and on the validated gfx1151 host it reported 89.24 GB
+    "100% free" while Windows itself had 59.3 GiB of physical memory actually
+    available -- the same pages, counted twice, ~30 GB apart. Qualifying that
+    relationship is a later slice; until then the value is observed and
+    discarded, and ``free_bytes`` stays None. See plans_placement().
+    """
+    blocks = []
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("device#"):
+            index = stripped[len("device#"):].strip()
+            current = {"index": int(index)} if index.isdigit() else None
+            if current is not None:
+                blocks.append(current)
+            continue
+        if current is None:
+            continue
+        key, sep, value = line.partition(":")
+        if sep:
+            current[key.strip()] = value.strip()
+    devices = []
+    for block in blocks:
+        name = block.get("Name", "")
+        total = _hipinfo_bytes(block.get("memInfo.total")
+                               or block.get("totalGlobalMem"))
+        if not name or not total:
+            continue
+        devices.append({"index": block["index"], "name": name,
+                        "arch": block.get("gcnArchName", ""),
+                        "total_bytes": total,
+                        "free_bytes": None,
+                        "unified_memory": block.get("isIntegrated") == "1"})
+    return devices
+
+
+def _discover_amd_gpus_windows():
+    hipinfo = _hipinfo_executable()
+    if hipinfo is None:
+        return []
+    try:
+        result = subprocess.run([str(hipinfo)], text=True, capture_output=True,
+                                check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _parse_hipinfo(result.stdout)
+
+
 def _discover_amd_gpus():
-    """ROCm/HIP discovery via rocm-smi (#662). Absent on non-AMD hosts, so this
-    returns [] there. rocm-smi --showmeminfo vram reports BYTES (unlike nvidia-smi's
-    MiB), so no unit scaling. Column names drift across ROCm versions, so match them
-    by substring rather than position. VERIFY on AMD hardware (labelled
-    hardware-owner-needed) -- authored without a ROCm host to test against."""
+    """ROCm/HIP discovery. Windows goes through hipInfo (see above); everywhere
+    else through rocm-smi (#662), which is absent on non-AMD hosts so this
+    returns [] there. rocm-smi --showmeminfo vram reports BYTES (unlike
+    nvidia-smi's MiB), so no unit scaling. Column names drift across ROCm
+    versions, so match them by substring rather than position. The rocm-smi
+    branch remains VERIFY-on-AMD-hardware (labelled hardware-owner-needed) --
+    authored without a ROCm host to test against."""
+    if sys.platform == "win32":
+        return _discover_amd_gpus_windows()
     command = ["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--csv"]
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
