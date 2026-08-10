@@ -355,11 +355,15 @@ def _parse_hipinfo(text):
     because the zeros would read as measurements.
 
     ``memInfo.free`` is deliberately NOT carried into ``free_bytes``. hipInfo
-    does report it, and on the validated gfx1151 host it reported 89.24 GB
-    "100% free" while Windows itself had 59.3 GiB of physical memory actually
-    available -- the same pages, counted twice, ~30 GB apart. Qualifying that
-    relationship is a later slice; until then the value is observed and
-    discarded, and ``free_bytes`` stays None. See plans_placement().
+    does report it, but on integrated hardware it has not been qualified as a
+    budget. On the validated gfx1151 host, four controlled rebooted sessions
+    varying the firmware shared-memory limit reported the same 76.79 GiB total
+    at the ~6, ~32 and ~64 GB settings -- about 12.8x the configured limit at
+    the minimum -- and 93.00 GiB only at the ~123 GB maximum, with
+    Windows-visible memory unchanged throughout. What that figure permits, and
+    at what cost to the host, is a later slice; until then the value is
+    observed and discarded, and ``free_bytes`` stays None. See
+    plans_placement().
     """
     blocks = []
     current = None
@@ -463,8 +467,9 @@ def plans_placement(gpu):
     discrete card's free VRAM *is* the budget. It is ``None`` for a device that
     exists and is worth reporting but whose free memory has not been qualified
     as a Colibri budget -- today, a Windows AMD part found through hipInfo,
-    where the runtime's free figure describes the same physical pages the host
-    RAM tier is already counting.
+    where the GPU and the host draw on one physical pool and the relationship
+    between the runtime's free figure and host-available memory has not been
+    measured.
 
     ``None`` is deliberately distinct from ``0``. Zero is a measurement ("the
     card is full") and keeps every behaviour it has always had. ``None`` says

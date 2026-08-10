@@ -418,22 +418,34 @@ measurement.
 `memInfo.total` and `memInfo.free`. Colibri records the identity, marks
 `isIntegrated: 1` as unified memory, and takes the total.
 
-It deliberately does **not** use `memInfo.free` as a placement budget. On the
-validated gfx1151 host, `hipInfo` reported:
+It deliberately does **not** use `memInfo.free` as a placement budget, because
+on this hardware that figure has not been qualified as one.
 
-```
-memInfo.total:                    89.39 GB
-memInfo.free:                     89.24 GB (100%)
-```
+The Armoury Crate firmware setting on the validated host exposes a
+*shared-memory allocation* limit. Four controlled observations, each in its own
+rebooted session with everything else held constant, gave:
 
-while Windows itself had **59.3 GiB** of physical memory actually available.
-Those are the same physical pages counted twice, about 30 GB apart, on a part
-where the GPU and the host share one pool. Spending the HIP figure as a VRAM
-budget would authorise an expert tier the machine cannot back — and the RAM
-tier is being sized from that same memory at the same time.
+| Armoury shared-memory limit | `memInfo.total` | `memInfo.free` | Windows visible |
+|---|---|---|---|
+| ~6 GB (UI minimum) | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~32 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~64 GB | 76.79 GiB | 76.63 GiB | 127.15 GiB |
+| ~123 GB (UI maximum) | 93.00 GiB | 92.84 GiB | 127.15 GiB |
 
-So such a device is carried as **identity only**: free memory is *unknown for
-planning*, which is not the same claim as "zero bytes are free". `coli plan`
+Three settings spanning a twentyfold range produced the same reading; only the
+maximum differed. At the ~6 GB minimum the reported total was roughly **12.8×
+the configured limit**. Windows-visible physical memory was unchanged in all
+four runs, as was the 0.50 GiB dedicated frame buffer the driver reports.
+
+So the reported figure is not a simple function of the setting, and no
+slider-to-HIP-memory mapping is assumed here. Nor is it dedicated VRAM: on an
+integrated part the GPU and the host draw on one physical pool, and how much of
+what HIP advertises can actually be spent — and at what cost to the host — has
+not been measured. Sizing an expert tier from it would be a guess.
+
+Such a device is therefore carried as **identity only**: free memory is
+*unknown for planning*, which is not the same claim as "zero bytes are free".
+`coli plan`
 shows it, marked `(identity only)`, with a warning naming it, and:
 
 - the VRAM tier stays at 0
@@ -447,8 +459,8 @@ fabricated in place of a measurement.
 None of this prevents you from running on the GPU. Every environment variable
 in this document still works exactly as documented — this governs only what
 Colibri will turn on *by itself*. Qualifying a safe automatic budget on shared
-memory needs measurement on real hardware, and that is deliberately left to a
-later change rather than guessed at here.
+memory needs allocation measurements on real hardware, and that is deliberately
+left to a later change rather than guessed at here.
 
 A discrete Windows AMD card is marked `unified_memory: false` from
 `isIntegrated: 0`, but is also carried as identity-only for now: there is no
