@@ -218,6 +218,14 @@ ifneq ($(IS_WIN),)
 NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
 else
 NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+# glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
+# with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
+# under C++17 (noexcept is part of the function type since C++17). Force-include
+# a compat header that strips __THROW from the host pass; see
+# glibc_c23_math_compat.h. MSVC never sees glibc headers, so Linux-only.
+ifneq ($(LINUX),)
+NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
+endif
 endif
 # HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
