@@ -9104,9 +9104,21 @@ int main(int argc, char **argv){
      * misurato (#707). */
     if(!getenv("COLI_OMP_TUNED") && !getenv("COLI_NO_OMP_TUNE") &&
        !coli_env_on("COLI_CUDA") && !coli_env_on("COLI_METAL")){
+        /* #707: the spin-wait knobs are measured HARMFUL on macOS / Apple
+         * Silicon with LLVM libomp. Reporter (M1 Max, 32 GB, GLM-5.2 int4):
+         * OMP_WAIT_POLICY=active alone +122% decode, KMP_BLOCKTIME=200 alone
+         * +115%. Reproduced on an M3 16 GB with the OLMoE engine (same libomp
+         * behaviour, smaller scale): wait-only 2.23 tok/s vs ~3.4 baseline
+         * (-34%), block-only 2.54 (-25%). The Linux/FreeBSD re-exec below
+         * never runs on Darwin (libomp's constructor already read the
+         * environment), so these setenvs are inert today -- but keep them OFF
+         * explicitly so a future Darwin exec path cannot apply a measured
+         * regression. The OMP_PROC_BIND/OMP_DYNAMIC pair is noise-level and
+         * stays for all platforms. */
+#ifndef __APPLE__
         setenv("OMP_WAIT_POLICY","active",0);  /* keep the team hot across the tiny per-expert matmul regions */
         setenv("GOMP_SPINCOUNT","200000",0);   /* spin briefly, then yield so long disk waits don't burn a core */
-        /* LLVM libomp (clang builds: FreeBSD cc, macOS, some Linux setups) does not
+        /* LLVM libomp (clang builds: FreeBSD cc, some Linux setups) does not
          * read GOMP_*: with OMP_WAIT_POLICY=active it sets KMP_BLOCKTIME=infinite,
          * so the idle team SPINS FOREVER once generation ends — a serve-mode engine
          * parked on stdin burns ~100% x nthreads (#341, measured 3000% on FreeBSD).
@@ -9114,6 +9126,10 @@ int main(int argc, char **argv){
          * and lets it sleep at the prompt. libgomp ignores KMP_*; overwrite=0 keeps
          * the user's own setting authoritative. */
         setenv("KMP_BLOCKTIME","200",0);
+#else
+        fprintf(stderr,"[OMP] hot-thread tuning skipped on macOS (#707): spin-wait knobs "
+                       "measured slower on Apple Silicon (COLI_NO_OMP_TUNE=1 to skip)\n");
+#endif
         setenv("OMP_PROC_BIND","close",0);     /* pack the team onto adjacent cores for cache locality */
         setenv("OMP_DYNAMIC","FALSE",0);       /* fixed team size: no per-region thread-count churn */
         setenv("COLI_OMP_TUNED","1",1);
