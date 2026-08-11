@@ -32,6 +32,15 @@ static void write_fixture(const char *dir){
     fwrite(q4,1,sizeof(q4),f); fwrite(s4,1,sizeof(s4),f); fclose(f);
 }
 
+static void close_fixture_shards(shards *S){
+    st_mirror_reset(S);
+    for(int i=0;i<S->nfd;i++){
+        if(S->dfds[i]>=0&&S->dfds[i]!=S->fds[i]) close(S->dfds[i]);
+        if(S->fds[i]>=0) close(S->fds[i]);
+        S->dfds[i]=S->fds[i]=-1;
+    }
+}
+
 static void compare_weight(Model *m, const char *name, int O, int I, int bits){
     W copied={0}, mapped={0}; float x[64], yc[2]={0}, ym[2]={0};
     float ac[64]={0}, am[64]={0};
@@ -67,12 +76,13 @@ int main(void){
     CHECK(!k3_mmap_backend_allowed(1,0,1),"mapped CUDA combination accepted");
     CHECK(k3_mmap_backend_allowed(0,1,1),"default loader changed GPU policy");
 
+    close_fixture_shards(&m.S);
     char path[512]; snprintf(path,sizeof(path),"%s/model.safetensors",dir);
-    remove(path);
+    CHECK(remove(path)==0,"fixture file cleanup failed");
 #ifdef _WIN32
-    _rmdir(dir);
+    CHECK(_rmdir(dir)==0,"fixture directory cleanup failed");
 #else
-    rmdir(dir);
+    CHECK(rmdir(dir)==0,"fixture directory cleanup failed");
 #endif
     if(failures){ fprintf(stderr,"k3 mmap: %d failure(s)\n",failures); return 1; }
     puts("k3 mmap: mapped and copied CPU paths are exact"); return 0;

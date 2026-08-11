@@ -31,6 +31,15 @@ static void write_snap(const char *dir) {
     fclose(f);
 }
 
+static void close_fixture_shards(shards *S) {
+    st_mirror_reset(S);
+    for (int i = 0; i < S->nfd; i++) {
+        if (S->dfds[i] >= 0 && S->dfds[i] != S->fds[i]) close(S->dfds[i]);
+        if (S->fds[i] >= 0) close(S->fds[i]);
+        S->dfds[i] = S->fds[i] = -1;
+    }
+}
+
 int main(void) {
     char dir[] = "test_st_map_XXXXXX";
     CHECK(mkdtemp(dir) != NULL);
@@ -58,13 +67,15 @@ int main(void) {
     CHECK(scales.data == NULL && scales.nbytes == 0);
     CHECK(weight.data == NULL && weight.nbytes == 0);
 
-    char cmd[600];
+    close_fixture_shards(&S);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/model.safetensors", dir);
+    CHECK(remove(path) == 0);
 #ifdef _WIN32
-    snprintf(cmd, sizeof(cmd), "rmdir /s /q %s", dir);
+    CHECK(_rmdir(dir) == 0);
 #else
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
+    CHECK(rmdir(dir) == 0);
 #endif
-    if (system(cmd)) {}
     printf("test_st_map: exact unaligned read-only tensor views: ok\n");
     return 0;
 }
