@@ -1354,8 +1354,10 @@ static int v5_dense_inventory(const char *model_dir,
 
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
+    const ColiDeepSeekV4Config *config,
     const ColiDeepSeekV4ExpertStoreOptions *options, ColiExpertStore **output,
     char *error, size_t error_size) {
+    (void)config; /* auto uses engine->runtime + engine->config; requires engine */
     if (!options || !engine) return -1;
     ColiDeepSeekV4ResourcePlan plan;
     ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
@@ -8321,6 +8323,7 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #ifdef COLI_V4_UNIT_RUNTIME
 /* ######## deepseek_v4_runtime.c / engine ######## */
 #include "deepseek_v4_internal.h"
+#include "expert_store_registry.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -8667,8 +8670,8 @@ int coli_v4_engine_open(ColiV4Engine **output,
         return 0;
     }
 #endif
-    if (coli_v4_expert_store_open_planned(
-            engine,
+    if (coli_expert_store_backend_open_selected(
+            engine, &engine->config,
             &(ColiDeepSeekV4ExpertStoreOptions){
                 engine->runtime.target_model_dir,
                 engine->config.num_hidden_layers,
@@ -10653,12 +10656,28 @@ int main(int argc, char **argv) {
     ColiSafetensorsIndex *index = NULL;
     ColiExpertStore *experts = NULL;
     if (coli_v4_config_load(&config, argv[1], error, sizeof(error)) ||
-        coli_st_index_open(&index, argv[1], error, sizeof(error)) ||
-        coli_deepseek_v4_expert_store_open(
-            &(ColiDeepSeekV4ExpertStoreOptions){
-                argv[1], config.num_hidden_layers, config.n_routed_experts,
-                UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
-            }, &experts, error, sizeof(error))) {
+        coli_st_index_open(&index, argv[1], error, sizeof(error))) {
+        fprintf(stderr, "%s\n", error);
+        return 1;
+    }
+    ColiDeepSeekV4ExpertStoreOptions store_opts = {
+        argv[1], config.num_hidden_layers, config.n_routed_experts,
+        UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
+    };
+    /* Route through the pluggable backend registry when COLI_EXPERT_STORE names
+     * a non-"auto" backend (e.g. a networked/remote store). The
+     * CLI has no ColiV4Engine, so pass NULL engine + the loaded config; the
+     * backend derives expert geometry from the config. Unset/"auto" keeps the
+     * historical direct on-disk open. */
+    const char *coli_be = getenv("COLI_EXPERT_STORE");
+    if (coli_be && *coli_be && strcmp(coli_be, "auto") != 0) {
+        if (coli_expert_store_backend_open_selected(
+                NULL, &config, &store_opts, &experts, error, sizeof(error))) {
+            fprintf(stderr, "%s\n", error);
+            return 1;
+        }
+    } else if (coli_deepseek_v4_expert_store_open(
+                   &store_opts, &experts, error, sizeof(error))) {
         fprintf(stderr, "%s\n", error);
         return 1;
     }
