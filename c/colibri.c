@@ -1338,6 +1338,9 @@ static void load_cfg(Cfg *c, const char *snap){
     CKR("v_head_dim",c->v_head,1,1<<16)          CKR("n_shared_experts",c->n_shared,0,64)
     CKR("vocab_size",c->vocab,1,1<<24)           CKR("index_topk",c->index_topk,0,1<<20)
     CKR("index_n_heads",c->index_nh,0,1024)      CKR("index_head_dim",c->index_hd,0,1<<16)
+    if(c->topk>c->n_experts){
+        fprintf(stderr,"config: num_experts_per_tok=%d exceeds n_routed_experts=%d\n",
+                c->topk,c->n_experts); exit(1); }
     #undef CKR
     free(ar);
 }
