@@ -362,7 +362,7 @@ def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
     env = os.environ.copy()
-    # OMP_NUM_THREADS for the sister engines too.
+    # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
     # #805 set this from physical cores "on every platform" -- but only inside
     # env_for(), which this function calls only for glm. inkling, kimi_k3,
@@ -375,12 +375,18 @@ def env_for_engine(a, arch):
     # Same defect shape as the one #805 fixed, one level out: a mechanism that
     # reaches one engine and not its siblings.
     #
-    # setdefault, so an explicit OMP_NUM_THREADS still wins -- which is also
-    # how to A/B it: OMP_NUM_THREADS=12 reproduces the old behaviour.
+    # DeepSeek V4 is now the exception: its C runtime sizes the team from
+    # logical CPUs minus its expert-loader reservation. Setting the physical
+    # count here makes that runtime mistake a launcher default for a user
+    # override and bypass its loader-aware policy. The other engines still
+    # need the physical-core default below.
+    #
+    # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
-        if arch == "deepseek_v4":
+        if arch != "deepseek_v4":
+            from resource_plan import physical_cpu_count
+            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
             env.setdefault("OMP_DYNAMIC", "FALSE")

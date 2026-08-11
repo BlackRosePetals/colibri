@@ -1490,8 +1490,9 @@ def tune_child_env(env, arch):
     if arch != "deepseek_v4":
         return env
     if not env.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        # The V4 runtime owns OMP_NUM_THREADS: it reserves logical CPUs for its
+        # expert-loader workers. Supplying a physical-core default here makes
+        # that runtime policy treat the launcher value as a user override.
         env.setdefault("OMP_WAIT_POLICY", "active")
         env.setdefault("GOMP_SPINCOUNT", "200000")
         env.setdefault("OMP_DYNAMIC", "FALSE")

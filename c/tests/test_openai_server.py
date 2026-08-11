@@ -708,16 +708,29 @@ class CapSentinelShimTest(unittest.TestCase):
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}
-        with patch("resource_plan.physical_cpu_count", return_value=6), \
+        with patch("resource_plan.physical_cpu_count",
+                   side_effect=AssertionError("V4 server sized the team")), \
              patch("openai_server.sys.platform", "linux"):
             tune_child_env(env, "deepseek_v4")
-        self.assertEqual(env["OMP_NUM_THREADS"], "6")
+        self.assertNotIn("OMP_NUM_THREADS", env)
         self.assertEqual(env["OMP_PROC_BIND"], "close")
         self.assertEqual(env["V4_DRAFT"], "0")
         self.assertEqual(env["V4_MTP"], "0")
         self.assertEqual(env["V4_MTP_DRAFT"], "3")
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+
+    def test_direct_v4_server_preserves_explicit_omp_threads(self):
+        env = {"OMP_NUM_THREADS": "3"}
+        tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+
+    def test_direct_v4_server_honours_omp_kill_switch(self):
+        env = {"COLI_NO_OMP_TUNE": "1"}
+        tune_child_env(env, "deepseek_v4")
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+                    "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
+            self.assertNotIn(key, env)
 
 
 class HTTPTest(unittest.TestCase):
