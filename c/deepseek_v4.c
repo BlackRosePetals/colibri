@@ -3896,6 +3896,211 @@ int coli_v4_block_window_token_ref(
 #include "deepseek_v4_internal.h"
 #include "deepseek_v4_internal.h"
 
+/* ================ expert-major batch MoE: the prefill union ==============
+ *
+ * The batched block below used to run the FFN position by position, so a
+ * chunk of 64 prompt positions issued up to 64 x topk expert lookups per
+ * layer even when many positions selected the same expert.  Measured on the
+ * real V4-Flash checkpoint (113-token prompt, issue #905): 4.37 disk reads
+ * per DISTINCT expert, 29,154 lookups where 7,777 suffice -- 42% of prefill
+ * bytes were re-reads of experts already read moments earlier.
+ *
+ * This routine routes the complete batch first, then walks the UNION of
+ * selected experts in ascending id order, leasing each expert once and
+ * applying it to every (position, rank) that selected it before moving on.
+ *
+ * Exactness: moe_token_pipeline() sorts a position's experts into ascending
+ * expert-id order before accumulating, and emits one term per MATCHING RANK
+ * (a router handing a position the same expert at two ranks contributes it
+ * twice).  The union preserves both properties -- ascending experts outer,
+ * ascending (item, rank) inner -- so each position's accumulation order is
+ * identical to the token path's and the result is token-exact, verified on
+ * the real checkpoint via --record-oracle/--oracle (26/26 teacher-forced
+ * positions, 8/8 greedy, identical near-tie logits).
+ *
+ * V4_EXPERT_UNION=0 restores the per-position path for A/B timing.
+ * ========================================================================= */
+static int v4_moe_batch_union(
+    float *outputs, const ColiDeepSeekV4LayerWeights *weights,
+    const ColiDeepSeekV4Config *config, ColiExpertStore *store,
+    const float *inputs, const int *tokens, int batch) {
+    int d = config->hidden_size;
+    int n = config->n_routed_experts;
+    int topk = config->num_experts_per_tok;
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    float *gate = NULL;
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+    int missing_gate = !raw_gate;
+#else
+    size_t gate_count = (size_t)n * d;
+    float *gate = malloc(gate_count * sizeof(*gate));
+    int missing_gate = !gate;
+#endif
+    float *route_weights = malloc((size_t)batch * topk * sizeof(*route_weights));
+    int *indices = malloc((size_t)batch * topk * sizeof(*indices));
+    float *shared = malloc((size_t)batch * d * sizeof(*shared));
+    float *expert_output = malloc((size_t)d * sizeof(*expert_output));
+    unsigned char *used = calloc((size_t)n, 1);
+    ColiExpertKey *keys = malloc((size_t)n * sizeof(*keys));
+    if (missing_gate || !route_weights || !indices || !shared ||
+        !expert_output || !used || !keys) {
+        free(keys); free(used); free(expert_output); free(shared);
+        free(indices); free(route_weights); free(gate);
+        return -1;
+    }
+#ifdef COLI_V4_DISABLE_BF16_ROUTE
+    decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
+#endif
+    const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
+    const float *bias = value(weights, "ffn.gate.bias", NULL);
+    int result = weights->plan.uses_hash_router && !table ? -1 : 0;
+    for (int item = 0; !result && item < batch; item++) {
+        int *item_indices = indices + (size_t)item * topk;
+        float *item_weights = route_weights + (size_t)item * topk;
+        if (weights->plan.uses_hash_router)
+            for (int rank = 0; rank < topk; rank++)
+                item_indices[rank] =
+                    (int)table[(size_t)tokens[item] * topk + rank];
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+        result = coli_v4_route_bf16(
+            item_weights, item_indices, inputs + (size_t)item * d,
+            raw_gate, bias,
+            weights->plan.uses_hash_router ? item_indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+#else
+        result = coli_v4_route(
+            item_weights, item_indices, inputs + (size_t)item * d,
+            gate, bias,
+            weights->plan.uses_hash_router ? item_indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+#endif
+        if (!result)
+            for (int rank = 0; rank < topk; rank++) {
+                if (item_indices[rank] >= 0 && item_indices[rank] < n)
+                    used[item_indices[rank]] = 1;
+                else
+                    result = -1;
+            }
+    }
+
+    ColiTensorView w1, w2, w3;
+    if (!result &&
+        (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
+         fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
+         fp8_view(&w3, weights, "ffn.shared_experts.w3")))
+        result = -1;
+    for (int item = 0; !result && item < batch; item++)
+        result = coli_v4_shared_expert_forward_ref(
+            shared + (size_t)item * d, &w1, &w2, &w3,
+            inputs + (size_t)item * d, config->swiglu_limit);
+    if (!result)
+        memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
+
+    int key_count = 0;
+    for (int expert = 0; expert < n; expert++)
+        if (used[expert])
+            keys[key_count++] = (ColiExpertKey){weights->plan.layer, expert};
+#ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
+    /* The union is also the loader pool's issue queue: keep lanes-many reads
+     * in flight, launch the replacement before computing the completed
+     * expert, and disk N+lanes overlaps CPU expert N. */
+    ExpertLoadJob jobs[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    ExpertLoadHandle loaders[DUAL_EXPERT_LOADER_MAX] = {{0}};
+    int active[DUAL_EXPERT_LOADER_MAX] = {0};
+    int preload = key_count < dual_loader_lanes()
+        ? key_count : dual_loader_lanes();
+    for (int current = 0; !result && current < preload; current++) {
+        jobs[current].store = store;
+        jobs[current].key = keys[current];
+        jobs[current].result = -1;
+        if (profiled_expert_load_start(&loaders[current], &jobs[current]))
+            result = -1;
+        else
+            active[current] = 1;
+    }
+    for (int current = 0; !result && current < key_count; current++) {
+        int slot = current % dual_loader_lanes();
+        if (!active[slot] || profiled_expert_load_finish(&loaders[slot]) ||
+            jobs[slot].result) {
+            result = -1;
+            break;
+        }
+        active[slot] = 0;
+        ColiExpertView view = jobs[slot].view;
+        int next = current + dual_loader_lanes();
+        if (next < key_count) {
+            memset(&jobs[slot], 0, sizeof(jobs[slot]));
+            jobs[slot].store = store;
+            jobs[slot].key = keys[next];
+            jobs[slot].result = -1;
+            if (profiled_expert_load_start(&loaders[slot], &jobs[slot]))
+                result = -1;
+            else
+                active[slot] = 1;
+        }
+        int expert = view.key.expert;
+        for (int item = 0; !result && item < batch; item++)
+            for (int rank = 0; !result && rank < topk; rank++) {
+                if (indices[(size_t)item * topk + rank] != expert) continue;
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &view, inputs + (size_t)item * d,
+                    route_weights[(size_t)item * topk + rank],
+                    config->swiglu_limit);
+                if (!result)
+                    for (int column = 0; column < d; column++)
+                        outputs[(size_t)item * d + column] +=
+                            expert_output[column];
+            }
+        coli_expert_release(store, &view);
+    }
+    for (int slot = 0; slot < dual_loader_lanes(); slot++)
+        if (active[slot]) {
+            profiled_expert_load_finish(&loaders[slot]);
+            if (!jobs[slot].result) coli_expert_release(store, &jobs[slot].view);
+        }
+#else
+    for (int current = 0; !result && current < key_count; current++) {
+        ColiExpertView view;
+        if (coli_expert_lookup(store, keys[current], &view)) {
+            result = -1;
+            break;
+        }
+        int expert = keys[current].expert;
+        for (int item = 0; !result && item < batch; item++)
+            for (int rank = 0; !result && rank < topk; rank++) {
+                if (indices[(size_t)item * topk + rank] != expert) continue;
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &view, inputs + (size_t)item * d,
+                    route_weights[(size_t)item * topk + rank],
+                    config->swiglu_limit);
+                if (!result)
+                    for (int column = 0; column < d; column++)
+                        outputs[(size_t)item * d + column] +=
+                            expert_output[column];
+            }
+        coli_expert_release(store, &view);
+    }
+#endif
+    for (int item = 0; !result && item < batch; item++)
+        for (int column = 0; column < d; column++)
+            outputs[(size_t)item * d + column] = coli_bf16_round(
+                outputs[(size_t)item * d + column] +
+                shared[(size_t)item * d + column]);
+
+    free(keys); free(used); free(expert_output); free(shared);
+    free(indices); free(route_weights); free(gate);
+    return result ? -1 : 0;
+}
+
+static int v4_expert_union_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value_text = getenv("V4_EXPERT_UNION");
+        enabled = !value_text || atoi(value_text) != 0;
+    }
+    return enabled;
+}
+
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
     const ColiDeepSeekV4LayerWeights *weights,
@@ -3912,10 +4117,12 @@ int coli_v4_block_window_batch_ref(
     float *posts = malloc((size_t)batch * hc * sizeof(*posts));
     float *combs = malloc((size_t)batch * hc * hc * sizeof(*combs));
     float *reduced = malloc((size_t)d * sizeof(*reduced));
-    float *ffn_normalized = malloc((size_t)d * sizeof(*ffn_normalized));
-    float *ffn_branch = malloc((size_t)d * sizeof(*ffn_branch));
-    float *ffn_post = malloc((size_t)hc * sizeof(*ffn_post));
-    float *ffn_comb = malloc((size_t)hc * hc * sizeof(*ffn_comb));
+    /* FFN buffers are batch-sized so the MoE can run expert-major over the
+     * whole chunk (v4_moe_batch_union) instead of position by position. */
+    float *ffn_normalized = malloc((size_t)batch * d * sizeof(*ffn_normalized));
+    float *ffn_branch = malloc((size_t)batch * d * sizeof(*ffn_branch));
+    float *ffn_post = malloc((size_t)batch * hc * sizeof(*ffn_post));
+    float *ffn_comb = malloc((size_t)batch * hc * hc * sizeof(*ffn_comb));
     if (!states || !normalized || !branches || !posts || !combs || !reduced ||
         !ffn_normalized || !ffn_branch || !ffn_post || !ffn_comb) {
         free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
@@ -3946,15 +4153,29 @@ int coli_v4_block_window_batch_ref(
         if (!result) coli_bf16_round_array(state, hd);
         if (!result) phase = "FFN hyper-connection";
         if (!result) result = normalized_hc_pre(
-            reduced, ffn_post, ffn_comb, ffn_normalized, state,
+            reduced, ffn_post + (size_t)item * hc,
+            ffn_comb + (size_t)item * hc * hc,
+            ffn_normalized + (size_t)item * d, state,
             weights, config, "ffn", "ffn_norm.weight");
-        if (!result) phase = "MoE";
-        if (!result) result = moe_token_pipeline(
+    }
+    if (!result) phase = "MoE";
+    if (!result && batch > 1 && v4_expert_union_enabled())
+        result = v4_moe_batch_union(
             ffn_branch, weights, config, experts,
-            ffn_normalized, tokens[item]);
-        if (!result) result = coli_v4_hc_post(
-            outputs_hc + (size_t)item * hd, ffn_branch, state,
-            ffn_post, ffn_comb, hc, d);
+            ffn_normalized, tokens, batch);
+    else
+        for (int item = 0; !result && item < batch; item++)
+            result = moe_token_pipeline(
+                ffn_branch + (size_t)item * d, weights, config, experts,
+                ffn_normalized + (size_t)item * d, tokens[item]);
+    if (!result) phase = "FFN hyper-connection post";
+    for (int item = 0; !result && item < batch; item++) {
+        result = coli_v4_hc_post(
+            outputs_hc + (size_t)item * hd,
+            ffn_branch + (size_t)item * d,
+            states + (size_t)item * hd,
+            ffn_post + (size_t)item * hc,
+            ffn_comb + (size_t)item * hc * hc, hc, d);
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
     }
@@ -7269,9 +7490,22 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
                                error, error_size)) return -1;
         int result = 0;
-        for (int offset = 0; !result && offset < batch; offset += 64) {
+        /* Chunk width caps every batch-scaled buffer in the block AND bounds
+         * the expert union: each chunk boundary re-reads the experts it
+         * shares with the previous chunk.  64 is the batch kernels' contract
+         * (coli_fp8/fp4_matmul_batch_ref and both window batch entries
+         * validate batch > 64 and return -1 -- measured: a 256 chunk dies in
+         * seconds at layer 0), so V4_PREFILL_CHUNK clamps to [1, 64]. */
+        static int chunk_width;
+        if (!chunk_width) {
+            const char *chunk_env = getenv("V4_PREFILL_CHUNK");
+            chunk_width = chunk_env ? atoi(chunk_env) : 64;
+            if (chunk_width < 1 || chunk_width > 64) chunk_width = 64;
+        }
+        for (int offset = 0; !result && offset < batch;
+             offset += chunk_width) {
             int chunk = batch - offset;
-            if (chunk > 64) chunk = 64;
+            if (chunk > chunk_width) chunk = chunk_width;
             result = coli_v4_block_window_batch_ref(
                 next + (size_t)offset * hd, attention[layer_id],
                 &layer, config, experts, state + (size_t)offset * hd,
