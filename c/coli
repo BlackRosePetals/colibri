@@ -1372,12 +1372,19 @@ def cmd_web(a):
     print(f"dashboard: {url}  (opens automatically when the engine is ready)")
     cmd_serve(a)
 
+def project_python():
+    if sys.platform == "win32":
+        candidate = os.path.join(HERE, "mio_env", "Scripts", "python.exe")
+    else:
+        candidate = os.path.join(HERE, "mio_env", "bin", "python3")
+    return candidate if os.path.exists(candidate) else sys.executable
+
+
 def cmd_bench(a):
     need_model(a.model)
     banner("bench")
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    py = venv_py if os.path.exists(venv_py) else sys.executable
+    py = project_python()
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
     # dataset mancanti -> li scarica una volta (fetch_benchmarks.py li mette in --data come JSONL)
     missing=[t for t in tasks.split(",") if not os.path.exists(os.path.join(a.data,f"{t}.jsonl"))]
@@ -1410,8 +1417,7 @@ def cmd_convert(a):
         sys.exit(f"{C.yel}no output directory given.{C.r}\n"
                  f"  --model <dir> is where the converted model is written")
     # python con torch/safetensors: l'ambiente del progetto se c'e', altrimenti quello corrente
-    venv_py = os.path.join(HERE, "mio_env", "Scripts" if sys.platform == "win32" else "bin", "python3")
-    py = venv_py if os.path.exists(venv_py) else sys.executable
+    py = project_python()
     base=[py, os.path.join(TOOLS,"convert_fp8_to_int4.py"),
           "--repo", a.repo, "--outdir", a.model, "--ebits", str(a.ebits), "--io-bits", str(a.io_bits),
           "--group-size", str(a.group_size)]
