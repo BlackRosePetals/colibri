@@ -199,6 +199,20 @@ jobs:
       # check.yml, Windows was first exercised at the release tag). The tiny
       # oracle is the token-exactness gate: it fails on any numerical or I/O
       # divergence, which is exactly what a platform port can break.
+      #
+      # The check target REGENERATES the fixture (--force) before comparing,
+      # so it needs the same pinned torch/transformers the Linux v4-tiny job
+      # installs -- without them the step dies in generation, not in the
+      # oracle (round 2 of this PR measured exactly that).
+      - uses: actions/setup-python@v5
+        if: matrix.os == 'macos-latest'
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: c/tools/requirements-deepseek-v4-tiny.txt
+      - name: Install pinned tiny-fixture dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: python -m pip install -r c/tools/requirements-deepseek-v4-tiny.txt
       - name: DeepSeek V4 tiny oracle (macOS)
         if: matrix.os == 'macos-latest'
         run: make -C c deepseek-v4-tiny-check
