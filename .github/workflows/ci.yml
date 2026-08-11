@@ -198,6 +198,11 @@ jobs:
         # itself. Nothing in CI exercised it until issue #940 shipped a
         # compile error in it, so run it explicitly on the Apple Silicon
         # runners.
+        # The runner's Apple Paravirtual device hangs on Metal submissions
+        # (observed: 47 min vs a 5-6 min normal run), so the test harness
+        # detects it and skips GPU execution with an explicit line; this
+        # timeout is the backstop that turns any residual hang into a red X.
+        timeout-minutes: 10
         run: |
           cd c
           make metal-test
