@@ -1048,7 +1048,7 @@ def chat_attached(a, base, model_id):
         except OSError as e:
             sp.stop()
             print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
-        sp.stop(); md.close()
+        md.close(); sp.stop()
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
         el=time.time()-t0
