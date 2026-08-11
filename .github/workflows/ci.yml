@@ -100,6 +100,17 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      - if: matrix.os == 'macos-latest'
+        name: Metal backend tests
+        # The Metal backend suite is its own target (metal-test) and is not
+        # part of `make check`: TEST_BINS is derived from tests/test_*.$(EXE)
+        # rules, and backend_metal_test is built/run by the metal-test target
+        # itself. Nothing in CI exercised it until issue #940 shipped a
+        # compile error in it, so run it explicitly on the Apple Silicon
+        # runners.
+        run: |
+          cd c
+          make metal-test
 
       # The Windows backend-DLL loader contract (c/tests/test_backend_loader.py)
       # had no CI anywhere: the `python` job below is Linux-only, where these
