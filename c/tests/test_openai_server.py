@@ -601,6 +601,50 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
+    def test_cancels_generation_before_first_frame(self):
+        # #908: a client that disconnects while the engine is still prefilling
+        # (no DATA frame has arrived) must cancel too. cancelled() used to be
+        # polled only in the "data" branch, so the CANCEL never went out and
+        # the turn ran to its token limit while this thread stayed blocked.
+        # The fake engine emits nothing until it sees CANCEL -- exactly the
+        # pre-first-frame regime -- and must still get one.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        flag = {"cancelled": False}
+        outcome = []
+
+        def generate():
+            try:
+                engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                outcome.append("cancelled")
+
+        thread = threading.Thread(target=generate)
+        thread.start()
+        for _ in range(200):
+            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                break
+            time.sleep(0.01)
+        flag["cancelled"] = True
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        engine.close()
+        self.assertEqual(outcome, ["cancelled"])
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
 
