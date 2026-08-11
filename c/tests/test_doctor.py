@@ -177,8 +177,12 @@ class DoctorTest(unittest.TestCase):
         return engine
 
     def _win_linkage(self, engine):
-        with mock.patch.object(sys, "platform", "win32"), \
-             mock.patch.object(os, "name", "nt"):
+        # Only sys.platform is faked. Faking os.name as well would make
+        # pathlib build a WindowsPath from the POSIX fixture path, which does
+        # not resolve on Linux/macOS, so cuda_linkage would bail at its
+        # is_file() guard before reaching the backend-marker logic and every
+        # assertion below would compare against a false negative.
+        with mock.patch.object(sys, "platform", "win32"):
             return cuda_linkage(engine)
 
     def test_windows_cuda_host_accepts_its_own_backend(self):

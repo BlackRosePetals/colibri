@@ -351,7 +351,13 @@ def cuda_linkage(engine_path):
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
-    if os.name == "posix":
+    # `sys.platform` alone selects the branch, so a test can exercise the
+    # Windows probe on a POSIX host by faking it. Faking `os.name` instead
+    # would repoint pathlib at Windows semantics and turn the POSIX fixture
+    # path into a WindowsPath that no longer resolves, so `is_file()` above
+    # would return early. On every real host the two agree and this reads
+    # exactly as `os.name == "posix"` did.
+    if os.name == "posix" and sys.platform != "win32":
         try:
             result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
                                     timeout=3, check=False)
