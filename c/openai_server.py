@@ -1723,7 +1723,21 @@ class Engine:
                     on_accept(info)
 
         while True:
-            kind, value = events.get()
+            try:
+                kind, value = events.get(timeout=0.05)
+            except queue.Empty:
+                # #908: cancelled() is only polled in the "data" branch, so a
+                # client that disconnects before the engine's first DATA frame
+                # (it is still prefilling) never cancels: the CANCEL never went
+                # out, the turn ran to its token limit, and this thread stayed
+                # blocked until the engine emitted something. Poll the callback
+                # while idle so a pre-first-frame disconnect cancels too.
+                if not cancel_sent and not stop_sent and cancelled and cancelled():
+                    cancel_sent = True
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
+                continue
             if kind == "accept":
                 if accepted:
                     raise RuntimeError("engine sent a duplicate ACCEPT frame")
