@@ -147,14 +147,62 @@ class SpecificationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "profile.out"
             path.write_text(
-                "[PROF] expert I/O: 38.178 GB fetched | 525.0 loads/token | "
+                "[PROF] expert I/O: 38.178 GB fetched | "
+                "hit 42.9% (100 pin + 125 lru / 300 load) | 525.0 loads/token | "
                 "7.2s read service / 1.4s felt wait\n",
                 encoding="utf-8",
             )
             costs = sim.profile_costs([path])
-        self.assertEqual(costs["loads"], 525)
+        self.assertEqual(costs["physical_misses"], 300)
+        self.assertEqual(costs["requests_per_token"], [525.0])
+        self.assertTrue(costs["complete"])
+        self.assertEqual(costs["records"], 1)
         self.assertEqual(costs["felt_wait_seconds"], 1.4)
-        self.assertAlmostEqual(costs["felt_us_per_load"], 2666.6666667)
+        self.assertAlmostEqual(costs["felt_us_per_physical_miss"], 4666.6666667)
+
+    def test_profile_costs_without_physical_misses_is_not_calibrated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.out"
+            path.write_text(
+                "[PROF] legacy | 525.0 loads/token | "
+                "7.2s read service / 1.4s felt wait\n",
+                encoding="utf-8",
+            )
+            costs = sim.profile_costs([path])
+        self.assertIsNone(costs["physical_misses"])
+        self.assertEqual(costs["requests_per_token"], [])
+        self.assertFalse(costs["complete"])
+        self.assertIsNone(costs["felt_us_per_physical_miss"])
+
+    def test_profile_costs_require_a_complete_record_from_every_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            complete = Path(tmp) / "complete.out"
+            empty = Path(tmp) / "empty.out"
+            complete.write_text(
+                "[PROF] expert I/O: 1 GB fetched | "
+                "hit 50.0% (1 pin + 1 lru / 2 load) | 4.0 loads/token | "
+                "0.2s read service / 0.1s felt wait\n",
+                encoding="utf-8",
+            )
+            empty.write_text("engine stopped before PROF output\n", encoding="utf-8")
+            costs = sim.profile_costs([complete, empty])
+        self.assertFalse(costs["complete"])
+        self.assertIsNone(costs["physical_misses"])
+        self.assertIsNone(costs["felt_us_per_physical_miss"])
+
+    def test_profile_costs_distinguish_zero_misses_from_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profile.out"
+            path.write_text(
+                "[PROF] expert I/O: 0 GB fetched | "
+                "hit 100.0% (1 pin + 1 lru / 0 load) | 2.0 loads/token | "
+                "0.0s read service / 0.0s felt wait\n",
+                encoding="utf-8",
+            )
+            costs = sim.profile_costs([path])
+        self.assertTrue(costs["complete"])
+        self.assertEqual(costs["physical_misses"], 0)
+        self.assertIsNone(costs["felt_us_per_physical_miss"])
 
 
 class PolicyBehaviorTest(unittest.TestCase):
@@ -237,6 +285,85 @@ class AllocationTest(unittest.TestCase):
         caps = sim.dynamic_capacities(trace, specs, 4, "lru", counts)
         self.assertGreater(caps[1], caps[0])
         self.assertLessEqual(sim.capacity_bytes(caps, specs), 4)
+
+    def test_dynamic_budget_evaluates_intermediate_capacity(self):
+        specs = {0: sim.LayerSpec(1, 1, 1, 4)}
+        sequence = [0, 1, 2, 0, 1, 2, 3] * 20
+        traces = [[sim.AccessEvent(0, (expert,)) for expert in sequence]]
+        counts = sim.training_counts(traces)
+        self.assertEqual(
+            sim.run_policy("lru", {0: 0}, specs, traces[0], counts).misses, 140)
+        self.assertEqual(
+            sim.run_policy("lru", {0: 2}, specs, traces[0], counts).misses, 140)
+        self.assertEqual(
+            sim.run_policy("lru", {0: 3}, specs, traces[0], counts).misses, 80)
+        caps = sim.dynamic_capacities(traces, specs, 3, "lru", counts)
+        self.assertEqual(caps, {0: 3})
+        result = sim.analyze(traces, traces, specs, 3, ["lru"], counts)
+        self.assertEqual(result["allocations"]["dynamic-lru"]["unused_bytes"], 0)
+
+    def test_frontier_matches_exhaustive_greedy_on_small_specs(self):
+        specs = {
+            0: sim.LayerSpec(2, 1, 1, 5),
+            1: sim.LayerSpec(3, 1, 4, 5),
+        }
+        traces = [[
+            *[sim.AccessEvent(0, (expert,)) for expert in [0, 1, 2, 0, 1, 3] * 4],
+            *[sim.AccessEvent(1, (expert,)) for expert in [0, 1, 0, 2, 0, 1] * 4],
+        ]]
+        counts = sim.training_counts(traces)
+
+        def exhaustive(policy, scenario_specs, budget):
+            capacities = {layer: 0 for layer in scenario_specs}
+            cache = sim.LayerReplayCache(traces, scenario_specs, counts)
+            waits = {
+                layer: cache.layer_wait(policy, layer, 0, scenario_specs)
+                for layer in scenario_specs
+            }
+            used = 0
+            while True:
+                best = None
+                for layer, spec in scenario_specs.items():
+                    current = capacities[layer]
+                    for target in range(current + 1, spec.max_experts + 1):
+                        added = (target - current) * spec.resident_bytes
+                        if used + added > budget:
+                            break
+                        wait = cache.layer_wait(policy, layer, target, scenario_specs)
+                        benefit = waits[layer] - wait
+                        candidate = (benefit / added, benefit, -added, -layer,
+                                     layer, target, wait, added)
+                        if best is None or candidate > best:
+                            best = candidate
+                if best is None or best[1] <= 0:
+                    break
+                _, _, _, _, layer, target, wait, added = best
+                capacities[layer] = target
+                waits[layer] = wait
+                used += added
+            return capacities
+
+        for policy in ("lru", "half-pinned", "frequency"):
+            for felt_scale in (0.1, 0.2, 1.0, 3.5):
+                scaled = sim.scale_specs(specs, felt_scale, target_layer=0)
+                for budget in range(1, 26):
+                    with self.subTest(
+                            policy=policy, felt_scale=felt_scale, budget=budget):
+                        self.assertEqual(
+                            sim.dynamic_capacities(
+                                traces, scaled, budget, policy, counts),
+                            exhaustive(policy, scaled, budget),
+                        )
+
+    def test_allocation_reports_unusable_budget_remainder(self):
+        specs = {0: sim.LayerSpec(2, 1, 1, 1)}
+        traces = [[sim.AccessEvent(0, (0,))]]
+        result = sim.analyze(traces, traces, specs, 3, ["lru"])
+        self.assertEqual(result["allocations"]["uniform"]["unused_bytes"], 1)
+        # A one-access training trace has no reuse benefit, so the dynamic
+        # allocator intentionally buys no residency and exposes all 3 bytes as
+        # unused rather than hiding the remainder.
+        self.assertEqual(result["allocations"]["dynamic-lru"]["unused_bytes"], 3)
 
     def test_training_traces_are_independent_cold_runs(self):
         specs = {0: sim.LayerSpec(1, 1, 1, 4)}
@@ -337,7 +464,7 @@ class DecisionGateTest(unittest.TestCase):
         self.assertLess(frequency["worst_category_gain"], -0.03)
 
     def test_synthetic_budget_sweep_exposes_robust_and_fragile_regions(self):
-        rows = sim.synthetic_budget_sweep(["lru", "frequency"], [2, 8])
+        rows = sim.synthetic_budget_sweep(["lru", "frequency"], [2, 8, 12])
         frequency = {
             row["budget_mb"]: row
             for row in rows
@@ -345,6 +472,7 @@ class DecisionGateTest(unittest.TestCase):
         }
         self.assertTrue(frequency[2]["pass_sensitivity"])
         self.assertFalse(frequency[8]["pass_sensitivity"])
+        self.assertTrue(frequency[12]["pass_sensitivity"])
 
 
 if __name__ == "__main__":
