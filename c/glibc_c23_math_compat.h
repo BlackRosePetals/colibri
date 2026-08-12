@@ -22,8 +22,8 @@
 #define COLI_GLIBC_C23_MATH_COMPAT_H
 
 #if defined(__cplusplus) && defined(__linux__)
-#include <sys/cdefs.h> /* glibc's own guards; forces __THROW into existence */
-#if defined(__THROW)
+#include <features.h> /* defines __GLIBC__ on glibc; musl ships one too */
+#if defined(__GLIBC__) && defined(__THROW)
 #undef __THROW
 #define __THROW
 #endif
