@@ -518,3 +518,22 @@ jobs:
           python-version: '3.12'
       - name: Python test suite
         run: cd c && python3 -m unittest discover -s tests -p 'test_*.py'
+
+  windows-python-focused:
+    name: Python tests (Windows focused)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Converter and launcher tests
+        shell: pwsh
+        run: |
+          cd c
+          $suites = @(
+            'tests.test_launcher_dispatch'
+            'tests.test_inkling_converter_lock'
+            'tests.test_convert_positioned_write'
+          )
+          python -m unittest -v @suites
