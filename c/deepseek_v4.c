@@ -5318,6 +5318,15 @@ void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot) {
 #include <stdlib.h>
 #include <string.h>
 
+/* The .coli_usage expert history lives in route_trace.h (#700) — one format,
+ * one reader, one writer for every engine. Included inside THIS unit only:
+ * the amalgam builds one object per COLI_V4_UNIT_*, and the shared header's
+ * statics must have a single owner, which is the unit that loads, counts
+ * (lookup_hot) and saves the history. The router runs in other units, so V4
+ * does not emit per-row ROUTE_TRACE lines; if the stream is enabled the
+ * banner says so below at store creation. */
+#include "route_trace.h"
+
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
 int coli_st_prefetch_many(
@@ -5749,13 +5758,6 @@ static double hot_now(void) {
     return (double)value.tv_sec + value.tv_nsec * 1e-9;
 }
 
-static uint32_t hot_engine_id(void) {
-    const unsigned char *text = (const unsigned char *)"deepseek_v4";
-    uint32_t hash = 2166136261u;
-    while (*text) { hash ^= *text++; hash *= 16777619u; }
-    return hash;
-}
-
 static char *hot_history_path(const char *model_dir) {
     if (!model_dir) return NULL;
     const char suffix[] = "/.coli_usage";
@@ -5765,61 +5767,47 @@ static char *hot_history_path(const char *model_dir) {
     return path;
 }
 
-/* Seed the hot-expert ranking from the same sparse text history used by the
- * other engines.  Placement is the only observable effect: expert ids and
- * weights are still selected by the V4 router on every forward. */
+/* Seed the hot-expert ranking through the shared route_trace.h reader, so the
+ * file format, the dimension and identity refusals, and the legacy layouts
+ * are exactly the ones every other engine honours (#700). Counts land in
+ * policy->usage for the pin ranking; the rt counters are fed in the same
+ * callback (rt_acc_cb) because they are what the next save persists, and the
+ * history must stay cumulative across sessions.
+ *
+ * One semantic widens deliberately: a legacy headerless history is accepted
+ * now, like the sibling engines accept it. The private reader this replaces
+ * demanded the -1 dimensions record and silently dropped headerless files. */
+typedef struct {
+    V4HotPolicy *policy;
+    const V4ExpertStoreState *state;
+} V4UsageAcc;
+
+static int hot_usage_cb(int layer, int expert, uint32_t count, void *ud) {
+    V4UsageAcc *acc = ud;
+    if (layer < 0 || layer >= acc->state->layers || expert < 0 ||
+        expert >= acc->state->experts_per_layer || !count) return 0;
+    uint64_t *slot = &acc->policy->usage[
+        (size_t)layer * acc->state->experts_per_layer + expert];
+    if (UINT64_MAX - *slot < count) *slot = UINT64_MAX;
+    else *slot += count;
+    rt_acc_cb(layer, expert, count, NULL);
+    return 1;
+}
+
 static uint64_t hot_usage_load(V4HotPolicy *policy,
                                const V4ExpertStoreState *state,
                                const char *model_dir) {
     if (!policy || !state || !model_dir) return 0;
     char *path = hot_history_path(model_dir);
     if (!path) return 0;
-    FILE *stream = fopen(path, "rb");
-    if (!stream) { free(path); return 0; }
-
-    int layer = 0, expert = 0, dimensions_seen = 0;
-    unsigned count = 0;
-    while (fscanf(stream, "%d %d %u", &layer, &expert, &count) == 3) {
-        if (layer == -1) {
-            dimensions_seen = 1;
-            if (expert != state->layers ||
-                count != (unsigned)state->experts_per_layer) {
-                fprintf(stderr,
-                        "v4_autopin ignored=%s dimensions=%d/%u expected=%d/%d\n",
-                        path, expert, count, state->layers,
-                        state->experts_per_layer);
-                fclose(stream); free(path); return 0;
-            }
-        } else if (layer == -2 &&
-                   (expert > 1 || count != hot_engine_id())) {
-            fprintf(stderr,
-                    "v4_autopin ignored=%s identity=version-%d/id-%u "
-                    "expected=version-1/id-%u\n",
-                    path, expert, count, hot_engine_id());
-            fclose(stream); free(path); return 0;
-        }
-    }
-    if (!dimensions_seen) {
-        fclose(stream); free(path); return 0;
-    }
-    rewind(stream);
-    uint64_t total = 0;
-    while (fscanf(stream, "%d %d %u", &layer, &expert, &count) == 3) {
-        if (layer < 0 || layer >= state->layers || expert < 0 ||
-            expert >= state->experts_per_layer || !count) continue;
-        uint64_t *slot = &policy->usage[
-            (size_t)layer * state->experts_per_layer + expert];
-        if (UINT64_MAX - *slot < count) *slot = UINT64_MAX;
-        else *slot += count;
-        if (UINT64_MAX - total < count) total = UINT64_MAX;
-        else total += count;
-    }
-    fclose(stream);
+    V4UsageAcc acc = { policy, state };
+    int64_t total = rt_read(path, hot_usage_cb, &acc);
+    if (total < 0) total = 0;
     if (total)
         fprintf(stderr, "v4_autopin history=%s selections=%llu\n", path,
                 (unsigned long long)total);
     free(path);
-    return total;
+    return (uint64_t)total;
 }
 
 static void hot_usage_save(const V4HotPolicy *policy,
@@ -5827,46 +5815,12 @@ static void hot_usage_save(const V4HotPolicy *policy,
     if (!policy || !state || !policy->history_path || !policy->usage) return;
     const char *enabled = getenv("COLI_V4_SAVE_USAGE");
     if (enabled && atoi(enabled) == 0) return;
-    size_t tmp_length = strlen(policy->history_path) + sizeof(".tmp");
-    char *tmp = malloc(tmp_length);
-    if (!tmp) return;
-    snprintf(tmp, tmp_length, "%s.tmp", policy->history_path);
-    FILE *stream = fopen(tmp, "wb");
-    if (!stream) { free(tmp); return; }
-
-    uint64_t total = 0, distinct = 0;
-    for (int layer = 0; layer < state->layers; layer++)
-        for (int expert = 0; expert < state->experts_per_layer; expert++) {
-            uint64_t count = policy->usage[
-                (size_t)layer * state->experts_per_layer + expert];
-            if (!count) continue;
-            total = UINT64_MAX - total < count ? UINT64_MAX : total + count;
-            distinct++;
-        }
-    if (distinct) {
-        fprintf(stream, "-1 %d %d\n", state->layers,
-                state->experts_per_layer);
-        fprintf(stream, "-2 1 %u\n", hot_engine_id());
-        for (int layer = 0; layer < state->layers; layer++)
-            for (int expert = 0; expert < state->experts_per_layer; expert++) {
-                uint64_t count = policy->usage[
-                    (size_t)layer * state->experts_per_layer + expert];
-                if (!count) continue;
-                unsigned stored = count > UINT_MAX ? UINT_MAX : (unsigned)count;
-                fprintf(stream, "%d %d %u\n", layer, expert, stored);
-            }
-    }
-    int failed = ferror(stream);
-    if (fclose(stream) != 0) failed = 1;
-    if (!failed && rename(tmp, policy->history_path) == 0)
-        fprintf(stderr,
-                "v4_autopin saved=%s selections=%llu distinct=%llu\n",
-                policy->history_path, (unsigned long long)total,
-                (unsigned long long)distinct);
-    else
+    /* rt_save persists the shared counters fed at each store lookup, with the
+     * standard [STATS] summary line and the COLI_USAGE_DECAY knob every other
+     * engine already honours. */
+    if (!rt_save(policy->history_path, 0))
         fprintf(stderr, "v4_autopin warning=cannot-save-history path=%s\n",
                 policy->history_path);
-    free(tmp);
 }
 
 
@@ -6100,6 +6054,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
+    rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
         layer_requests % policy->repin_interval == 0)
@@ -6310,6 +6265,11 @@ int COLI_V4_ROWS16_STORE_OPEN(
         ? options->repin_interval : (uint64_t)minimum_slots;
     if (!policy->repin_interval) policy->repin_interval = 1;
     const char *autopin = getenv("COLI_V4_AUTOPIN");
+    rt_init("deepseek_v4", state->layers, state->experts_per_layer);
+    if (rt_tracing())
+        fprintf(stderr, "[ROUTE_TRACE] note: deepseek_v4 keeps the expert "
+                "history here, but per-row routing traces are not wired in "
+                "this engine — the stream will hold no rows\n");
     if (!autopin || atoi(autopin) != 0) {
         policy->history_total = hot_usage_load(policy, state,
                                                 options->model_dir);

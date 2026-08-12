@@ -98,6 +98,7 @@ $(V4_BINARY): $(V4_OBJS)
 
 $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	deepseek_v4_internal.h deepseek_v4_dspark.inc st.h json.h compat.h tensor.h quant.h \
+	route_trace.h \
 	native_quant.h native_quant_batch.h native_quant_dual.h \
 	native_quant_fp4_rows16.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
