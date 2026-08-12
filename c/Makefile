@@ -175,7 +175,6 @@ CUDA_DLL  ?= 0
 COLI_ANS  ?= 0
 DIETGPU_ROOT ?=
 DEEPGEMM  ?= 0
-VLLM_MHC  ?= 0
 NCCL      ?= 0
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
@@ -437,23 +436,10 @@ endif
 # objects are self-contained: backend_cuda_dsv4.* include only their own header
 # and the CUDA runtime, so they build and their tests run without the engine.
 #
-# VLLM_MHC, DEEPGEMM and FLASHINFER below are UNSUPPORTED. They are eight build
-# configurations and CI compiles none of them: each needs an external checkout
-# (TILELANG_HOME, DEEPGEMM_HOME, FLASHINFER_HOME) and DeepGEMM's kernels want
-# Blackwell to run. That is a statement about verification, not quality -- an
-# untested build path rots silently, and whoever is here in six months inherits
-# it. They gate nothing and block nothing: the default build (all three off) is
-# the one CI compiles and the one to report bugs against. Enable them only if
-# you have the external trees and are prepared to debug the combination.
+# DEEPGEMM is unsupported: CI cannot compile it without an external checkout,
+# and its kernels require Blackwell to run. It gates nothing and blocks nothing;
+# the default build is the supported configuration.
 DSV4_CUDA_OBJ = backend_cuda_dsv4.o
-ifeq ($(VLLM_MHC),1)
-ifndef TILELANG_HOME
-$(error TILELANG_HOME must point to an installed TileLang package)
-endif
-CFLAGS += -DCOLI_DSV4_VLLM_MHC
-override NVCCFLAGS += -DCOLI_DSV4_VLLM_MHC
-DSV4_CUDA_OBJ += backend_cuda_dsv4_mhc_vllm.o
-endif
 ifeq ($(DEEPGEMM),1)
 ifndef DEEPGEMM_HOME
 $(error DEEPGEMM_HOME must point to a DeepGEMM include tree)
@@ -468,14 +454,6 @@ CFLAGS += -DCOLI_DSV4_DEEPGEMM
 override NVCC_STD  := c++20
 override NVCCFLAGS += --expt-relaxed-constexpr --expt-extended-lambda -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)"
 LDFLAGS += -lcuda
-endif
-ifeq ($(FLASHINFER),1)
-ifndef FLASHINFER_HOME
-$(error FLASHINFER_HOME must point to a FlashInfer source checkout)
-endif
-CFLAGS += -DCOLI_DSV4_FLASHINFER
-override NVCCFLAGS += -DCOLI_DSV4_FLASHINFER
-DSV4_CUDA_OBJ += backend_cuda_dsv4_flashinfer.o backend_cuda_dsv4_sparse_mla_flashinfer.o backend_cuda_dsv4_qkv_vllm.o
 endif
 ifeq ($(NCCL),1)
 CFLAGS += -DCOLI_DSV4_NCCL
@@ -687,32 +665,9 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
 
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h backend_cuda_dsv4_flashinfer.h .build-config
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
-
-backend_cuda_dsv4_mhc_vllm.o: backend_cuda_dsv4_mhc_vllm.cu backend_cuda_dsv4_mhc_vllm.h .build-config
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" -O3 -std=c++20 -arch=sm_120 -DENABLE_BF16 \
-		-I"$(TILELANG_HOME)/src" -I"$(TILELANG_HOME)/3rdparty/cutlass/include" \
-		-c backend_cuda_dsv4_mhc_vllm.cu -o $@
-
-backend_cuda_dsv4_flashinfer.o: backend_cuda_dsv4_flashinfer.cu backend_cuda_dsv4_flashinfer.h .build-config
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" -O3 -std=c++17 -arch=sm_120a --expt-relaxed-constexpr -diag-suppress=20012 -diag-suppress=20013 -diag-suppress=20015 \
-		-I"$(FLASHINFER_HOME)/include" -I"$(FLASHINFER_HOME)/3rdparty/cutlass/include" \
-		-I"$(FLASHINFER_HOME)/3rdparty/cutlass/tools/util/include" -c backend_cuda_dsv4_flashinfer.cu -o $@
-
-backend_cuda_dsv4_sparse_mla_flashinfer.o: $(FLASHINFER_HOME)/csrc/sparse_mla_sm120_decode_dsv4.cu .build-config
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" -O3 -std=c++17 -gencode=arch=compute_120f,code=sm_120f --expt-relaxed-constexpr \
-		-I"$(FLASHINFER_HOME)/include" -I"$(FLASHINFER_HOME)/3rdparty/cutlass/include" \
-		-c "$<" -o $@
-
-backend_cuda_dsv4_qkv_vllm.o: backend_cuda_dsv4_qkv_vllm.cu backend_cuda_dsv4_qkv_vllm.h .build-config
-	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
-	"$(NVCC)" -O3 -std=c++17 -gencode=arch=compute_120f,code=sm_120f \
-		--expt-relaxed-constexpr --expt-extended-lambda -c "$<" -o $@
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
