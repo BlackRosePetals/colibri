@@ -15,6 +15,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -32,6 +33,26 @@ from types import SimpleNamespace
 CLI = Path(__file__).resolve().parent.parent / "coli"
 
 SEEN_MESSAGES = []
+
+# The child is spawned with fork+EXEC, never bare fork: this test process is
+# multi-threaded (the fake SSE server runs in a thread), and pty.fork() from a
+# multi-threaded process inherits half-held runtime locks -- Python itself
+# warns "use of forkpty() may lead to deadlocks in the child", and on the
+# macOS runner it did exactly that, reliably, until the job timeout.
+BOOTSTRAP = """
+import importlib.machinery, importlib.util, os, sys
+from types import SimpleNamespace
+loader = importlib.machinery.SourceFileLoader("coli_t", os.environ["COLI_TEST_CLI"])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.argv = ["coli"]
+try:
+    loader.exec_module(module)
+except SystemExit:
+    pass
+module.chat_attached(SimpleNamespace(ngen=32, api_key=None),
+                     os.environ["COLI_TEST_BASE"], "fake-model")
+"""
 
 
 class FakeSSE(BaseHTTPRequestHandler):
@@ -58,27 +79,16 @@ class FakeSSE(BaseHTTPRequestHandler):
 
 
 def run_chat(base, extra_env):
-    """Drive chat_attached in a pty child: two prompts, then quit."""
-    pid, fd = pty.fork()
-    if pid == 0:
-        # Under pytest the inherited sys.stdout is the capture buffer, not
-        # fd 1: coli would see isatty()=False and its output would never
-        # reach the pty. Rebind the std streams to the real descriptors.
-        sys.stdin = os.fdopen(0, "r")
-        sys.stdout = os.fdopen(1, "w", buffering=1)
-        sys.stderr = os.fdopen(2, "w", buffering=1)
-        os.environ.update(extra_env)
-        loader = importlib.machinery.SourceFileLoader("coli_t", str(CLI))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        module = importlib.util.module_from_spec(spec)
-        sys.argv = ["coli"]
-        try:
-            loader.exec_module(module)
-        except SystemExit:
-            pass
-        args = SimpleNamespace(ngen=32, api_key=None)
-        module.chat_attached(args, base, "fake-model")
-        os._exit(0)
+    """Drive chat_attached through a pty slave: two prompts, then quit."""
+    master, slave = pty.openpty()
+    env = dict(os.environ, COLI_TEST_CLI=str(CLI), COLI_TEST_BASE=base,
+               TERM="xterm", **extra_env)
+    child = subprocess.Popen([sys.executable, "-c", BOOTSTRAP],
+                             stdin=slave, stdout=slave, stderr=slave,
+                             env=env, start_new_session=True, close_fds=True)
+    os.close(slave)
+    fd = master
+
     # Lockstep, not fire-and-forget: writing lines before the child reaches
     # input() is timing-dependent -- on macOS, libedit's initialization at the
     # first input() flushes the tty buffer and eats pre-written lines (the
@@ -123,7 +133,12 @@ def run_chat(base, extra_env):
         if not chunk:
             break
         output += chunk
-    os.waitpid(pid, 0)
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        child.kill()
+        child.wait()
+    os.close(master)
     return output.decode("utf-8", "replace")
 
 
