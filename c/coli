@@ -1030,7 +1030,7 @@ def chat_attached(a, base, model_id):
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
         print(f"\n  {C.teal}◆ colibri{C.r}")
         sp=Spinner("thinking…"); sp.start()
-        md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False
+        md=MDStream("  "); reply=[]; first=True; t0=time.time(); interrupted=False; think_open=False
         try:
             with urllib.request.urlopen(req) as r:
                 for raw in r:
@@ -1042,8 +1042,29 @@ def chat_attached(a, base, model_id):
                     except ValueError: continue
                     for ch in ev.get("choices",[]):
                         d=ch.get("delta",{})
+                        rtxt=d.get("reasoning_content")
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
+                            continue              # thinking nascosto: lo spinner resta a girare
+                        if rtxt:
+                            # Thinking arrives as its own delta field, and this loop
+                            # used to drop it on the floor: `coli run` streamed the
+                            # model's reasoning while `coli chat` silently hid it
+                            # (#979). Render it dim and unformatted — it is the
+                            # model's scratchpad, not the answer — and keep it out
+                            # of the saved reply so history carries content only.
+                            # The keepalive ping reuses this field with "."/"" —
+                            # dim dots read as heartbeat, which is what they are.
+                            if first: sp.stop(); first=False
+                            if not think_open:
+                                think_open=True
+                                sys.stdout.write(f"  {C.dgray}┌ thinking{C.r}\n  {C.dgray}│{C.r} ")
+                            sys.stdout.write(C.dim+rtxt.replace("\n","\n  "+C.dgray+"│"+C.r+" "+C.dim)+C.r)
+                            sys.stdout.flush(); continue
                         txt=d.get("content")
-                        if not txt: continue          # ping/ruolo/reasoning: non è testo
+                        if not txt: continue          # ping/ruolo: non è testo
+                        if think_open:
+                            think_open=False
+                            sys.stdout.write(f"{C.r}\n  {C.dgray}└─{C.r}\n")
                         if first: sp.stop(); first=False
                         md.feed(txt); reply.append(txt)
         except KeyboardInterrupt:
@@ -1065,6 +1086,9 @@ def chat_attached(a, base, model_id):
         except OSError as e:
             sp.stop()
             print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
+        if think_open:                            # stream finito dentro il thinking (interrupt o
+            think_open=False                      # risposta solo-reasoning): chiudi il riquadro
+            sys.stdout.write(f"{C.r}\n  {C.dgray}\u2514\u2500{C.r}\n")
         md.close(); sp.stop()
         if reply: msgs.append({"role":"assistant","content":"".join(reply)})
         else: msgs.pop()                              # turno vuoto: non sporcare la history
