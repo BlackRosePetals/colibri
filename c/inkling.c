@@ -33,6 +33,10 @@
 #endif
 #include "st.h"
 #include "tok.h"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+#include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
 #ifdef COLI_CUDA
@@ -2058,6 +2062,7 @@ int main(int argc, char **argv) {
 #endif
     }
 #endif  /* !COLI_CUDA && !__APPLE__ */
+    coli_omp_tune_threads("inkling");
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
     g_topp = getenv("TOPP") ? (float)atof(getenv("TOPP")) : 0.f;
