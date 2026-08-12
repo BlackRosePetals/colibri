@@ -914,6 +914,36 @@ class HTTPTest(unittest.TestCase):
             })
         self.assertEqual(caught.exception.code, 400)
 
+    def test_olmoe_never_files_the_answer_as_reasoning(self):
+        # #984: OLMoE has no thinking mode, so its engine never emits </think>.
+        # With thinking left on, the reasoning splitter kept the whole answer in
+        # reasoning_content and streamed an empty `content` -- content dropped.
+        # Forcing thinking off for olmoe must return the answer as content
+        # whether or not the client asked for reasoning, streaming or not.
+        for streaming in (False, True):
+            with self.subTest(stream=streaming), \
+                 patch("openai_server.ARCH", "olmoe"):
+                with self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "reasoning_effort": "high",   # a client asking to think
+                    "stream": streaming,
+                }) as response:
+                    raw = response.read().decode()
+                if streaming:
+                    payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                                if line.startswith("data: ") and line != "data: [DONE]"]
+                    content = "".join((c.get("delta") or {}).get("content", "")
+                                      for p in payloads for c in p["choices"])
+                    reasoning = "".join((c.get("delta") or {}).get("reasoning_content", "")
+                                        for p in payloads for c in p["choices"])
+                else:
+                    msg = json.loads(raw)["choices"][0]["message"]
+                    content = msg.get("content") or ""
+                    reasoning = msg.get("reasoning_content") or ""
+                self.assertIn("Hé", content, "the answer must arrive as content")
+                self.assertEqual(reasoning, "", "olmoe must not produce reasoning")
+
     def test_streaming_chat_completion(self):
         with self.request("/v1/chat/completions", {
             "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
