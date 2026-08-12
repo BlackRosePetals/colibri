@@ -1043,6 +1043,8 @@ def chat_attached(a, base, model_id):
                     for ch in ev.get("choices",[]):
                         d=ch.get("delta",{})
                         rtxt=d.get("reasoning_content")
+                        if rtxt and os.environ.get("COLI_SHOW_THINK","1")=="0":
+                            continue              # thinking nascosto: lo spinner resta a girare
                         if rtxt:
                             # Thinking arrives as its own delta field, and this loop
                             # used to drop it on the floor: `coli run` streamed the
