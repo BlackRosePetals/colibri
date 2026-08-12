@@ -74,13 +74,42 @@ def run_chat(base, extra_env):
         args = SimpleNamespace(ngen=32, api_key=None)
         module.chat_attached(args, base, "fake-model")
         os._exit(0)
-    os.write(fd, b"first question\n")
-    time.sleep(1.0)
-    os.write(fd, b"second question\n")
-    time.sleep(1.0)
-    os.write(fd, b":q\n")
+    # Lockstep, not fire-and-forget: writing lines before the child reaches
+    # input() is timing-dependent -- on macOS, libedit's initialization at the
+    # first input() flushes the tty buffer and eats pre-written lines (the
+    # readline activation from #928), while Linux's GNU readline preserves
+    # them. Wait for each marker before typing, like a human would, with a
+    # strictly-advancing cursor so an old prompt can never satisfy a new wait.
     output = b""
-    deadline = time.time() + 15
+    pos = 0
+    deadline = time.time() + 30
+
+    def read_until(needle):
+        nonlocal output, pos
+        while time.time() < deadline:
+            found = output.find(needle, pos)
+            if found >= 0:
+                pos = found + len(needle)
+                return True
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return False
+            if not chunk:
+                return False
+            output += chunk
+        return False
+
+    prompt = "\u203a".encode()           # the › of a fresh input box
+    footer = "tok \u00b7".encode()       # the "~N tok ·" reply footer
+    if read_until(prompt):
+        os.write(fd, b"first question\n")
+    read_until(footer)                    # reply finished
+    if read_until(prompt):
+        os.write(fd, b"second question\n")
+    read_until(footer)
+    if read_until(prompt):
+        os.write(fd, b":q\n")
     while time.time() < deadline:
         try:
             chunk = os.read(fd, 65536)
