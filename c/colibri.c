@@ -5157,7 +5157,14 @@ static void pilot_realload(Model *m, int layer, int eid){
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        dst->eid=-1;                                    /* load fallito: libera la prenotazione (slot resta in ecn ma nascosto, riusabile) */
+        /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
+         * la prenotazione lo aveva marcato used=(uint64_t)-1 ("in carica", mai vittima),
+         * e lasciarlo cosi' lo rendeva invisibile agli hit ma ULTIMO in ogni scan LRU —
+         * mai evictable: ogni speculazione fallita (disco lento, errore I/O transitorio)
+         * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
+         * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
+        dst->eid=-1;
+        dst->used=0;
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
