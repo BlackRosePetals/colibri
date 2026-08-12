@@ -8744,11 +8744,20 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     if (prompt_count < 1 || prompt_count > session->max_prompt_tokens ||
         prompt_count + 1 > context) {
         /* The PROMPT does not fit (or leaves no room for a single generated
-         * token) -- that is the only honest CONTEXT_EXCEEDED. */
+         * token) -- that is the only honest CONTEXT_EXCEEDED.
+         *
+         * Format contract: the gateway parses `CONTEXT_EXCEEDED <used>
+         * <limit>` as bare positional numbers (openai_server.py, matching
+         * the GLM engine's emission). The previous key=value fields were
+         * interpolated verbatim into the client-facing message, which told
+         * #975's reporter his "maximum context length is requested=16384"
+         * -- the request, not the capacity, which never appeared at all. */
+        int prompt_capacity = session->max_prompt_tokens < context - 1
+                                  ? session->max_prompt_tokens
+                                  : context - 1;
         char message[256];
-        snprintf(message, sizeof(message),
-                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-                 prompt_count, request->max_tokens, context);
+        snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
+                 prompt_count, prompt_capacity);
         v4_serve_error(request->id, message);
         return;
     }
