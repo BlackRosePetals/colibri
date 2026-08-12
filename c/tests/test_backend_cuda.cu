@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #ifdef _WIN32
 /* MSVC has no POSIX setenv/unsetenv */
