@@ -2818,6 +2818,15 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
+        if ARCH == "olmoe" and enable_thinking:
+            # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
+            # but unused"), so the engine never emits <think>/</think>. Left on,
+            # the reasoning splitter files the ENTIRE answer as reasoning_content
+            # and streams an empty `content` -- the drop reported in #984, which
+            # bit streaming (ThinkingStreamSplit stays in thinking mode forever)
+            # while non-streaming happened to survive. Make the template's "unused"
+            # true end-to-end instead of trusting every path to opt out.
+            enable_thinking = False
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
@@ -2844,6 +2853,8 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
             enable_thinking = True
+        if ARCH == "olmoe":
+            enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
             raise APIError(400, "`max_tokens` is required.", "max_tokens")
         # Reuse the OpenAI path's own validation by handing it an equivalent body.
