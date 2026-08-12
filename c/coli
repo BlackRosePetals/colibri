@@ -1003,7 +1003,7 @@ def chat_attached(a, base, model_id):
     its KV slots reuse the conversation prefix, so a continued chat skips
     re-prefill too. The engine byte-protocol stays untouched — this is plain
     OpenAI SSE over localhost, stdlib only."""
-    import urllib.request
+    import urllib.request, urllib.error
     print(f"  {C.grn}✦ attached{C.r} {C.dim}to {base} · model {model_id} · the engine stays warm after you quit{C.r}")
     print(f"  {C.dim}type and press Enter · Ctrl-C stops the answer · :reset starts a new conversation · :q exits{C.r}\n")
     msgs=[]
@@ -1048,6 +1048,20 @@ def chat_attached(a, base, model_id):
                         md.feed(txt); reply.append(txt)
         except KeyboardInterrupt:
             interrupted=True                          # il server annulla la richiesta alla disconnessione
+        except urllib.error.HTTPError as e:
+            # HTTPError IS-A OSError: without this arm a 4xx/5xx fell into the
+            # branch below and read as "server unreachable" — hiding the API's
+            # own explanation of what was wrong with the request (#975: a V4
+            # CONTEXT_EXCEEDED 400 took a screenshot to diagnose instead of a
+            # sentence). The body is OpenAI-shaped; show its message.
+            sp.stop()
+            try:
+                detail=json.loads(e.read().decode("utf-8","replace")).get("error",{}).get("message","")
+            except Exception:
+                detail=""
+            print(f"\n  {C.yel}[the server rejected the request: HTTP {e.code}"
+                  f"{' — '+detail if detail else ''}]{C.r}")
+            msgs.pop(); continue                      # la richiesta non è mai partita: togli il turno e riprova
         except OSError as e:
             sp.stop()
             print(f"\n  {C.yel}[server unreachable: {e}]{C.r}"); break
