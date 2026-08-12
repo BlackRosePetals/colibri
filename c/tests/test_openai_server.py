@@ -187,6 +187,15 @@ class TemplateTest(unittest.TestCase):
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
 
+    def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
+        with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
+            self.assertEqual(generation_options({}, 8)[1], 0.25)
+            self.assertEqual(generation_options({"temperature": 0}, 8)[1], 0.0)
+        for invalid in ("malformed", "5", "-1", "nan", "1e999"):
+            with self.subTest(invalid=invalid):
+                with patch.dict("openai_server.os.environ", {"COLI_TEMP": invalid}):
+                    self.assertEqual(generation_options({}, 8)[1], 0.7)
+
     def test_validates_stop_sequences(self):
         self.assertEqual(generation_options({"stop": "END"}, 8)[4], ("END",))
         self.assertEqual(generation_options({"stop": ["ONE", "TWO"]}, 8)[4],
