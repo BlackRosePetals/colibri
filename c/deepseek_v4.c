@@ -6242,10 +6242,8 @@ static int v4_read_direct_window(const V4ExpertStoreState *state, int shard,
             fd, slab + direct_length,
             wanted - direct_length, base + direct_length)) return -1;
     memmove(slab + destination_offset, slab + pad, length);
-    if (rep) {
-        __atomic_fetch_add(&g_v4_mir_bytes[rep], (uint64_t)length, __ATOMIC_RELAXED);
-        __atomic_fetch_add(&g_v4_mir_nread[rep], 1, __ATOMIC_RELAXED);
-    }
+    __atomic_fetch_add(&g_v4_mir_bytes[rep], (uint64_t)length, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_v4_mir_nread[rep], 1, __ATOMIC_RELAXED);
     return 0;
 }
 
