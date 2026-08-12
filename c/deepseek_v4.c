@@ -314,12 +314,20 @@ static double v4_mirror_now_s(void) {
 /* replica of one expert: DETERMINISTIC hash of (layer,eid). Determinism is a
  * requirement, not a style choice: the readahead and the demand pread must hit
  * the same fd/page-cache, and in buffered mode an expert must never be cached
- * twice (one copy per drive). */
+ * twice (one copy per drive).
+ *
+ * Uses the linear index (layer*256+eid) multiplied by a large prime
+ * (golden-ratio constant for 32-bit), then extracts bits 16-23.  The old XOR-
+ * based hash (layer*C1 ^ eid*C2) was uniform across the full 43x256 grid, but
+ * the hot subset accessed during inference (~12 experts/layer) clustered on one
+ * replica because the XOR didn't spread small inputs evenly.  The linear-index
+ * approach maps each (layer,eid) to a unique integer 0..11007; the multiply-
+ * and-shift inherits the uniform distribution of that flat index, so any subset
+ * — hot or cold — splits evenly across drives. */
 static inline int v4_expert_route(int layer, int eid) {
     if (!g_v4_mirror) return 0;
-    uint32_t h = (uint32_t)layer * 2654435761u ^ (uint32_t)eid * 0x9E3779B9u;
-    h ^= h >> 16; h *= 0x45d9f3bu; h ^= h >> 16;
-    int hv = (int)(h & 255), r = 0;
+    uint32_t h = (uint32_t)(layer * 256 + eid) * 2654435761u;
+    int hv = (int)((h >> 16) & 255), r = 0;
     while (hv >= g_v4_mir_cut[r]) r++;  /* cut[nrep-1]==256 terminates the scan */
     return r;
 }
