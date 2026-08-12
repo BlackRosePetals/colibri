@@ -215,14 +215,26 @@ class V4CliTest(unittest.TestCase):
             "<\uff5cUser\uff5c>Again<\uff5cAssistant\uff5c><think>",
         )
 
-    def test_openai_renderer_rejects_unwired_tools(self):
+    def test_openai_renderer_scaffolds_v4_tools(self):
         import openai_server
 
-        with self.assertRaises(openai_server.APIError):
-            openai_server.render_chat_v4(
-                [{"role": "user", "content": "hello"}],
-                tools=[{"type": "function"}],
-            )
+        prompt = openai_server.render_chat_v4(
+            [{"role": "user", "content": "hello"}],
+            tools=[{"type": "function", "function": {
+                "name": "get_weather",
+                "description": "current weather",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"}}, "required": ["city"]}}}],
+        )
+        self.assertIn("## Tools", prompt)
+        self.assertIn('"get_weather"', prompt)
+        # Sanity: tool_choice="none" suppresses the declaration.
+        no_tools = openai_server.render_chat_v4(
+            [{"role": "user", "content": "hello"}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="none",
+        )
+        self.assertNotIn("## Tools", no_tools)
 
 
 if __name__ == "__main__":
