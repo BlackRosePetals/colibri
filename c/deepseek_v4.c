@@ -8889,23 +8889,26 @@ static int v4_serve_main(void) {
  * rationale omp_tune.h records for the spin-wait half of the GLM tuning: a
  * busy team steals cores from the I/O pool). An explicit OMP_NUM_THREADS or
  * COLI_NO_OMP_TUNE=1 wins, exactly like the other engines' tuning. */
-static void v4_omp_reserve_loader_cpus(void) {
-    if (getenv("COLI_NO_OMP_TUNE")) return; /* family-wide kill-switch */
-    if (getenv("OMP_NUM_THREADS")) return;  /* the user already chose */
+static int v4_omp_reserve_loader_cpus(void) {
+    if (getenv("COLI_NO_OMP_TUNE")) return 0; /* family-wide kill-switch */
+    if (getenv("OMP_NUM_THREADS")) return 0;  /* the user already chose */
     int logical = omp_get_max_threads();
     int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
-    if (team < 2) return; /* tiny machine: leave the OpenMP default alone */
+    if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
     omp_set_num_threads(team);
     fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
                     "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
                     "overrides, COLI_NO_OMP_TUNE=1 disables\n",
             team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+    return 1;
 }
 #endif
 
 int main(int argc, char **argv) {
 #ifdef _OPENMP
-    v4_omp_reserve_loader_cpus();
+    if (!v4_omp_reserve_loader_cpus())
+        fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",
+                omp_get_max_threads());
 #endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
         return v4_serve_main();
