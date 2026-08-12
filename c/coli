@@ -392,7 +392,10 @@ def env_for_engine(a, arch):
     if arch == "olmoe":
         env["CHAT"] = "1"
         env["MAX_NEW"] = str(ngen_for(a))
-        if a.temp is not None: env["TEMP"] = str(a.temp)
+        # olmoe reads COLI_TEMP like every other engine (line above). Setting the
+        # legacy TEMP alias here also clobbered %TEMP% with "0.7" for every child
+        # of the chat process on Windows — and olmoe never read COLI_TEMP, so the
+        # ONLY working channel was a poisoned system variable (#509's exact shape).
     # --ram reaches the engines that read it. kimi_k3 gained a RAM budget in
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the

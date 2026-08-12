@@ -70,7 +70,14 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "olmoe")
         self.assertEqual(env["CHAT"], "1")
         self.assertEqual(env["MAX_NEW"], "32")
-        self.assertEqual(env["TEMP"], "0.25")
+        # #509 for olmoe: the engine reads COLI_TEMP like every other arch.
+        # The legacy TEMP channel double-poisoned on Windows: it overrode the
+        # child's %TEMP% directory with "0.25", while a real %TEMP% path read
+        # back as atof("C:\...") == 0.0 and silently forced greedy decoding.
+        # env starts from os.environ, so TEMP may be inherited — the launcher
+        # must simply never write the temperature there.
+        self.assertEqual(env["COLI_TEMP"], "0.25")
+        self.assertNotEqual(env.get("TEMP"), "0.25")
 
     def test_olmoe_run_uses_its_engine_and_writes_one_prompt_line(self):
         directory, root = self.make_model("olmoe")
