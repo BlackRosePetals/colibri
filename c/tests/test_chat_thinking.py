@@ -15,11 +15,16 @@ import importlib.machinery
 import importlib.util
 import json
 import os
-import pty
 import sys
 import threading
 import time
 import unittest
+
+try:
+    import pty                      # POSIX-only: no termios/pty on Windows.
+    HAVE_PTY = True
+except ImportError:                 # The TUI path under test needs a real
+    HAVE_PTY = False                # terminal; Linux and macOS runners cover it.
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,6 +127,7 @@ def run_chat(base, extra_env):
     return output.decode("utf-8", "replace")
 
 
+@unittest.skipUnless(HAVE_PTY, "pty is POSIX-only; covered on Linux/macOS")
 class ChatThinkingTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
