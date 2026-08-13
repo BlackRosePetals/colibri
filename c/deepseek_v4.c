@@ -8742,13 +8742,37 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                                   session->max_prompt_tokens + 16);
     int context = engine->runtime.context_tokens;
     if (prompt_count < 1 || prompt_count > session->max_prompt_tokens ||
-        prompt_count + request->max_tokens > context) {
+        prompt_count + 1 > context) {
+        /* The PROMPT does not fit (or leaves no room for a single generated
+         * token) -- that is the only honest CONTEXT_EXCEEDED.
+         *
+         * Format contract: the gateway parses `CONTEXT_EXCEEDED <used>
+         * <limit>` as bare positional numbers (openai_server.py, matching
+         * the GLM engine's emission). The previous key=value fields were
+         * interpolated verbatim into the client-facing message, which told
+         * #975's reporter his "maximum context length is requested=16384"
+         * -- the request, not the capacity, which never appeared at all. */
+        int prompt_capacity = session->max_prompt_tokens < context - 1
+                                  ? session->max_prompt_tokens
+                                  : context - 1;
         char message[256];
-        snprintf(message, sizeof(message),
-                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
-                 prompt_count, request->max_tokens, context);
+        snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
+                 prompt_count, prompt_capacity);
         v4_serve_error(request->id, message);
         return;
+    }
+    /* max_tokens is a CEILING, not a target (#260/#382): generation ends at
+     * EOS either way, so an oversized budget is clamped to what the context
+     * can hold -- the same semantics the GLM serve path has had since #260.
+     * Rejecting instead made `coli chat`'s interactive default (16384) a
+     * guaranteed 400 on every first message of a fresh V4 chat (#975). */
+    if (request->max_tokens > context - prompt_count) {
+        fprintf(stderr,
+                "[V4] max_tokens %d clamped to %d (context %d - prompt %d); "
+                "raise CTX for longer answers\n",
+                request->max_tokens, context - prompt_count, context,
+                prompt_count);
+        request->max_tokens = context - prompt_count;
     }
     printf("ACCEPT %s %d\n", request->id, prompt_count);
     fflush(stdout);
@@ -8865,23 +8889,26 @@ static int v4_serve_main(void) {
  * rationale omp_tune.h records for the spin-wait half of the GLM tuning: a
  * busy team steals cores from the I/O pool). An explicit OMP_NUM_THREADS or
  * COLI_NO_OMP_TUNE=1 wins, exactly like the other engines' tuning. */
-static void v4_omp_reserve_loader_cpus(void) {
-    if (getenv("COLI_NO_OMP_TUNE")) return; /* family-wide kill-switch */
-    if (getenv("OMP_NUM_THREADS")) return;  /* the user already chose */
+static int v4_omp_reserve_loader_cpus(void) {
+    if (getenv("COLI_NO_OMP_TUNE")) return 0; /* family-wide kill-switch */
+    if (getenv("OMP_NUM_THREADS")) return 0;  /* the user already chose */
     int logical = omp_get_max_threads();
     int team = logical - COLI_V4_EXPERT_LOADER_COUNT;
-    if (team < 2) return; /* tiny machine: leave the OpenMP default alone */
+    if (team < 2) return 0; /* tiny machine: leave the OpenMP default alone */
     omp_set_num_threads(team);
     fprintf(stderr, "[OMP] deepseek-v4: %d compute threads (%d logical CPUs "
                     "minus %d expert-loader workers); OMP_NUM_THREADS=<n> "
                     "overrides, COLI_NO_OMP_TUNE=1 disables\n",
             team, logical, COLI_V4_EXPERT_LOADER_COUNT);
+    return 1;
 }
 #endif
 
 int main(int argc, char **argv) {
 #ifdef _OPENMP
-    v4_omp_reserve_loader_cpus();
+    if (!v4_omp_reserve_loader_cpus())
+        fprintf(stderr, "[OMP] deepseek-v4: effective team size %d\n",
+                omp_get_max_threads());
 #endif
     if (getenv("SERVE") && getenv("SERVE")[0] == '1')
         return v4_serve_main();

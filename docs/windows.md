@@ -3,7 +3,7 @@
 A start-to-finish, reproducible path from a fresh Windows 11 machine to GLM-5.2 generating tokens, with the GPU tier. Every step and every failure mode below was hit and verified on real hardware: Core Ultra 9 285K (AVX-VNNI) / RTX 5080 (sm_120) / 128 GB RAM / Windows 11 24H2 (issue #306). Steps are ordered so the long downloads run while you build.
 
 ---
-> **2026-08-09: Additional validation with detailed steps for laptop setup** \
+> **2026-08-11: Additional validation with detailed steps for laptop setup** \
 Lenovo Thinkpad P16v (Intel Core i7 ultra (155H 1.4GHz), 64GB RAM, 2Tb NVME drive, Nvidia RTX 2000 Ada generation 8GB (AD107, 2023)).
 Windows 11 pro english.\
 **Software installs:**\
@@ -19,6 +19,12 @@ From within `mingw64` we need to install compiler and make. \
 \
 `C:\msys64\mingw64.exe`\
 `pacman -S --needed mingw-w64-x86_64-gcc make`\
+\
+To see which AI oriented instructions your processor has, run CPU-Z from `https://www.cpuid.com/softwares/cpu-z.html` \
+or use the following command from msys2: `cat /proc/cpuinfo | grep ^flags | head -n 1`\
+To see which code optimizations are active in gcc compiler with the native flag check:\
+`gcc -march=native -dM -Q --help=target | grep -E "m(avx|ssw|aes|fma|sha|mmx)"`\
+For guidance about gcc optimizations, a good source cab be: `https://wiki.gentoo.org/wiki/GCC_optimization`\
 \
 **colibri.exe and coli_cuda.*** build from MS Visual Studio and Nvidia CUDA Toolkit:\
 Microsoft Visual Studio tools includes a `vcvars64.bat` batch file that appropriately sets all the paths. \

@@ -374,6 +374,173 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
+# ---- DeepSeek V4 tool calling (DSML) -------------------------------------------------------
+# V4 expresses tool calls as DSML blocks (see encoding/encoding_dsv4.py):
+#   <｜DSML｜tool_calls>\n<｜DSML｜invoke name="fn">\n
+#   <｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>
+# preceded by "\n\n". There is no standalone "tool" role: results are <tool_result>{content}
+# </tool_result> blocks merged into the following user turn. DSML = U+FF5C (｜) + ASCII.
+DSV4_DSML = "｜DSML｜"
+DSV4_EOS = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+_DSV4_BLOCK_RE = re.compile(
+    r"<" + DSV4_DSML + r"tool_calls>(.*?)</" + DSV4_DSML + r"tool_calls>", re.DOTALL)
+_DSV4_INVOKE_RE = re.compile(
+    r"<" + DSV4_DSML + r"invoke name=\"(.*?)\">(.*?)</" + DSV4_DSML + r"invoke>", re.DOTALL)
+_DSV4_PARAM_RE = re.compile(
+    r"<" + DSV4_DSML + r"parameter name=\"(.*?)\" string=\"(true|false)\">(.*?)</" +
+    DSV4_DSML + r"parameter>", re.DOTALL)
+
+DSV4_TOOLS_TEMPLATE = """## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{dsml}tool_calls>" block like the following:
+
+<{dsml}tool_calls>
+<{dsml}invoke name="$TOOL_NAME">
+<{dsml}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{dsml}parameter>
+...
+</{dsml}invoke>
+<{dsml}invoke name="$TOOL_NAME2">
+...
+</{dsml}invoke>
+</{dsml}tool_calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by {think_open}), you MUST output your complete reasoning inside {think_open}...{think_close} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {think_close} with tool calls or final response.
+
+### Available Tool Schemas
+
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+"""
+
+# OpenAI-style reasoning_effort levels -> the V4 vocabulary (encoding_dsv4.py has only
+# low/high/max; `low` adds nothing). In thinking mode the level's prompt is prepended at the
+# very start of the conversation, byte-matching REASONING_EFFORT_PROMPTS.
+DSV4_REASONING_EFFORT = {"minimal": "low", "low": "low", "medium": "high",
+                         "high": "high", "xhigh": "max", "max": "max"}
+DSV4_REASONING_EFFORT_PROMPTS = {
+    "high": ("Reasoning Effort: High.\n"
+             "Reason thoroughly, decompose the problem, and verify the relevant edge cases before acting. "
+             "Avoid repeating settled points or narrating redundant alternatives. "
+             "Keep the analysis proportional to the task. HARD LIMIT: finish reasoning within about "
+             "1,500 tokens, close the thinking section, and then emit the next tool call or a complete "
+             "final response. Never consume the whole output budget with reasoning.\n\n"),
+    "max": ("Reasoning Effort: Maximum.\n"
+            "Analyze the problem with maximum depth, trace root causes, and independently verify the "
+            "solution from multiple relevant angles. Do not repeat settled reasoning or pursue "
+            "irrelevant branches. Reserve sufficient tokens for the required tool call or final "
+            "response, and always terminate reasoning before the token budget is exhausted.\n\n"),
+}
+
+
+def _dsv4_tools_block(tools):
+    """V4 tool-declaration block (byte-matches encoding_dsv4.py's TOOLS_TEMPLATE)."""
+    schemas = []
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
+        schemas.append(json.dumps(clean, ensure_ascii=False))
+    return DSV4_TOOLS_TEMPLATE.format(dsml=DSV4_DSML, think_open=THINK_OPEN,
+                                      think_close=THINK_CLOSE, tool_schemas="\n".join(schemas))
+
+
+def _dsv4_tool_calls(tool_calls):
+    """Render OpenAI-format tool_calls into a V4 DSML block (incl. the leading \\n\\n)."""
+    calls = []
+    for tc in tool_calls:
+        fn = tc.get("function", tc) if isinstance(tc, dict) else {}
+        name = fn.get("name") or ""
+        args = fn.get("arguments")
+        try:
+            arguments = json.loads(args) if isinstance(args, str) else (args or {})
+        except (json.JSONDecodeError, TypeError, ValueError):
+            arguments = {}
+        params = []
+        for key, value in (arguments or {}).items():
+            is_str = "true" if isinstance(value, str) else "false"
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            params.append('<%sparameter name="%s" string="%s">%s</%sparameter>'
+                          % (DSV4_DSML, key, is_str, text, DSV4_DSML))
+        calls.append('<%sinvoke name="%s">\n%s\n</%sinvoke>'
+                     % (DSV4_DSML, name, "\n".join(params), DSV4_DSML))
+    return '\n\n<%stool_calls>\n%s\n</%stool_calls>' % (DSV4_DSML, "\n".join(calls), DSV4_DSML)
+
+
+def parse_dsv4_tool_calls(reply):
+    """Parse DeepSeek V4 DSML tool calls out of one assistant reply.
+
+    Returns (content, tool_calls): the visible answer text with the DSML block (and any
+    thinking/eos markers) removed, plus OpenAI-format tool_calls. Tolerant of truncated
+    output: an incomplete block yields no calls rather than an error.
+    """
+    content, calls = reply, []
+    block = _DSV4_BLOCK_RE.search(reply)
+    if block:
+        content = reply[:block.start()].rstrip("\n")
+        for m in _DSV4_INVOKE_RE.finditer(block.group(1)):
+            name = m.group(1).strip()
+            if not name:
+                continue
+            arguments = {}
+            for p in _DSV4_PARAM_RE.finditer(m.group(2)):
+                key, is_str, value = p.group(1), p.group(2), p.group(3)
+                if is_str != "true":
+                    try:
+                        value = json.loads(value)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+                arguments[key] = value
+            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
+                          "function": {"name": name,
+                                       "arguments": json.dumps(arguments, ensure_ascii=False)}})
+    else:
+        # No complete block (e.g. length-truncated output): drop everything from the first
+        # V4 tool marker so raw DSML syntax never leaks into the visible content.
+        cut = len(reply)
+        for marker in ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke"):
+            pos = reply.find(marker)
+            if pos >= 0 and pos < cut:
+                cut = pos
+        if cut < len(reply):
+            content = reply[:cut]
+    for marker in (DSV4_EOS, THINK_OPEN, THINK_CLOSE):
+        content = content.replace(marker, "")
+    return content.strip(), calls
+
+
+def parse_arch_tool_calls(reply, tools):
+    """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
+    if ARCH == "deepseek_v4":
+        return parse_dsv4_tool_calls(reply)
+    return parse_tool_calls(reply, tools)
+
+
+def _tool_stream_markers():
+    """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
+    if ARCH == "deepseek_v4":
+        return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    return (BOX_START,)
+
+
+def _tool_cut(buf):
+    """Earliest position of a tool-call marker in buf, or -1."""
+    found = -1
+    for marker in _tool_stream_markers():
+        pos = buf.find(marker)
+        if pos >= 0 and (found < 0 or pos < found):
+            found = pos
+    return found
+
+
+def _tool_hold():
+    """Bytes to hold back while scanning for a tool-call marker split across chunks."""
+    return max(len(m) for m in _tool_stream_markers()) - 1
+
+
 ARCH = "glm"   # set in main(): glm | inkling | kimi | deepseek_v4
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
@@ -667,40 +834,104 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
     The target engine receives this as a raw prompt. Prior assistant turns end
     with the checkpoint's EOS marker; the final assistant marker selects the
     thinking or direct-answer prefix for the new turn.
+
+    Tool use follows the official DSML format (encoding/encoding_dsv4.py): tool
+    schemas are declared on the first system/developer message, assistant tool
+    calls are DSML blocks, and tool results are <tool_result> blocks merged into
+    user turns (V4 has no standalone "tool" role).
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for DeepSeek V4 yet.",
-                       "tools", "unsupported_parameter")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    # Merge tool messages into <tool_result> blocks on the following user turn (V4 has no
+    # tool role); validate every message on the original list for accurate field-level errors.
+    merged = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            raw = message.get("content")
+            content = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            merged.append({"role": role, "content": content,
+                           "reasoning_content": message.get("reasoning_content"),
+                           "tool_calls": message.get("tool_calls")})
+            continue
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            block = "<tool_result>" + text + "</tool_result>"
+            if merged and merged[-1].get("_parts") is not None:
+                merged[-1]["_parts"].append(block)
+            else:
+                merged.append({"role": "user", "_parts": [block]})
+        elif role == "user":
+            if merged and merged[-1].get("_parts") is not None:
+                merged[-1]["_parts"].append(text)
+            else:
+                merged.append({"role": "user", "content": text})
+        else:                                     # system / developer
+            merged.append({"role": role, "content": text})
+    if tools:
+        tools_text = _dsv4_tools_block(tools)
+        if forced:
+            tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
+        elif tool_choice == "required":
+            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+        for msg in merged:
+            if msg["role"] in ("system", "developer"):
+                msg["content"] += "\n\n" + tools_text
+                break
+        else:
+            # No system/developer message: the official encoder renders tools on an empty
+            # system message, i.e. "bos" + "\n\n" + tools. Keep that exact byte layout.
+            merged.insert(0, {"role": "system", "content": "\n\n" + tools_text})
     bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
     user = "<\uff5cUser\uff5c>"
     assistant = "<\uff5cAssistant\uff5c>"
     eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
     parts = [bos]
-    for index, message in enumerate(messages):
-        if not isinstance(message, dict):
-            raise APIError(400, "Each message must be an object.", f"messages.{index}")
-        role = message.get("role")
-        if role not in ("system", "developer", "user", "assistant"):
-            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
-        raw = message.get("content")
-        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+    if enable_thinking:
+        effort = DSV4_REASONING_EFFORT.get(reasoning_effort, "low")
+        if effort != "low":
+            parts.append(DSV4_REASONING_EFFORT_PROMPTS[effort])
+    for message in merged:
+        role = message["role"]
         if role in ("system", "developer"):
-            parts.append(text)
+            if role == "developer":
+                parts.append(user)            # V4 wraps developer messages like user turns
+            parts.append(message["content"])
         elif role == "user":
-            parts.extend((user, text))
+            parts.append(user)
+            if message.get("_parts") is not None:
+                parts.append("\n\n".join(message["_parts"]))
+            else:
+                parts.append(message["content"])
         else:
             reasoning = message.get("reasoning_content")
-            if reasoning is not None and not isinstance(reasoning, str):
-                raise APIError(400, "`reasoning_content` must be a string.",
-                               f"messages.{index}.reasoning_content")
             parts.append(assistant)
             if reasoning:
                 parts.extend(("<think>", reasoning, "</think>"))
             else:
                 parts.append("</think>")
-            parts.extend((text, eos))
+            parts.append(message["content"])
+            if message.get("tool_calls"):
+                parts.append(_dsv4_tool_calls(message["tool_calls"]))
+            parts.append(eos)
     parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
     return "".join(parts)
 
@@ -2087,12 +2318,25 @@ class APIHandler(BaseHTTPRequestHandler):
         name = name.strip().lower()
         allowed = set(self.LOOPBACK_HOSTS)
         allowed.update(self.server.allowed_hosts)          # #597: operator-trusted reverse-proxy names
+        # A wildcard is an explicit operator opt-out of the guard, for the case
+        # the guard cannot serve: a container/LAN bind reached by an IP or DNS
+        # name the server cannot predict (#990 -- Docker port-map, the browser
+        # sends the host's address, which the container never knows). The guard
+        # protects a LOOPBACK bind from a malicious page; once bound to 0.0.0.0
+        # the exposure is already chosen, so `*` adds no risk that bind did not.
+        if "*" in allowed:
+            return
         try:
             allowed.add(str(self.server.server_address[0]).strip("[]").lower())
         except Exception:
             pass
         if name not in allowed:
-            raise APIError(403, "Host header not allowed.", None, "forbidden")
+            raise APIError(
+                403,
+                "Host header %r not allowed. Add it with --allowed-host %s "
+                "(or COLI_ALLOWED_HOSTS), or --allowed-host '*' to accept any "
+                "host when the bind is already public." % (name or "(empty)", name or "<host>"),
+                None, "forbidden")
 
     def read_json(self):
         try:
@@ -2345,7 +2589,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    content, calls = parse_arch_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -2468,16 +2712,16 @@ class APIHandler(BaseHTTPRequestHandler):
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
-                # <tool_call> split across engine chunks is still caught.
+                # tool-call marker split across engine chunks is still caught.
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                hold = _tool_hold()
                 raw = []
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = _tool_cut(sp["buf"])
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
@@ -2507,7 +2751,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                _content, calls = parse_arch_tool_calls("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -2587,6 +2831,15 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
+        if ARCH == "olmoe" and enable_thinking:
+            # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
+            # but unused"), so the engine never emits <think>/</think>. Left on,
+            # the reasoning splitter files the ENTIRE answer as reasoning_content
+            # and streams an empty `content` -- the drop reported in #984, which
+            # bit streaming (ThinkingStreamSplit stays in thinking mode forever)
+            # while non-streaming happened to survive. Make the template's "unused"
+            # true end-to-end instead of trusting every path to opt out.
+            enable_thinking = False
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
@@ -2613,6 +2866,8 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
             enable_thinking = True
+        if ARCH == "olmoe":
+            enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
             raise APIError(400, "`max_tokens` is required.", "max_tokens")
         # Reuse the OpenAI path's own validation by handing it an equivalent body.
@@ -2668,7 +2923,7 @@ class APIHandler(BaseHTTPRequestHandler):
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_tool_calls(text, tools)
+                text, calls = parse_arch_tool_calls(text, tools)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -2757,7 +3012,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             raw = []
             state = {"buf": "", "in_tool": False}
-            hold = len(BOX_START) - 1
+            hold = _tool_hold()
 
             def emit_text(chunk):
                 if not chunk:
@@ -2776,7 +3031,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if state["in_tool"]:
                     return                       # tool markers never reach the client as text
                 state["buf"] += chunk
-                cut = state["buf"].find(BOX_START)
+                cut = _tool_cut(state["buf"])
                 if cut >= 0:
                     if cut:
                         emit_text(state["buf"][:cut])
@@ -2884,6 +3139,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
             print("refusing to bind %s beyond localhost without COLI_API_KEY set "
                   "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
             sys.exit(1)
+    if allowed_hosts and "*" in allowed_hosts:
+        print("WARNING: --allowed-host '*' accepts ANY Host header "
+              "(DNS-rebinding guard disabled)", file=sys.stderr)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
