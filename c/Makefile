@@ -325,6 +325,9 @@ endif
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
+# tests/mxfp4_ref.c is compiled by $(CC) with OpenMP. Its object therefore
+# needs the host OpenMP runtime when the GPU compiler performs the final link.
+GPU_OMP_LINK = -Xcompiler=-fopenmp
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
 # triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
@@ -435,6 +438,7 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
+GPU_OMP_LINK = -fopenmp
 # rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
 # headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
 # let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
@@ -681,7 +685,7 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
 	$(CC) $(CFLAGS) -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
 	./mxfp4_cuda_test$(EXE)
 
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
