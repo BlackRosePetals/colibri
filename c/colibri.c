@@ -1848,8 +1848,11 @@ static unsigned metal_fused_layer_fmt_miss(const Layer *l);
  * (the kv_b-only notice this replaces re-typed the gate condition and had already gone
  * stale: it missed the `!g_moe_exact` term, staying silent on fmt=4 kv_b under
  * COLI_METAL_MOE_EXACT=1 while both gates closed). NOTICE ONLY — no gate/behavior change
- * here. Main layers only (m->L): the MTP head (m->mtpL) is deliberately excluded —
- * common containers ship it at INT8 by design, and the fused gates never see it.
+ * here. Main layers only (m->L): the MTP head (m->mtpL) is deliberately excluded by
+ * ratified decision — common containers ship it at INT8 by design, so its kv_b closes
+ * the fused attention gate on the MTP row on every ordinary load (the gate DOES evaluate
+ * the MTP head; that CPU fallback is carried, correct behavior) and a line about it here
+ * would be noise on every load, not signal.
  * FORMAT-ONLY SEMANTICS: a line here names a FORMAT (or format-mode) obstacle and
  * nothing else — it does not claim the fused path would otherwise engage. The gates
  * carry further runtime preconditions (GLM-5.2 dims, batch shape/S, ragged-mux guard,
@@ -1874,13 +1877,23 @@ static void metal_fmt_gate_notice(Model *m){
                           l->o.fmt, l->sh_gate.fmt, l->sh_up.fmt, l->sh_down.fmt };
         for(int k=0;k<NK;k++) if(miss>>k & 1u){ nbad[k]++; if(ffmt[k]<0) ffmt[k]=f[k]; }
     }
+    /* The remedy is MODE-AWARE because the plain suggestion is circular under MOE-exact:
+     * the converter's --group-size defaults to 64 (community-validated, see
+     * c/tools/convert_fp8_to_int4.py), so `--kvb-bits 4` alone mints GROUPED int4 =
+     * fmt=4 — which is exactly what g_moe_exact keeps off the fused path. Under the
+     * mode, point at the two real cures: an ungrouped requant (--group-size 0 -> fmt=2)
+     * or, for a kv_b that is already fmt=4, unsetting COLI_METAL_MOE_EXACT. */
     if(nbad[0]) fprintf(stderr,
         "[METAL] kv_b_proj is fmt=%d on %d/%d layer%s: the fused Metal attention path "
         "serves kv_b only as int4, per-row (fmt=2) or grouped (fmt=4; grouped is served "
         "only while COLI_METAL_MOE_EXACT is off), so those layers run decode attention "
-        "on the CPU absorb path instead. Requantize kv_b to int4 (--kvb-bits 4) to "
-        "re-enable the fused path.\n",
-        ffmt[0], nbad[0], c->n_layers, nbad[0]==1?"":"s");
+        "on the CPU absorb path instead. %s\n",
+        ffmt[0], nbad[0], c->n_layers, nbad[0]==1?"":"s",
+        g_moe_exact
+          ? "Requantize kv_b to ungrouped int4 (--kvb-bits 4 --group-size 0) to re-enable "
+            "the fused path; for a grouped-int4 (fmt=4) kv_b, unsetting COLI_METAL_MOE_EXACT "
+            "also re-enables it without requantizing."
+          : "Requantize kv_b to int4 (--kvb-bits 4) to re-enable the fused path.");
     static const char *const kind_name[NK]={ "kv_b_proj" /* [0] has its own line above */,
         "q_a_proj","q_b_proj","kv_a_proj_with_mqa","o_proj",
         "shared_experts.gate_proj","shared_experts.up_proj","shared_experts.down_proj" };

@@ -37,12 +37,17 @@ static int fails = 0;
 #define CHECK(c) do{ if(!(c)){ printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); fails++; } }while(0)
 
 /* Redirects stderr to `path` (truncated, read+write) and returns a dup of the original
- * fd 2 so restore_stderr() can put it back. */
+ * fd 2 so restore_stderr() can put it back. A failed dup/freopen leaves the capture seam
+ * (and stderr itself) in an undefined state every later CHECK would silently depend on,
+ * so abort the whole test loudly instead of limping on. */
 static int redirect_stderr(const char *path){
     fflush(stderr);
     int saved = dup(fileno(stderr));
-    if(saved<0){ printf("FAIL: dup(stderr) failed\n"); fails++; }
-    if(!freopen(path, "w+", stderr)){ printf("FAIL: freopen(%s) failed\n", path); fails++; }
+    if(saved<0){ printf("FAIL: dup(stderr) failed -- capture seam unusable, aborting\n"); exit(1); }
+    if(!freopen(path, "w+", stderr)){
+        printf("FAIL: freopen(%s) failed -- capture seam unusable, aborting\n", path);
+        exit(1);
+    }
     return saved;
 }
 /* Reads back everything written to stderr since redirect_stderr(), restores the real
@@ -133,6 +138,10 @@ int main(void){
         CHECK(strstr(buf, "fmt=4") != NULL);               /* mentions the grouped option -- fmt=4 is valid outside MOE-exact */
         CHECK(strstr(buf, "CPU absorb path") != NULL);      /* attention runs the CPU path */
         CHECK(strstr(buf, "--kvb-bits 4") != NULL);          /* remedy hint */
+        /* mode OFF -> the PLAIN remedy: no --group-size opt-out steering (that flag is
+         * the MOE-exact cure; suggesting the accuracy-costing ungrouped requant on an
+         * ordinary load would be wrong advice) */
+        CHECK(strstr(buf, "--group-size 0") == NULL);
         /* the pre-#587 message's PER-ROW-only warning and fmt=4-trap sentence must be
          * gone -- fmt=4 is a valid GPU-served kv_b outside MOE-exact mode, not a second
          * way to miss the gate. (These pins are carried from dev's test verbatim.) */
@@ -196,6 +205,11 @@ int main(void){
         CHECK(strstr(buf, "fmt=4") != NULL);               /* the offending format is grouped int4 */
         CHECK(strstr(buf, "2/4 layer") != NULL);            /* only the fmt=4 layers count */
         CHECK(strstr(buf, "COLI_METAL_MOE_EXACT") != NULL); /* names the mode that excludes fmt=4 */
+        /* mode ON -> the MODE-AWARE remedy: `--kvb-bits 4` alone is circular here (the
+         * converter's default --group-size 64 mints fmt=4 again), so the message must
+         * name the ungrouped opt-out and the option of unsetting the mode. */
+        CHECK(strstr(buf, "--group-size 0") != NULL);
+        CHECK(strstr(buf, "unsetting COLI_METAL_MOE_EXACT") != NULL);
 
         /* ... and all-fmt=4 under the same mode: 3/3 miss */
         for(int i=0;i<4;i++) m.L[i].kv_b.fmt = 4;
@@ -287,8 +301,10 @@ int main(void){
     }
 
     /* (f) MTP-head exclusion: main layers clean, the MTP head (m->mtpL, ships INT8 by
-     * design) entirely off-allowlist -> still silent. The fused gates never see the
-     * MTP head and neither must the notice. */
+     * design) entirely off-allowlist -> still silent. The notice scans main layers only
+     * by ratified decision: the fused attention gate DOES evaluate the MTP row and its
+     * INT8 kv_b closes it on every ordinary load (carried, correct CPU fallback), so a
+     * notice line about it would be noise on every load, not signal. */
     {
         Model m = make_model(3);
         set_clean(&m);
@@ -418,6 +434,43 @@ int main(void){
         unsigned miss = metal_fused_layer_fmt_miss(&l);
         CHECK(!(miss & METAL_FUSED_ATTN_TENSORS));
         CHECK(!(miss & METAL_FUSED_LAYER_TENSORS));
+    }
+
+    /* (k) ACCEPTED BEHAVIOR (documented, not guarded): runtime-quant dense configs land
+     * every fused-bound tensor on one qt_alloc rung, and the notice reports that
+     * truthfully under FORMAT-ONLY SEMANTICS. dense@16 (bits>=16 -> fmt=0 everywhere):
+     * fmt=0 never fused, so ALL 8 kinds miss -> exactly 8 accurate lines, every one
+     * naming fmt=0 -- bounded, correct, and deliberate (a load that can never fuse for
+     * format reasons deserves to say so once per kind). dense@3 (bits==3 -> fmt=3
+     * everywhere): fmt=3 is ON the allowlist, so only kv_b misses (an int2 kv_b is not
+     * int4) -> exactly 1 line. This case pins the behavior so it is claimed and tested
+     * rather than accidental. */
+    {
+        Model m = make_model(4);
+        for(int i=0;i<4;i++){
+            Layer *l=&m.L[i]; l->sparse=1;
+            l->kv_b.fmt=0; l->q_a.fmt=0; l->q_b.fmt=0; l->kv_a.fmt=0; l->o.fmt=0;
+            l->sh_gate.fmt=0; l->sh_up.fmt=0; l->sh_down.fmt=0;
+        }
+        g_metal_enabled = 1;
+        run_notice(&m, buf, sizeof buf);
+        CHECK(count_sub(buf, "[METAL]") == 8);             /* bounded: one line per kind */
+        for(int k=0;k<8;k++) CHECK(count_sub(buf, kind_str[k]) == 1);
+        CHECK(count_sub(buf, "fmt=0") == 8);                /* every line names the real fmt */
+        CHECK(count_sub(buf, "4/4 layer") == 5);            /* kv_b + q_a/q_b/kv_a/o */
+        CHECK(count_sub(buf, "4/4 sparse layer") == 3);     /* sh_* */
+
+        for(int i=0;i<4;i++){
+            Layer *l=&m.L[i];
+            l->kv_b.fmt=3; l->q_a.fmt=3; l->q_b.fmt=3; l->kv_a.fmt=3; l->o.fmt=3;
+            l->sh_gate.fmt=3; l->sh_up.fmt=3; l->sh_down.fmt=3;
+        }
+        run_notice(&m, buf, sizeof buf);
+        CHECK(count_sub(buf, "[METAL]") == 1);              /* allowlist kinds all pass */
+        CHECK(count_sub(buf, "[METAL] kv_b_proj") == 1);    /* the one miss is kv_b */
+        CHECK(strstr(buf, "fmt=3") != NULL);
+        CHECK(strstr(buf, "4/4 layer") != NULL);
+        free(m.L);
     }
 
     if(fails){ printf("fused-metal fmt-gate notice tests: %d FAILED\n", fails); return 1; }
