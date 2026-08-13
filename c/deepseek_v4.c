@@ -5358,6 +5358,9 @@ typedef struct {
     unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
+    double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
+    uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
+    uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -5509,6 +5512,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         /* A short read must never expose a partially overwritten old slot. */
         slot->expert = -1;
+        struct timespec disk_t0;
+        clock_gettime(CLOCK_MONOTONIC, &disk_t0);
         if (coli_st_read_at_streaming(
                 state->index, record->shard, record->scale_offset,
                 (size_t)record->scale_bytes, slot->slab) != 0 ||
@@ -5516,9 +5521,21 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 state->index, record->shard, record->weight_offset,
                 (size_t)record->weight_bytes,
                 slot->slab + record->scale_bytes) != 0) {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
+        }
+        {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
         }
         slot->expert = key.expert;
         state->stats.misses++;
@@ -5527,6 +5544,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
+    if (state->ehit) {
+        size_t expert_index =
+            (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->ehit[expert_index] = 1;
+        if (state->eheat && state->eheat[expert_index] < 63)
+            state->eheat[expert_index]++;
+    }
     memset(view, 0, sizeof(*view));
     view->key = key;
     fill_tensor_view(&view->gate, record, slot, V4_W1);
@@ -5630,6 +5654,8 @@ static void destroy(ColiExpertStore *store) {
         coli_st_index_close(state->index);
         free(state->records);
         free(state->slots);
+        free(state->ehit);
+        free(state->eheat);
         free(state);
     }
     free(store);
@@ -5699,6 +5725,14 @@ int coli_deepseek_v4_expert_store_open(
     }
     for (int i = 0; i < state->layers * state->slots_per_layer; i++)
         state->slots[i].expert = -1;
+    size_t telemetry_cells =
+        (size_t)state->layers * state->experts_per_layer;
+    state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
+    state->eheat = calloc(telemetry_cells, sizeof(*state->eheat));
+    if (!state->ehit || !state->eheat) {
+        set_error(error, error_size, "out of memory creating expert telemetry");
+        goto fail;
+    }
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
     store->ops = &operations;
@@ -5709,6 +5743,8 @@ int coli_deepseek_v4_expert_store_open(
 fail:
     if (state->slots) free(state->slots);
     free(state->records);
+    free(state->ehit);
+    free(state->eheat);
     coli_st_index_close(state->index);
     pthread_mutex_destroy(&state->mutex);
     free(state);
@@ -6100,6 +6136,13 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
+    if (state->ehit) {
+        size_t expert_index =
+            (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->ehit[expert_index] = 1;
+        if (state->eheat && state->eheat[expert_index] < 63)
+            state->eheat[expert_index]++;
+    }
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
         layer_requests % policy->repin_interval == 0)
@@ -6154,8 +6197,15 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     state->active_leases++;
     slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
+    struct timespec disk_t0;
+    clock_gettime(CLOCK_MONOTONIC, &disk_t0);
     int read_result = v4_read_expert_record(state, record, slot);
+    struct timespec disk_t1;
+    clock_gettime(CLOCK_MONOTONIC, &disk_t1);
     pthread_mutex_lock(&state->mutex);
+    state->disk_sec +=
+        (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+        (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
     if (read_result) {
         slot->references = 0; slot->expert = -1;
         if (state->active_leases) state->active_leases--;
@@ -6332,6 +6382,111 @@ int COLI_V4_ROWS16_STORE_OPEN(
         hot_prewarm_history(policy, state))
         fprintf(stderr, "v4_autopin warning=partial-warmup; continuing\n");
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Dashboard telemetry (TIERS/EMAP/HITS) — emitted to stdout in the same
+ * wire format openai_server.py parses for the GLM engine (telemetry.h):
+ *
+ *   TIERS vram ram disk vram_gb ram_gb
+ *   EMAP  rows cols hex        (per expert: 2 hex digits, tier<<6 | heat)
+ *   HITS  rows cols hex        (per-turn routed-expert bitmap, then cleared)
+ *
+ * The serve unit (COLI_V4_UNIT_GENERATE_STATS) calls these at turn
+ * boundaries; the per-expert state lives here, so the store emits them.
+ * V4 is CPU-only, so the VRAM tier is always 0 and "ram" means "resident in
+ * the expert-store cache slots". Heat is the cumulative routing-selection
+ * count (capped at 63, matching the GLM map's low-6-bit field).
+ * ---------------------------------------------------------------------- */
+
+void coli_v4_expert_store_emit_tiers(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int resident = 0;
+    pthread_mutex_lock(&state->mutex);
+    for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        if (state->slots[i].slab && state->slots[i].expert >= 0) resident++;
+    pthread_mutex_unlock(&state->mutex);
+    int total = state->layers * state->experts_per_layer;
+    int ram = resident, disk = total - ram;
+    if (ram < 0) ram = 0;
+    if (disk < 0) disk = 0;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", ram, disk,
+           (double)resident * state->record_bytes / 1e9);
+    fflush(stdout);
+}
+
+void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int rows = state->layers, cols = state->experts_per_layer;
+    size_t cells = (size_t)rows * cols;
+    char *hex = malloc(cells * 2 + 1);
+    if (!hex) return;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t i = 0; i < cells; i++) {
+        int tier = 0;
+        int layer = (int)(i / (size_t)cols), expert = (int)(i % (size_t)cols);
+        V4ExpertSlot *slots = state->slots +
+            (size_t)layer * state->slots_per_layer;
+        for (int z = 0; z < state->slots_per_layer; z++)
+            if (slots[z].slab && slots[z].expert == expert) { tier = 1; break; }
+        int heat = state->eheat ? state->eheat[i] : 0;
+        if (heat > 63) heat = 63;
+        int b = (tier << 6) | heat;
+        hex[i * 2] = "0123456789abcdef"[b >> 4];
+        hex[i * 2 + 1] = "0123456789abcdef"[b & 15];
+    }
+    pthread_mutex_unlock(&state->mutex);
+    hex[cells * 2] = 0;
+    printf("EMAP %d %d %s\n", rows, cols, hex);
+    fflush(stdout);
+    free(hex);
+}
+
+void coli_v4_expert_store_emit_hits(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int rows = state->layers, cols = state->experts_per_layer;
+    size_t cells = (size_t)rows * cols;
+    size_t nbytes = (cells + 7) / 8;
+    char *hex = malloc(nbytes * 2 + 1);
+    if (!hex) return;
+    uint8_t *bitmap = calloc(nbytes, 1);
+    if (!bitmap) {
+        free(hex);
+        return;
+    }
+    pthread_mutex_lock(&state->mutex);
+    if (state->ehit) {
+        for (size_t i = 0; i < cells; i++)
+            if (state->ehit[i]) bitmap[i >> 3] |= (uint8_t)(1u << (i & 7));
+        memset(state->ehit, 0, cells);
+    }
+    pthread_mutex_unlock(&state->mutex);
+    for (size_t b = 0; b < nbytes; b++) {
+        hex[b * 2] = "0123456789abcdef"[bitmap[b] >> 4];
+        hex[b * 2 + 1] = "0123456789abcdef"[bitmap[b] & 15];
+    }
+    hex[nbytes * 2] = 0;
+    printf("HITS %d %d %s\n", rows, cols, hex);
+    fflush(stdout);
+    free(bitmap);
+    free(hex);
+}
+
+double coli_v4_expert_store_disk_sec(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return 0.0;
+    state = store->state;
+    double value;
+    pthread_mutex_lock(&state->mutex);
+    value = state->disk_sec;
+    pthread_mutex_unlock(&state->mutex);
+    return value;
 }
 #endif /* COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 */
 
@@ -8633,6 +8788,64 @@ static double v4_serve_rss_gb(void) {
 #endif
 }
 
+/* Dashboard telemetry: the per-expert state lives in the expert-store unit
+ * (COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16), so the emitters are exported from
+ * there and called at turn boundaries from this unit. */
+extern void coli_v4_expert_store_emit_tiers(ColiExpertStore *store);
+extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
+extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
+extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
+
+static void v4_hwinfo_emit(void) {
+    char cpu[256] = "";
+    int cores = 0;
+    double ram_total = 0.0, ram_avail = 0.0;
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) {
+        char line[256];
+        while (fgets(line, sizeof(line), ci))
+            if (!strncmp(line, "model name", 10)) {
+                char *p = strchr(line, ':');
+                if (p) {
+                    p++;
+                    while (*p == ' ') p++;
+                    int n = (int)strlen(p);
+                    if (n > 0 && p[n - 1] == '\n') p[--n] = 0;
+                    snprintf(cpu, sizeof(cpu), "%s", p);
+                }
+                break;
+            }
+        fclose(ci);
+    }
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) {
+        char line[256];
+        double mt = 0.0, ma = 0.0;
+        while (fgets(line, sizeof(line), mi)) {
+            if (sscanf(line, "MemTotal: %lf", &mt) == 1) ram_total = mt / 1e6;
+            if (sscanf(line, "MemAvailable: %lf", &ma) == 1) ram_avail = ma / 1e6;
+        }
+        fclose(mi);
+    }
+    printf("HWINFO %d %.1f %.1f 0 0.0 %s|v4-cpu\n", cores, ram_total,
+           ram_avail, cpu[0] ? cpu : "unknown");
+    fflush(stdout);
+}
+
+/* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
+ * expert_matmul_s attention_s lm_head_s forwards — the V4 runtime has no
+ * per-phase instrumentation beyond disk-read time, so the phase fields other
+ * than expert_disk_s stay zero and the frontend folds them into "other". */
+static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
+                         double expert_disk_s) {
+    printf("PROF %.3f %d %d %.3f 0.000 0.000 0.000 0.000 0\n",
+           wall_s, prompt_tokens, completion, expert_disk_s);
+    fflush(stdout);
+}
+
 static int v4_serve_read_request(V4ServeRequest *request,
                                  const char *active_id) {
     char line[512], command[16], id[64];
@@ -8780,6 +8993,8 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     ColiExpertStoreStats before = {0}, after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &before);
+    double disk_before =
+        engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
     V4ServeStream stream = {session, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -8817,6 +9032,13 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
            hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
            session->prefix_reused);
     fflush(stdout);
+    double expert_disk_s = engine->experts
+        ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
+        : 0.0;
+    v4_prof_emit(elapsed, stats.prompt_tokens, completion, expert_disk_s);
+    coli_v4_expert_store_emit_hits(engine->experts);
+    coli_v4_expert_store_emit_emap(engine->experts);
+    coli_v4_expert_store_emit_tiers(engine->experts);
 }
 
 static int v4_serve_main(void) {
@@ -8864,6 +9086,9 @@ static int v4_serve_main(void) {
     fputs("\x01\x01READY\x01\x01\n", stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n", v4_serve_rss_gb());
     fflush(stdout);
+    v4_hwinfo_emit();
+    coli_v4_expert_store_emit_tiers(engine->experts);
+    coli_v4_expert_store_emit_emap(engine->experts);
     for (;;) {
         V4ServeRequest request = {0};
         int result;
@@ -9547,6 +9772,9 @@ typedef struct {
     unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
+    double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
+    uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
+    uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -9698,6 +9926,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         /* A short read must never expose a partially overwritten old slot. */
         slot->expert = -1;
+        struct timespec disk_t0;
+        clock_gettime(CLOCK_MONOTONIC, &disk_t0);
         if (coli_st_read_at_streaming(
                 state->index, record->shard, record->scale_offset,
                 (size_t)record->scale_bytes, slot->slab) != 0 ||
@@ -9705,9 +9935,21 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 state->index, record->shard, record->weight_offset,
                 (size_t)record->weight_bytes,
                 slot->slab + record->scale_bytes) != 0) {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
+        }
+        {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
         }
         slot->expert = key.expert;
         state->stats.misses++;
@@ -9716,6 +9958,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
+    if (state->ehit) {
+        size_t expert_index =
+            (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->ehit[expert_index] = 1;
+        if (state->eheat && state->eheat[expert_index] < 63)
+            state->eheat[expert_index]++;
+    }
     memset(view, 0, sizeof(*view));
     view->key = key;
     fill_tensor_view(&view->gate, record, slot, V4_W1);
@@ -9817,6 +10066,8 @@ static void destroy(ColiExpertStore *store) {
         coli_st_index_close(state->index);
         free(state->records);
         free(state->slots);
+        free(state->ehit);
+        free(state->eheat);
         free(state);
     }
     free(store);
@@ -9886,6 +10137,14 @@ int coli_deepseek_v4_expert_store_open(
     }
     for (int i = 0; i < state->layers * state->slots_per_layer; i++)
         state->slots[i].expert = -1;
+    size_t telemetry_cells =
+        (size_t)state->layers * state->experts_per_layer;
+    state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
+    state->eheat = calloc(telemetry_cells, sizeof(*state->eheat));
+    if (!state->ehit || !state->eheat) {
+        set_error(error, error_size, "out of memory creating expert telemetry");
+        goto fail;
+    }
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
     store->ops = &operations;
@@ -9896,6 +10155,8 @@ int coli_deepseek_v4_expert_store_open(
 fail:
     if (state->slots) free(state->slots);
     free(state->records);
+    free(state->ehit);
+    free(state->eheat);
     coli_st_index_close(state->index);
     pthread_mutex_destroy(&state->mutex);
     free(state);
