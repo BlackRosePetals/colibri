@@ -2318,12 +2318,25 @@ class APIHandler(BaseHTTPRequestHandler):
         name = name.strip().lower()
         allowed = set(self.LOOPBACK_HOSTS)
         allowed.update(self.server.allowed_hosts)          # #597: operator-trusted reverse-proxy names
+        # A wildcard is an explicit operator opt-out of the guard, for the case
+        # the guard cannot serve: a container/LAN bind reached by an IP or DNS
+        # name the server cannot predict (#990 -- Docker port-map, the browser
+        # sends the host's address, which the container never knows). The guard
+        # protects a LOOPBACK bind from a malicious page; once bound to 0.0.0.0
+        # the exposure is already chosen, so `*` adds no risk that bind did not.
+        if "*" in allowed:
+            return
         try:
             allowed.add(str(self.server.server_address[0]).strip("[]").lower())
         except Exception:
             pass
         if name not in allowed:
-            raise APIError(403, "Host header not allowed.", None, "forbidden")
+            raise APIError(
+                403,
+                "Host header %r not allowed. Add it with --allowed-host %s "
+                "(or COLI_ALLOWED_HOSTS), or --allowed-host '*' to accept any "
+                "host when the bind is already public." % (name or "(empty)", name or "<host>"),
+                None, "forbidden")
 
     def read_json(self):
         try:
@@ -3126,6 +3139,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
             print("refusing to bind %s beyond localhost without COLI_API_KEY set "
                   "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
             sys.exit(1)
+    if allowed_hosts and "*" in allowed_hosts:
+        print("WARNING: --allowed-host '*' accepts ANY Host header "
+              "(DNS-rebinding guard disabled)", file=sys.stderr)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.

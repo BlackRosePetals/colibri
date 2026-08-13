@@ -1464,6 +1464,31 @@ class AllowedHostsTest(unittest.TestCase):
         server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
         self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
 
+    def test_wildcard_accepts_any_host(self):
+        # #990: a Docker/LAN bind reached by an unpredictable IP. The wildcard is
+        # an explicit operator opt-out, so ANY host passes -- but loopback and a
+        # real name still work, i.e. it widens rather than replaces.
+        server = self._make_server(allowed_hosts=("*",))
+        port = server.server_port
+        self.assertEqual(self._get_models(port, "10.20.30.40:36873"), 200)
+        self.assertEqual(self._get_models(port, "colibri.example.com"), 200)
+        self.assertEqual(self._get_models(port, "localhost"), 200)
+
+    def test_rejection_message_names_the_host_and_the_fix(self):
+        server = self._make_server()
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            conn.putrequest("GET", "/v1/models", skip_host=True)
+            conn.putheader("Host", "myserver.lan:36873")
+            conn.endheaders()
+            resp = conn.getresponse()
+            body = resp.read().decode()
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 403)
+        self.assertIn("myserver.lan", body)          # the offending host, so the user can copy it
+        self.assertIn("--allowed-host", body)        # and how to fix it
+
 
 class ThinkingSplitUnitTest(unittest.TestCase):
     """#597 item 4: the GLM reasoning splitter, incl. mkelcb's cross-chunk cases."""
