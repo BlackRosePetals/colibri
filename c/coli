@@ -941,7 +941,7 @@ def cmd_run(a):
         prompt_path=None
         try:
             cmd=[engine,os.path.abspath(a.model)]
-            if sys.platform=="win32":
+            if sys.platform in ("win32", "msys", "cygwin"):
                 with tempfile.NamedTemporaryFile(
                         mode="w",encoding="utf-8",newline="",delete=False,
                         prefix="coli-v4-prompt-",suffix=".txt") as stream:
