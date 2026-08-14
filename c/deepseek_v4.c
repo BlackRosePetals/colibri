@@ -115,6 +115,18 @@ int coli_st_streaming_direct_available(const ColiSafetensorsIndex *index,
     return index->dfds[shard] >= 0;
 }
 
+/* Direct-I/O availability for the ROUTED replica: same COLI_V4_DIRECT gate,
+ * but checks the replica's own O_DIRECT twin — a mirror with a twin must not
+ * lose direct reads just because the primary lacks one, and vice versa. */
+int coli_st_streaming_direct_available_rep(const ColiSafetensorsIndex *index,
+                                           int shard, int rep) {
+    if (!index || shard < 0 || shard >= index->nfd) return 0;
+    const char *setting = getenv("COLI_V4_DIRECT");
+    if (setting && atoi(setting) == 0) return 0;
+    int dfd = rep ? index->mdfds[rep - 1][shard] : index->dfds[shard];
+    return dfd >= 0;
+}
+
 int coli_st_read_at_streaming(const ColiSafetensorsIndex *index, int shard,
                               uint64_t offset, size_t length,
                               void *destination) {
@@ -316,17 +328,19 @@ static double v4_mirror_now_s(void) {
  * the same fd/page-cache, and in buffered mode an expert must never be cached
  * twice (one copy per drive).
  *
- * Uses the linear index (layer*256+eid) multiplied by a large prime
- * (golden-ratio constant for 32-bit), then extracts bits 16-23.  The old XOR-
- * based hash (layer*C1 ^ eid*C2) was uniform across the full 43x256 grid, but
- * the hot subset accessed during inference (~12 experts/layer) clustered on one
- * replica because the XOR didn't spread small inputs evenly.  The linear-index
- * approach maps each (layer,eid) to a unique integer 0..11007; the multiply-
- * and-shift inherits the uniform distribution of that flat index, so any subset
+ * Uses the linear index (layer*experts_per_layer+eid) multiplied by a large
+ * prime (golden-ratio constant for 32-bit), then extracts bits 16-23.  The old
+ * XOR-based hash (layer*C1 ^ eid*C2) was uniform across the full 43x256 grid,
+ * but the hot subset accessed during inference (~12 experts/layer) clustered on
+ * one replica because the XOR didn't spread small inputs evenly.  The linear-
+ * index approach maps each (layer,eid) to a unique integer; the multiply-and-
+ * shift inherits the uniform distribution of that flat index, so any subset
  * — hot or cold — splits evenly across drives. */
+static int g_v4_mir_epl = 256;      /* experts per layer (config, set at setup) */
+
 static inline int v4_expert_route(int layer, int eid) {
     if (!g_v4_mirror) return 0;
-    uint32_t h = (uint32_t)(layer * 256 + eid) * 2654435761u;
+    uint32_t h = (uint32_t)(layer * g_v4_mir_epl + eid) * 2654435761u;
     int hv = (int)((h >> 16) & 255), r = 0;
     while (hv >= g_v4_mir_cut[r]) r++;  /* cut[nrep-1]==256 terminates the scan */
     return r;
@@ -375,8 +389,10 @@ static double v4_mirror_probe_bw(const ColiSafetensorsIndex *index, int rep) {
  * dirs), derive the read split from COLI_DISK_WEIGHTS or a startup bandwidth
  * probe. Runs after the expert-store index is open and BEFORE any expert load,
  * so the OMP-parallel pin warmup streams from all drives. */
-int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir) {
+int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir,
+                         int experts_per_layer) {
     if (!index) return 0;
+    if (experts_per_layer > 0) g_v4_mir_epl = experts_per_layer;
     const char *mirror_dir = getenv("COLI_MODEL_MIRROR");
     if (!mirror_dir || !*mirror_dir) mirror_dir = getenv("SNAP_MIRROR");
     if (!mirror_dir || !*mirror_dir) return 0;
@@ -498,8 +514,7 @@ int coli_st_read_at_streaming_rep(const ColiSafetensorsIndex *index, int shard,
         length > (uint64_t)index->sizes[shard] - offset)
         return -1;
     if (!length) return 0;
-    if (!coli_st_streaming_direct_available(index, shard) ||
-        (rep && index->mdfds[rep - 1][shard] < 0))
+    if (!coli_st_streaming_direct_available_rep(index, shard, rep))
         return coli_st_read_at_rep(index, shard, rep, offset, length, destination);
 
     const uint64_t alignment = 4096;
@@ -5940,7 +5955,8 @@ int coli_deepseek_v4_expert_store_open(
     /* DUAL-SSD: register COLI_MODEL_MIRROR copies and derive the read split
      * before any expert load, so pin warmup and demand reads stream from all
      * drives. */
-    coli_st_mirror_setup(state->index, options->model_dir);
+    coli_st_mirror_setup(state->index, options->model_dir,
+                         options->experts_per_layer);
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
     state->records = calloc(record_count, sizeof(*state->records));
     if (!state->records) {
@@ -6251,8 +6267,7 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
                                  const V4ExpertRecord *record,
                                  V4ExpertSlot *slot, int rep) {
     int direct_available = slot->aligned_slab &&
-        coli_st_streaming_direct_available(state->index, record->shard) &&
-        (!rep || state->index->mdfds[rep - 1][record->shard] >= 0);
+        coli_st_streaming_direct_available_rep(state->index, record->shard, rep);
     if (direct_available &&
         record->scale_offset + record->scale_bytes == record->weight_offset &&
         !v4_read_direct_window(state, record->shard, rep, slot->slab,
@@ -9109,6 +9124,24 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
            hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
            session->prefix_reused);
     fflush(stdout);
+    /* DUAL-SSD: cumulative per-drive read split, once per turn. The CLI path
+     * prints this at exit; serve is long-lived, so surface it on stderr where
+     * the gateway tees it — it is the only way to see whether expert I/O
+     * actually aggregates both drives' bandwidth in production. */
+    if (coli_st_mirror_active()) {
+        /* One write: the gateway tees this stderr alongside its own lines,
+         * and piecewise fprintf interleaves mid-line under load. */
+        char line[256];
+        int at = snprintf(line, sizeof(line), "v4_mirror");
+        for (int r = 0; r < coli_st_mirror_nrep() && at < (int)sizeof(line); r++)
+            at += snprintf(line + at, sizeof(line) - at, " %s=%.2fGiB/%llu",
+                           r ? "mirror" : "primary",
+                           __atomic_load_n(&g_v4_mir_bytes[r], __ATOMIC_RELAXED)
+                               / 1073741824.0,
+                           (unsigned long long)__atomic_load_n(
+                               &g_v4_mir_nread[r], __ATOMIC_RELAXED));
+        fprintf(stderr, "%s\n", line);
+    }
 }
 
 static int v4_serve_main(void) {

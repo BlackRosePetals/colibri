@@ -81,7 +81,10 @@ const char *coli_st_dtype_name(ColiSafetensorsDType dtype);
  * or a startup bandwidth probe (colibri.c mirror_setup semantics). Runs after
  * the index is open and before any expert load. Returns 1 when a usable mirror
  * is active, 0 when none, -1 on error. */
-int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir);
+int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir,
+                         int experts_per_layer);
+int coli_st_streaming_direct_available_rep(const ColiSafetensorsIndex *index,
+                                           int shard, int rep);
 
 /* Replica (0 = primary, 1..nrep-1 = mirrors) serving expert (layer, eid). */
 int coli_st_expert_route(int layer, int eid);
