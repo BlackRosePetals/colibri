@@ -134,6 +134,7 @@ jobs:
           cp c/coli dist/
           cp c/version.py dist/
           cp c/openai_server.py dist/
+          cp c/v4_dsml.py dist/        # openai_server imports v4_dsml (vendored DeepSeek V4 DSML primitives); without it the packaged server won't import
           cp c/resource_plan.py dist/
           cp c/doctor.py dist/
           cp c/autotune.py dist/
