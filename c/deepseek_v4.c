@@ -6112,6 +6112,76 @@ static int hot_pack_slot_locked(V4HotPolicy *policy,
 #endif
 }
 
+/* Issue #900: the FP4 rows16 packing is CPU-heavy (~5-6 s across a batched
+ * prefill) and used to run while holding state->mutex, serialising every
+ * other expert fetch on every OMP thread. The slot already holds our
+ * reference here, so its slab is stable and the packing can run lock-free.
+ * We only need the mutex for the final copy into the slab plus the packed[]
+ * flag flip, which hot_pack_slot_commit performs. Returns an owned buffer
+ * (free()'d by hot_pack_slot_commit) or NULL when packing is skipped or
+ * fails. Call outside state->mutex. */
+static unsigned char *hot_pack_slot_prepare(const V4ExpertRecord *record,
+                                            V4ExpertSlot *slot) {
+#ifndef COLI_FP4_ROWS16_KERNEL
+    (void)record; (void)slot; return NULL;
+#else
+    ColiTensorView gate, down, up;
+    fill_tensor_view(&gate, record, slot, V4_W1);
+    fill_tensor_view(&down, record, slot, V4_W2);
+    fill_tensor_view(&up, record, slot, V4_W3);
+    const ColiTensorView *views[3] = {&gate, &down, &up};
+    size_t total = 0;
+    for (int i = 0; i < 3; i++)
+        total += views[i]->data_bytes + views[i]->scale_bytes;
+    unsigned char *buf = malloc(total);
+    if (!buf) return NULL;
+    size_t off = 0;
+    for (int i = 0; i < 3; i++) {
+        unsigned char *packed_data = buf + off;
+        unsigned char *packed_scales = buf + off + views[i]->data_bytes;
+        if (coli_fp4_pack_rows16_v10(packed_data, packed_scales, views[i])) {
+            free(buf);
+            return NULL;
+        }
+        off += views[i]->data_bytes + views[i]->scale_bytes;
+    }
+    return buf;
+#endif
+}
+
+/* state->mutex held. Copies the prepared packed buffers into the slot slab
+ * and marks the slot packed, so the (slab layout, packed flag) pair stays
+ * consistent for any reader. Frees buf. No-op when buf is NULL. */
+static void hot_pack_slot_commit(V4HotPolicy *policy,
+                                 V4ExpertStoreState *state,
+                                 const V4ExpertRecord *record,
+                                 V4ExpertSlot *slot,
+                                 unsigned char *buf) {
+#ifndef COLI_FP4_ROWS16_KERNEL
+    (void)policy; (void)state; (void)record; (void)slot; (void)buf;
+#else
+    if (!buf) return;
+    ColiTensorView gate, down, up;
+    fill_tensor_view(&gate, record, slot, V4_W1);
+    fill_tensor_view(&down, record, slot, V4_W2);
+    fill_tensor_view(&up, record, slot, V4_W3);
+    const ColiTensorView *views[3] = {&gate, &down, &up};
+    size_t off = 0;
+    for (int i = 0; i < 3; i++) {
+        memcpy((void *)views[i]->data, buf + off, views[i]->data_bytes);
+        memcpy((void *)views[i]->scales, buf + off + views[i]->data_bytes,
+               views[i]->scale_bytes);
+        off += views[i]->data_bytes + views[i]->scale_bytes;
+    }
+    size_t slot_index = hot_slot_index(state, slot);
+    if (!policy->packed[slot_index]) {
+        policy->packed[slot_index] = 1;
+        policy->packed_slots++;
+    }
+    free(buf);
+#endif
+}
+
 static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
                              int layer) {
     if (!policy || policy->pin_count < 1) return;
@@ -6225,6 +6295,12 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     int read_result = v4_read_expert_record(state, record, slot);
     struct timespec disk_t1;
     clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+    /* Pack outside the mutex: the slot holds our reference so its slab is
+     * stable, and the heavy FP4 rows16 work must not serialise other
+     * fetches (issue #900). Committed under the lock below. */
+    unsigned char *v4_pack_buf = NULL;
+    if (hot_is_pinned(policy, key.layer, key.expert))
+        v4_pack_buf = hot_pack_slot_prepare(record, slot);
     pthread_mutex_lock(&state->mutex);
     state->disk_sec +=
         (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
@@ -6232,14 +6308,15 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     if (read_result) {
         slot->references = 0; slot->expert = -1;
         if (state->active_leases) state->active_leases--;
+        free(v4_pack_buf);
         pthread_mutex_unlock(&state->mutex);
         memset(view, 0, sizeof(*view));
         return -1;
     }
     slot->expert = key.expert; slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
-    if (hot_is_pinned(policy, key.layer, key.expert))
-        hot_pack_slot_locked(policy, state, record, slot);
+    hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
+    v4_pack_buf = NULL;
     memset(view, 0, sizeof(*view)); view->key = key;
     hot_fill_view(&view->gate, record, slot, V4_W1, policy, state);
     hot_fill_view(&view->down, record, slot, V4_W2, policy, state);
