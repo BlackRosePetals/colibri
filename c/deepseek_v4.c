@@ -7242,12 +7242,31 @@ static int final_hidden(float *output, const float *state,
         coli_tensor_load_f32(&norm, index, "norm.weight", error, error_size))
         return -1;
     int d = config->hidden_size, hc = config->hc_mult;
+    /* SEC (GHSA-9gjf): these global tensors are loaded by their declared numel
+     * with no shape reconciliation (unlike the per-layer tensors, which
+     * coli_v4_layer_validate checks against config). final_hidden then indexes
+     * hc_head_fn at [copy*hc*d + i], hc_head_base at [copy], hc_head_scale at
+     * [0], and norm over d — a truncated global tensor turns each into a heap
+     * OOB read whose stale bytes leak into the logits. Require enough elements
+     * before use; `hc` also bounds the pre[16] stack array below. Free-closed on
+     * mismatch (the old hc>16 early-return leaked all four tensors). */
+    if (hc < 1 || hc > 16 ||
+        function.count < (uint64_t)hc * hc * d ||
+        base.count < (uint64_t)hc ||
+        scale.count < 1 ||
+        norm.count < (uint64_t)d) {
+        coli_float_tensor_free(&norm);
+        coli_float_tensor_free(&scale);
+        coli_float_tensor_free(&base);
+        coli_float_tensor_free(&function);
+        if (error && error_size) snprintf(error, error_size, "global tensor shape mismatch");
+        return -1;
+    }
     int flattened = hc * d;
     float square = 0.0f;
     for (int i = 0; i < flattened; i++) square += state[i] * state[i];
     float inverse_rms = 1.0f / sqrtf(square / flattened + config->rms_norm_eps);
     float pre[16];
-    if (hc > 16) return -1;
     for (int copy = 0; copy < hc; copy++) {
         float mix = 0.0f;
         for (int i = 0; i < flattened; i++)
@@ -10633,6 +10652,21 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         json_free(root);
         free(arena);
         return set_error(error, error_size, "inconsistent DeepSeek-V4 config dimensions");
+    }
+    /* SEC (GHSA-7654): rope vs head/index-head cross relationship. The per-field
+     * checks above never compared qk_rope_head_dim against index_head_dim; when
+     * qk_rope_head_dim > index_head_dim the indexer/compressor computed the RoPE
+     * sub-vector pointer as `output + index_head_dim - qk_rope_head_dim` — a
+     * negative offset — and rotated/rounded bf16 to the left of the heap block.
+     * No weight tensor carries the rope dim, so a benign snapshot + a tampered
+     * config.json alone reaches this. */
+    if (config->head_dim < 1 || config->index_head_dim < 1 ||
+        config->qk_rope_head_dim < 2 || (config->qk_rope_head_dim % 2) != 0 ||
+        config->qk_rope_head_dim > config->head_dim ||
+        config->qk_rope_head_dim > config->index_head_dim) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size, "inconsistent DeepSeek-V4 rope/index head dims");
     }
     json_free(root);
     free(arena);
