@@ -3607,6 +3607,18 @@ double coli_v4_block_profile_now(void);
 void coli_v4_block_profile_add(int kind, double seconds);
 #endif
 
+/* #890: expert-forward compute accounting — defined in the expert-store unit,
+ * called here around the matmul, read per-turn in the serve loop. Always on
+ * (unlike the block profiler above), because the dashboard always needs it. */
+void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec);
+double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);
+
+static double v4_now_mono(void) {   /* #890 phase timing, same clock as disk_sec */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static int profiled_expert_load_start(ExpertLoadHandle *handle,
                                       ExpertLoadJob *job) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
@@ -3783,9 +3795,13 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active[slot] = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        if (!result) {
+            double mm0 = v4_now_mono();
+            result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -3816,9 +3832,13 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        if (!result) {
+            double mm0 = v4_now_mono();
+            result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -5359,6 +5379,9 @@ typedef struct {
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
     double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
+    double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
+                        * dashboard needs alongside disk_sec so it stops folding
+                        * everything into "other". One shared instance per store. */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
@@ -6485,6 +6508,27 @@ double coli_v4_expert_store_disk_sec(ColiExpertStore *store) {
     double value;
     pthread_mutex_lock(&state->mutex);
     value = state->disk_sec;
+    pthread_mutex_unlock(&state->mutex);
+    return value;
+}
+
+/* #890: the compute phase, accumulated by the MoE and read by the serve loop —
+ * the disk_sec twin. add is called from the block units around expert forward;
+ * the getter is read per-turn in v4_serve_one, same as disk_sec. */
+void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec) {
+    if (!store || !store->state || sec <= 0.0) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    state->matmul_sec += sec;
+    pthread_mutex_unlock(&state->mutex);
+}
+double coli_v4_expert_store_matmul_sec(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return 0.0;
+    state = store->state;
+    double value;
+    pthread_mutex_lock(&state->mutex);
+    value = state->matmul_sec;
     pthread_mutex_unlock(&state->mutex);
     return value;
 }
@@ -8795,6 +8839,7 @@ extern void coli_v4_expert_store_emit_tiers(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
 extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
 extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
+extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);   /* #890 */
 
 static void v4_hwinfo_emit(void) {
     char cpu[256] = "";
@@ -8836,13 +8881,15 @@ static void v4_hwinfo_emit(void) {
 }
 
 /* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
- * expert_matmul_s attention_s lm_head_s forwards — the V4 runtime has no
- * per-phase instrumentation beyond disk-read time, so the phase fields other
- * than expert_disk_s stay zero and the frontend folds them into "other". */
+ * expert_matmul_s attention_s lm_head_s forwards — disk (I/O) and matmul
+ * (expert-forward compute) are the two phases the runtime tracks per turn
+ * (#890); the frontend folds the remainder — attention, head, framing — into
+ * "other". Before this the matmul field was hardcoded 0 and every turn read as
+ * 100% other whenever the model sat warm in page cache. */
 static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
-                         double expert_disk_s) {
-    printf("PROF %.3f %d %d %.3f 0.000 0.000 0.000 0.000 0\n",
-           wall_s, prompt_tokens, completion, expert_disk_s);
+                         double expert_disk_s, double expert_matmul_s) {
+    printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
     fflush(stdout);
 }
 
@@ -8995,6 +9042,8 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         engine->experts->ops->stats(engine->experts, &before);
     double disk_before =
         engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
+    double matmul_before =
+        engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
     V4ServeStream stream = {session, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -9035,7 +9084,11 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     double expert_disk_s = engine->experts
         ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
         : 0.0;
-    v4_prof_emit(elapsed, stats.prompt_tokens, completion, expert_disk_s);
+    double expert_matmul_s = engine->experts
+        ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
+        : 0.0;
+    v4_prof_emit(elapsed, stats.prompt_tokens, completion,
+                 expert_disk_s, expert_matmul_s);
     coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);
@@ -9773,6 +9826,9 @@ typedef struct {
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
     double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
+    double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
+                        * dashboard needs alongside disk_sec so it stops folding
+                        * everything into "other". One shared instance per store. */
     uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
     uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
