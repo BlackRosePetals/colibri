@@ -187,6 +187,15 @@ class TemplateTest(unittest.TestCase):
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
 
+    def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
+        with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
+            self.assertEqual(generation_options({}, 8)[1], 0.25)
+            self.assertEqual(generation_options({"temperature": 0}, 8)[1], 0.0)
+        for invalid in ("malformed", "5", "-1", "nan", "1e999"):
+            with self.subTest(invalid=invalid):
+                with patch.dict("openai_server.os.environ", {"COLI_TEMP": invalid}):
+                    self.assertEqual(generation_options({}, 8)[1], 0.7)
+
     def test_validates_stop_sequences(self):
         self.assertEqual(generation_options({"stop": "END"}, 8)[4], ("END",))
         self.assertEqual(generation_options({"stop": ["ONE", "TWO"]}, 8)[4],
@@ -1463,6 +1472,31 @@ class AllowedHostsTest(unittest.TestCase):
     def test_untrusted_host_still_rejected_with_allowlist(self):
         server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
         self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+    def test_wildcard_accepts_any_host(self):
+        # #990: a Docker/LAN bind reached by an unpredictable IP. The wildcard is
+        # an explicit operator opt-out, so ANY host passes -- but loopback and a
+        # real name still work, i.e. it widens rather than replaces.
+        server = self._make_server(allowed_hosts=("*",))
+        port = server.server_port
+        self.assertEqual(self._get_models(port, "10.20.30.40:36873"), 200)
+        self.assertEqual(self._get_models(port, "colibri.example.com"), 200)
+        self.assertEqual(self._get_models(port, "localhost"), 200)
+
+    def test_rejection_message_names_the_host_and_the_fix(self):
+        server = self._make_server()
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            conn.putrequest("GET", "/v1/models", skip_host=True)
+            conn.putheader("Host", "myserver.lan:36873")
+            conn.endheaders()
+            resp = conn.getresponse()
+            body = resp.read().decode()
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 403)
+        self.assertIn("myserver.lan", body)          # the offending host, so the user can copy it
+        self.assertIn("--allowed-host", body)        # and how to fix it
 
 
 class ThinkingSplitUnitTest(unittest.TestCase):
