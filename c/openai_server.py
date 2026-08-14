@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 import uuid
+
+import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -380,42 +382,8 @@ def parse_tool_calls(reply, tools=None):
 #   <｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>
 # preceded by "\n\n". There is no standalone "tool" role: results are <tool_result>{content}
 # </tool_result> blocks merged into the following user turn. DSML = U+FF5C (｜) + ASCII.
-DSV4_DSML = "｜DSML｜"
-DSV4_EOS = "<\uff5cend\u2581of\u2581sentence\uff5c>"
-_DSV4_BLOCK_RE = re.compile(
-    r"<" + DSV4_DSML + r"tool_calls>(.*?)</" + DSV4_DSML + r"tool_calls>", re.DOTALL)
-_DSV4_INVOKE_RE = re.compile(
-    r"<" + DSV4_DSML + r"invoke name=\"(.*?)\">(.*?)</" + DSV4_DSML + r"invoke>", re.DOTALL)
-_DSV4_PARAM_RE = re.compile(
-    r"<" + DSV4_DSML + r"parameter name=\"(.*?)\" string=\"(true|false)\">(.*?)</" +
-    DSV4_DSML + r"parameter>", re.DOTALL)
-
-DSV4_TOOLS_TEMPLATE = """## Tools
-
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<{dsml}tool_calls>" block like the following:
-
-<{dsml}tool_calls>
-<{dsml}invoke name="$TOOL_NAME">
-<{dsml}parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</{dsml}parameter>
-...
-</{dsml}invoke>
-<{dsml}invoke name="$TOOL_NAME2">
-...
-</{dsml}invoke>
-</{dsml}tool_calls>
-
-String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
-
-If thinking_mode is enabled (triggered by {think_open}), you MUST output your complete reasoning inside {think_open}...{think_close} BEFORE any tool calls or final response.
-
-Otherwise, output directly after {think_close} with tool calls or final response.
-
-### Available Tool Schemas
-
-{tool_schemas}
-
-You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
-"""
+DSV4_DSML = v4_dsml.dsml_token
+DSV4_EOS = v4_dsml.eos_token
 
 # OpenAI-style reasoning_effort levels -> the V4 vocabulary (encoding_dsv4.py has only
 # low/high/max; `low` adds nothing). In thinking mode the level's prompt is prepended at the
@@ -438,75 +406,41 @@ DSV4_REASONING_EFFORT_PROMPTS = {
 
 
 def _dsv4_tools_block(tools):
-    """V4 tool-declaration block (byte-matches encoding_dsv4.py's TOOLS_TEMPLATE)."""
+    """V4 tool-declaration block, rendered by the vendored reference template."""
     schemas = []
     for tool in (tools or []):
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
-        clean = {k: v for k, v in fn.items() if k not in ("defer_loading", "strict")}
-        schemas.append(json.dumps(clean, ensure_ascii=False))
-    return DSV4_TOOLS_TEMPLATE.format(dsml=DSV4_DSML, think_open=THINK_OPEN,
-                                      think_close=THINK_CLOSE, tool_schemas="\n".join(schemas))
+        # Gateway-side scrub: OpenAI clients attach routing hints the model
+        # schema must not carry.
+        schemas.append({k: v for k, v in fn.items() if k not in ("defer_loading", "strict")})
+    return v4_dsml.render_tools(schemas)
 
 
 def _dsv4_tool_calls(tool_calls):
-    """Render OpenAI-format tool_calls into a V4 DSML block (incl. the leading \\n\\n)."""
-    calls = []
-    for tc in tool_calls:
-        fn = tc.get("function", tc) if isinstance(tc, dict) else {}
-        name = fn.get("name") or ""
-        args = fn.get("arguments")
-        try:
-            arguments = json.loads(args) if isinstance(args, str) else (args or {})
-        except (json.JSONDecodeError, TypeError, ValueError):
-            arguments = {}
-        params = []
-        for key, value in (arguments or {}).items():
-            is_str = "true" if isinstance(value, str) else "false"
-            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-            params.append('<%sparameter name="%s" string="%s">%s</%sparameter>'
-                          % (DSV4_DSML, key, is_str, text, DSV4_DSML))
-        calls.append('<%sinvoke name="%s">\n%s\n</%sinvoke>'
-                     % (DSV4_DSML, name, "\n".join(params), DSV4_DSML))
-    return '\n\n<%stool_calls>\n%s\n</%stool_calls>' % (DSV4_DSML, "\n".join(calls), DSV4_DSML)
+    """Render OpenAI-format tool_calls into a V4 DSML block (incl. the leading 
+
+)."""
+    return v4_dsml.render_tool_calls(tool_calls)
 
 
 def parse_dsv4_tool_calls(reply):
     """Parse DeepSeek V4 DSML tool calls out of one assistant reply.
 
-    Returns (content, tool_calls): the visible answer text with the DSML block (and any
-    thinking/eos markers) removed, plus OpenAI-format tool_calls. Tolerant of truncated
-    output: an incomplete block yields no calls rather than an error.
+    The block itself is decoded by the vendored reference parser (strict, so a
+    malformed block degrades to no calls instead of half-parsed arguments).
+    Gateway hardening on top: an incomplete block (e.g. length-truncated
+    output) is cut from the visible content so raw DSML syntax never leaks,
+    and any thinking/eos markers around the block are scrubbed.
     """
-    content, calls = reply, []
-    block = _DSV4_BLOCK_RE.search(reply)
-    if block:
-        content = reply[:block.start()].rstrip("\n")
-        for m in _DSV4_INVOKE_RE.finditer(block.group(1)):
-            name = m.group(1).strip()
-            if not name:
-                continue
-            arguments = {}
-            for p in _DSV4_PARAM_RE.finditer(m.group(2)):
-                key, is_str, value = p.group(1), p.group(2), p.group(3)
-                if is_str != "true":
-                    try:
-                        value = json.loads(value)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        pass
-                arguments[key] = value
-            calls.append({"id": "call_" + uuid.uuid4().hex[:24], "type": "function",
-                          "function": {"name": name,
-                                       "arguments": json.dumps(arguments, ensure_ascii=False)}})
-    else:
-        # No complete block (e.g. length-truncated output): drop everything from the first
-        # V4 tool marker so raw DSML syntax never leaks into the visible content.
-        cut = len(reply)
+    content, calls = v4_dsml.parse_completion_text(reply)
+    if not calls:
+        cut = len(content)
         for marker in ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke"):
-            pos = reply.find(marker)
-            if pos >= 0 and pos < cut:
+            pos = content.find(marker)
+            if 0 <= pos < cut:
                 cut = pos
-        if cut < len(reply):
-            content = reply[:cut]
+        if cut < len(content):
+            content = content[:cut]
     for marker in (DSV4_EOS, THINK_OPEN, THINK_CLOSE):
         content = content.replace(marker, "")
     return content.strip(), calls
@@ -1622,7 +1556,16 @@ def generation_options(body, limit):
         maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
-    temperature = 0.7 if temperature is None else temperature
+    if temperature is None:
+        # The launcher publishes --temp through COLI_TEMP (#509, #968). The
+        # gateway must use that value as its request default or the SERVE frame
+        # replaces it with 0.7 before any engine can honor the setting.
+        try:
+            temperature = float(os.environ.get("COLI_TEMP", "0.7"))
+            if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                temperature = 0.7
+        except ValueError:
+            temperature = 0.7
     top_p = 0.9 if top_p is None else top_p
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
         raise APIError(400, f"`{maximum_param}` must be a positive integer.", maximum_param)
