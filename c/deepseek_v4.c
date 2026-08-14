@@ -3140,6 +3140,13 @@ static int normalized_hc_pre(float *reduced, float *post, float *comb,
     return result;
 }
 
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
+                       const uint16_t *gate, const float *bias,
+                       const int *forced_indices, int experts, int dimension,
+                       int topk, float route_scale);
+#endif
+
 static int moe_token(float *output,
                      const ColiDeepSeekV4LayerWeights *weights,
                      const ColiDeepSeekV4Config *config,
@@ -3147,18 +3154,24 @@ static int moe_token(float *output,
     int d = config->hidden_size;
     int n = config->n_routed_experts;
     int topk = config->num_experts_per_tok;
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    float *gate = NULL;
+    const uint16_t *raw_gate = value(weights, "ffn.gate.weight", NULL);
+    int missing_gate = !raw_gate;
+#else
     size_t gate_count = (size_t)n * d;
     float *gate = malloc(gate_count * sizeof(*gate));
+    int missing_gate = !gate;
+#endif
     float *route_weights = malloc((size_t)topk * sizeof(*route_weights));
     int *indices = malloc((size_t)topk * sizeof(*indices));
     float *expert_output = malloc((size_t)d * sizeof(*expert_output));
     float *shared_output = malloc((size_t)d * sizeof(*shared_output));
-    if (!gate || !route_weights || !indices || !expert_output || !shared_output) {
+    if (missing_gate || !route_weights || !indices || !expert_output || !shared_output) {
         free(shared_output); free(expert_output); free(indices);
         free(route_weights); free(gate);
         return -1;
     }
-    decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
     const int64_t *table = value(weights, "ffn.gate.tid2eid", NULL);
     const float *bias = value(weights, "ffn.gate.bias", NULL);
     int result = token < 0 || token >= config->vocab_size;
@@ -3169,10 +3182,20 @@ static int moe_token(float *output,
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
     }
-    if (!result) result = coli_v4_route(
-        route_weights, indices, input, gate, bias,
+#ifndef COLI_V4_DISABLE_BF16_ROUTE
+    if (!result) result = coli_v4_route_bf16(
+        route_weights, indices, input, raw_gate, bias,
         weights->plan.uses_hash_router ? indices : NULL,
         n, d, topk, config->routed_scaling_factor);
+#else
+    if (!result) {
+        decode_bf16(gate, value(weights, "ffn.gate.weight", NULL), gate_count);
+        result = coli_v4_route(
+            route_weights, indices, input, gate, bias,
+            weights->plan.uses_hash_router ? indices : NULL,
+            n, d, topk, config->routed_scaling_factor);
+    }
+#endif
 
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
