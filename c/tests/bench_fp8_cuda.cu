@@ -2,14 +2,16 @@
  * rework (shared-LUT decode and, where the toolchain compiles it, the
  * cuda_fp8.h cvt decode), on the census expert shapes grouped as 8 experts x
  * S rows, S in {1,4,8,32}. Kernel time only (events around the launches, no
- * H2D/D2H): the question is achieved weight bandwidth against the device
- * roofline. GB/s is weight GOODPUT — unique weight bytes per launch over
- * time — so a kernel that re-reads weights per row shows the drop instead of
- * hiding it. One JSON object on stdout; progress and errors on stderr.
+ * H2D/D2H): the question is achieved weight bandwidth against the roofline.
+ * GB/s is weight GOODPUT — unique weight bytes per launch over time — so a
+ * kernel that re-reads weights per row shows the drop instead of hiding it.
+ * pct_peak uses the BENCH_PEAK_GBPS env override only (see device_mem_attrs
+ * for why no universal formula exists); -1 when unset. One JSON object on
+ * stdout; progress and errors on stderr.
  *
  * Build: make fp8-bench CUDA=1     (or: nvcc -O2 -std=c++17 -arch=native
  *        tests/bench_fp8_cuda.cu -o fp8_bench)
- * The GB10/remote wrapper is run_f8_bench.sh at the repo root.
+ * The GB10/remote wrapper is tools/run_f8_bench.sh.
  */
 #include <cstdio>
 #include <cstdlib>
@@ -32,26 +34,28 @@ static uint8_t rnd_e4m3(void){
     return b;
 }
 
-#define CK(x) do{ if((x)!=cudaSuccess){ \
-    fprintf(stderr,"[bench] %s failed: %s\n",#x,cudaGetErrorString(cudaGetLastError())); exit(1);} }while(0)
+#define CK(x) do{ cudaError_t _e=(x); if(_e!=cudaSuccess){ \
+    fprintf(stderr,"[bench] %s failed: %s\n",#x,cudaGetErrorString(_e)); exit(1);} }while(0)
 
-/* Roofline via device attributes, NOT cudaDeviceProp: CUDA 13 removed the
- * deprecated memoryClockRate/clockRate members from the struct, while the
- * attribute enums go back to CUDA 11. An error return OR a zero/negative
- * report (GB10 may legitimately report nothing for its LPDDR5X) yields 0.0,
- * which the caller turns into pct_peak=-1. Failed queries clear the sticky
- * error so they cannot poison the next CK. */
-static double device_peak_gbps(int dev){
-    int khz=0,bus=0;
+/* Memory attributes via cudaDeviceGetAttribute, NOT cudaDeviceProp: CUDA 13
+ * removed the deprecated memoryClockRate/clockRate members from the struct,
+ * while the attribute enums go back to CUDA 11. The attribute's SEMANTICS are
+ * device-inconsistent — command clock on HBM parts, but the EFFECTIVE
+ * 8533 MT/s rate on GB10, where a 2x DDR factor would double-count — so no
+ * universal peak formula exists. The roofline therefore comes ONLY from the
+ * BENCH_PEAK_GBPS env override (pct_peak=-1 without it); the raw attributes
+ * and the naive 2x-derived candidate are reported so the operator can judge.
+ * Failed queries zero the value and clear the sticky error. */
+static void device_mem_attrs(int dev,int *khz,int *bus){
+    *khz=0;*bus=0;
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
-    if(hipDeviceGetAttribute(&khz,hipDeviceAttributeMemoryClockRate,dev)!=hipSuccess) khz=0;
-    if(hipDeviceGetAttribute(&bus,hipDeviceAttributeMemoryBusWidth,dev)!=hipSuccess) bus=0;
+    if(hipDeviceGetAttribute(khz,hipDeviceAttributeMemoryClockRate,dev)!=hipSuccess) *khz=0;
+    if(hipDeviceGetAttribute(bus,hipDeviceAttributeMemoryBusWidth,dev)!=hipSuccess) *bus=0;
 #else
-    if(cudaDeviceGetAttribute(&khz,cudaDevAttrMemoryClockRate,dev)!=cudaSuccess) khz=0;
-    if(cudaDeviceGetAttribute(&bus,cudaDevAttrGlobalMemoryBusWidth,dev)!=cudaSuccess) bus=0;
+    if(cudaDeviceGetAttribute(khz,cudaDevAttrMemoryClockRate,dev)!=cudaSuccess) *khz=0;
+    if(cudaDeviceGetAttribute(bus,cudaDevAttrGlobalMemoryBusWidth,dev)!=cudaSuccess) *bus=0;
 #endif
     (void)cudaGetLastError();
-    return (khz>0&&bus>0) ? 2.0*khz*1e3*(bus/8.0)/1e9 : 0.0;
 }
 
 static const int E=8, D=2048, I=6144;               /* census: 8 experts, GLM-5.2 dims */
@@ -84,9 +88,14 @@ static void cvt_down(GroupDesc *d,float *g,float *u,float *x,float *y,int S){
 int main(void){
     srand(5);
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop,0));
-    double peak = device_peak_gbps(0);
-    fprintf(stderr,"[bench] %s sm_%d%d, reported peak %.1f GB/s\n",
-            prop.name,prop.major,prop.minor,peak);
+    int khz=0,bus=0; device_mem_attrs(0,&khz,&bus);
+    double cand=(khz>0&&bus>0)?2.0*khz*1e3*(bus/8.0)/1e9:0.0;
+    double peak=0.0; const char *pe=getenv("BENCH_PEAK_GBPS");
+    if(pe&&*pe){ double v=atof(pe); if(v>0) peak=v; }
+    fprintf(stderr,"[bench] %s sm_%d%d, mem attrs %d kHz x %d bit "
+            "(2x-derived candidate %.1f GB/s), peak %s%.1f GB/s\n",
+            prop.name,prop.major,prop.minor,khz,bus,cand,
+            peak>0?"(env) ":"(unset) ",peak);
 
     float lut[256]; for(int i=0;i<256;i++) lut[i]=e4m3_ref((uint8_t)i);
     CK(cudaMemcpyToSymbol(c_e4m3,lut,sizeof(lut)));
@@ -136,8 +145,11 @@ int main(void){
     };
     int svals[4]={1,4,8,32};
     printf("{\"device\":\"%s\",\"cc\":\"sm_%d%d\",\"peak_gbps\":%.1f,"
+           "\"peak_source\":\"%s\",\"mem_clock_khz\":%d,\"mem_bus_bits\":%d,"
+           "\"ddr2x_candidate_gbps\":%.1f,"
            "\"experts\":%d,\"D\":%d,\"I\":%d,\"results\":[",
-           prop.name,prop.major,prop.minor,peak,E,D,I);
+           prop.name,prop.major,prop.minor,peak,peak>0?"env":"unset",
+           khz,bus,cand,E,D,I);
     int first=1;
     for(size_t k=0;k<sizeof(cfg)/sizeof(cfg[0]);k++){
         for(int si=0;si<4;si++){
