@@ -108,7 +108,9 @@ __global__ static void f8_sweep_kernel(float *out){
 static int sweep_check(const char *name,const float *got,const float *want){
     int bad=0;
     for(int i=0;i<256;i++){
-        if((i&0x7F)==0x7F){ if(!(isnan(got[i])&&isnan(want[i]))) bad++; }
+        /* std:: qualification on host math: ROCm's __clang_hip_cmath.h hijacks
+         * unqualified isnan in host code and its float overload fails. */
+        if((i&0x7F)==0x7F){ if(!(std::isnan(got[i])&&std::isnan(want[i]))) bad++; }
         else if(memcmp(&got[i],&want[i],4)) bad++;
     }
     printf("decode sweep [%s]: %d mismatches\n",name,bad);
@@ -444,8 +446,8 @@ int main(void){
             cpu_expert_chain(g,u,d,gs,us,ds,D,I,x+(size_t)s*D,want+(size_t)s*D,h);
         int nbad=0;
         for(size_t i=0;i<(size_t)total*D;i++)
-            if(isnan(y[i])!=isnan(want[i])) nbad++;
-        for(int s=0;s<total;s++) if(!isnan(y[(size_t)s*D+3])) nbad++;
+            if(std::isnan(y[i])!=std::isnan(want[i])) nbad++;
+        for(int s=0;s<total;s++) if(!std::isnan(y[(size_t)s*D+3])) nbad++;
         printf("NaN injection (0x7F in down row 3): %d policy mismatches\n",nbad);
         if(nbad){ printf("FAIL\n"); return 1; }
         coli_cuda_tensor_free(tg);coli_cuda_tensor_free(tu);coli_cuda_tensor_free(td);
