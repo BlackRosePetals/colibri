@@ -79,6 +79,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))   # importa glm_fp8_emi
 from glm_fp8_emit import (fp8_block_quantize, fp8_block_dequantize, keep_f32,
                           save_fp8_safetensors, unfuse_experts)
 
+# Codec per le fixture quantizzate (fmt=6/fmt=4). Importati a livello di modulo: sono
+# numpy-only (niente torch/transformers) e safetensors e' gia' richiesto da OGNI ramo di
+# save (default bf16 incluso), quindi non toccano il path default dependency-free.
+# EN: codecs for the quantized fixtures. Imported at module scope: numpy-only (no
+# torch/transformers) and safetensors is already required by every save path, so they
+# leave the dependency-free default path untouched.
+import numpy as np
+import iq3_pack
+from convert_fp8_to_int4 import quant_int4_grouped
+from convert_fmt4_to_fmt2 import dequant_fmt4
+from safetensors.torch import save_file
+
+FMT6 = 6                    # container E8/IQ3 con rotazione (98B per super-blocco di 256 pesi)
+FMT4 = 4                    # int4 grouped, braccio di controllo senza rotazione
+FMT6_SCALE_TAG = 6.0        # il singolo float del companion .qs che il motore legge come tag fmt=6
+GROUPED_INT4_BITS = 4       # bit depth del braccio int4 grouped
+GROUPED_INT4_GROUP = 64     # group size (input dim per scala) del braccio int4 grouped
+# EN: FMT6 = rotation-bearing E8/IQ3 container; FMT4 = grouped int4 control; FMT6_SCALE_TAG
+# EN: = single .qs float the engine reads to detect fmt=6; grouped int4 uses 4 bits / gs=64.
+
+def quantize_routed(w, fmt):
+    """Quantizza una matrice di pesi routed [O, I] nel container fmt=6 (E8/IQ3) o fmt=4
+    (grouped int4). Ritorna (packed_or_q, scale_or_none): per fmt=6 i byte E8 impacchettati
+    (scale None, il codec non ha scale esterne); per fmt=4 i nibble U8 appiattiti + le scale
+    f32. UNICO encoder condiviso da round-trip e save, cosi' i due path non possono divergere.
+    EN: quantize routed weight matrix w [O,I] to fmt=6 (E8/IQ3) or fmt=4 (grouped int4).
+    Returns (packed_or_q, scale_or_none): fmt=6 -> packed E8 bytes (scale None); fmt=4 -> flat
+    U8 nibbles + f32 scales. Single shared encoder for round-trip and save, so they can't drift."""
+    if fmt == FMT6:
+        return iq3_pack.encode(iq3_pack.rotate_rows(w)), None
+    q, s = quant_int4_grouped(w, GROUPED_INT4_BITS, GROUPED_INT4_GROUP)
+    return q, s
+
 ap = argparse.ArgumentParser()
 _quant = ap.add_mutually_exclusive_group()
 _quant.add_argument("--fp8", action="store_true",
@@ -95,6 +128,8 @@ _quant.add_argument("--fmt4", action="store_true",
                      "EN: like --fmt6 but fmt=4 (grouped int4, no rotation) — the control arm")
 args = ap.parse_args()
 
+fmt = FMT6 if args.fmt6 else FMT4 if args.fmt4 else 0
+
 torch.manual_seed(1234)
 
 # E8/IQ3 (fmt=6) e il suo controllo int4-grouped (fmt=4) richiedono che le
@@ -106,7 +141,7 @@ torch.manual_seed(1234)
 # EN: fmt=6's E8 super-block (256 weights/98B) forces routed-expert contraction dims
 # to be multiples of 256; the quantized fixtures use hidden=256/moe_inter=256 while
 # the f32 default is unchanged at 128/32.
-if args.fmt6 or args.fmt4:
+if fmt:
     _HIDDEN, _MOE_INTER = 256, 256
 else:
     _HIDDEN, _MOE_INTER = 128, 32
@@ -177,7 +212,7 @@ if args.fp8:
 # ref (same pattern as --fp8), so the ref matches exactly what the engine decodes.
 # Quantization is per-row on the last (contraction) dim, so fused and unfused encodings
 # are identical.
-if args.fmt6 or args.fmt4:
+if fmt:
     # Cattura i pesi ORIGINALI (pre-round-trip) PRIMA di toccare il modello: servono
     # per il SAVE — i pesi impacchettati devono venire dai pesi originali, non da quelli
     # gia' dequantizzati (encode(decode(x)) != encode(x): il codec E8 non e' idempotente
@@ -186,21 +221,17 @@ if args.fmt6 or args.fmt4:
     # pack the ORIGINAL weights (encode∘decode is not idempotent), and state_dict()
     # aliases the live parameters.
     sd_orig = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    import iq3_pack
-    from convert_fp8_to_int4 import quant_int4_grouped
-    from convert_fmt4_to_fmt2 import dequant_fmt4
     with torch.no_grad():
         for n, p in model.named_parameters():
             if ".mlp.experts." not in n or not n.endswith(("gate_up_proj", "down_proj")):
                 continue
             shp = tuple(p.shape); I = shp[-1]
             w = p.detach().float().numpy().reshape(-1, I)
-            if args.fmt6:
-                packed = iq3_pack.encode(iq3_pack.rotate_rows(w))
+            packed, scale = quantize_routed(w, fmt)
+            if fmt == FMT6:
                 w_eff = iq3_pack.unrotate_rows(iq3_pack.decode(packed, I))
             else:
-                q, s = quant_int4_grouped(w, 4, 64)
-                w_eff = dequant_fmt4(q.reshape(-1, (I + 1) // 2), s, w.shape[0], I)
+                w_eff = dequant_fmt4(packed.reshape(-1, (I + 1) // 2), scale, w.shape[0], I)
             p.copy_(torch.from_numpy(w_eff.reshape(shp)))
 
 print("=== state_dict tensors (names used by the C loader) ===")
@@ -229,7 +260,7 @@ print("tf_pred:", tf_pred)
 sd = model.state_dict()
 unfuse_experts(sd)
 
-if args.fmt6 or args.fmt4:
+if fmt:
     # Salva SOLO gli expert routed quantizzati (fmt=6 o fmt=4 + .qs); shared/dense/attn/
     # norme restano f32. I pesi impacchettati provengono dai pesi ORIGINALI (sd_orig,
     # non fusi), non da quelli gia' dequantizzati, cosi' il motore decodifica ESATTAMENTE
@@ -237,29 +268,23 @@ if args.fmt6 or args.fmt4:
     # routed experts (fmt=6 or fmt=4 + .qs); everything else stays f32. Packed weights
     # come from the ORIGINAL (unfused) weights, not the dequantized ones, so the engine
     # decodes exactly the weights the round-trip used for the reference.
-    outdir = "glm_tiny_fmt6" if args.fmt6 else "glm_tiny_fmt4"
-    fmt = 6 if args.fmt6 else 4
+    outdir = "glm_tiny_fmt6" if fmt == FMT6 else "glm_tiny_fmt4"
     Path(outdir).mkdir(parents=True, exist_ok=True)
-    import numpy as np
-    import iq3_pack
-    from convert_fp8_to_int4 import quant_int4_grouped
     sd = unfuse_experts(sd_orig)
     out = {}
     for name, t in sd.items():
         if ".mlp.experts." in name and name.endswith(
                 (".gate_proj.weight", ".up_proj.weight", ".down_proj.weight")):
             w = t.detach().float().numpy()
-            if fmt == 6:
-                packed = iq3_pack.encode(iq3_pack.rotate_rows(w))
+            packed, scale = quantize_routed(w, fmt)
+            if fmt == FMT6:
                 out[name] = torch.from_numpy(np.ascontiguousarray(packed.reshape(-1)))
-                out[name + ".qs"] = torch.tensor([6.0], dtype=torch.float32)
+                out[name + ".qs"] = torch.tensor([FMT6_SCALE_TAG], dtype=torch.float32)
             else:
-                q, s = quant_int4_grouped(w, 4, 64)
-                out[name] = torch.from_numpy(q)
-                out[name + ".qs"] = torch.from_numpy(s)
+                out[name] = torch.from_numpy(packed)
+                out[name + ".qs"] = torch.from_numpy(scale)
         else:
             out[name] = t.detach().contiguous()
-    from safetensors.torch import save_file
     save_file(out, f"{outdir}/model.safetensors")
     json.dump(cfg.to_dict(), open(f"{outdir}/config.json", "w"))
     json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred},
@@ -273,7 +298,6 @@ else:
         print(f"\nsaved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
               f"-> glm_tiny/model.safetensors")
     else:
-        from safetensors.torch import save_file
         save_file({k: v.contiguous() for k, v in sd.items()}, "glm_tiny/model.safetensors")
     json.dump(cfg.to_dict(), open("glm_tiny/config.json", "w"))
     json.dump({"prompt_ids": prompt, "full_ids": full, "tf_pred": tf_pred}, open("ref_glm.json", "w"))
