@@ -35,8 +35,11 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
-#include <cuda_runtime.h>
 
+/* No direct <cuda_runtime.h>: the backend include below pulls
+ * backend_gpu_compat.h, which supplies the runtime surface for BOTH vendors
+ * (a direct include breaks the hipcc build the same way test_backend_cuda.cu
+ * avoids by including only backend headers). */
 #include "../backend_cuda.cu"
 
 #ifdef _WIN32

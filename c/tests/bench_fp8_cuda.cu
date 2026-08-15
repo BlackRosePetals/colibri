@@ -18,8 +18,9 @@
 #include <cstring>
 #include <cmath>
 #include <cstdint>
-#include <cuda_runtime.h>
 
+/* No direct <cuda_runtime.h>: backend_gpu_compat.h (via the backend include)
+ * supplies the runtime surface for both vendors. */
 #include "../backend_cuda.cu"
 
 static float e4m3_ref(uint8_t b){
