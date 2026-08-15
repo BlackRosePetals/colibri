@@ -35,6 +35,25 @@ static uint8_t rnd_e4m3(void){
 #define CK(x) do{ if((x)!=cudaSuccess){ \
     fprintf(stderr,"[bench] %s failed: %s\n",#x,cudaGetErrorString(cudaGetLastError())); exit(1);} }while(0)
 
+/* Roofline via device attributes, NOT cudaDeviceProp: CUDA 13 removed the
+ * deprecated memoryClockRate/clockRate members from the struct, while the
+ * attribute enums go back to CUDA 11. An error return OR a zero/negative
+ * report (GB10 may legitimately report nothing for its LPDDR5X) yields 0.0,
+ * which the caller turns into pct_peak=-1. Failed queries clear the sticky
+ * error so they cannot poison the next CK. */
+static double device_peak_gbps(int dev){
+    int khz=0,bus=0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+    if(hipDeviceGetAttribute(&khz,hipDeviceAttributeMemoryClockRate,dev)!=hipSuccess) khz=0;
+    if(hipDeviceGetAttribute(&bus,hipDeviceAttributeMemoryBusWidth,dev)!=hipSuccess) bus=0;
+#else
+    if(cudaDeviceGetAttribute(&khz,cudaDevAttrMemoryClockRate,dev)!=cudaSuccess) khz=0;
+    if(cudaDeviceGetAttribute(&bus,cudaDevAttrGlobalMemoryBusWidth,dev)!=cudaSuccess) bus=0;
+#endif
+    (void)cudaGetLastError();
+    return (khz>0&&bus>0) ? 2.0*khz*1e3*(bus/8.0)/1e9 : 0.0;
+}
+
 static const int E=8, D=2048, I=6144;               /* census: 8 experts, GLM-5.2 dims */
 
 typedef void (*launch_fn)(GroupDesc*,float*,float*,float*,float*,int);
@@ -65,8 +84,7 @@ static void cvt_down(GroupDesc *d,float *g,float *u,float *x,float *y,int S){
 int main(void){
     srand(5);
     cudaDeviceProp prop; CK(cudaGetDeviceProperties(&prop,0));
-    double peak = prop.memoryClockRate>0
-        ? 2.0*prop.memoryClockRate*1e3*(prop.memoryBusWidth/8.0)/1e9 : 0.0;
+    double peak = device_peak_gbps(0);
     fprintf(stderr,"[bench] %s sm_%d%d, reported peak %.1f GB/s\n",
             prop.name,prop.major,prop.minor,peak);
 
