@@ -211,8 +211,12 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_120,code=sm_120 \
                -gencode arch=compute_120,code=compute_120
 NVCC_RELEASE := $(shell "$(NVCC)" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+# The empty-check makes the fail-closed promise real: with no parsable
+# version the sort below would compare 12.9 against itself and pass.
+ifneq ($(strip $(NVCC_RELEASE)),)
 ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1),12.9)
 CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
+endif
 endif
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
