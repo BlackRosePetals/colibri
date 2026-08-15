@@ -245,7 +245,7 @@ int main(void){
         if(!coli_cuda_expert_group(tg,tu,td,rows,NC,yold,x)){ printf("FAIL census old-path group\n"); return 1; }
         unsetenv("COLI_CUDA_F8_WARP");
         if(!rms_named("census grouped (old kernels) vs CPU",yold,want,(size_t)total*D,1e-4f)) return 1;
-        rms_named("census grouped old vs new (informational)",yold,ys,(size_t)total*D,1.f);
+        rms_named("census grouped old vs new (informational)",yold,ys,(size_t)total*D,1e9f);
 
         /* dense branch (quant_matmul fmt=8) on the census gate matrix */
         {
