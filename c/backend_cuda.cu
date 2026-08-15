@@ -306,16 +306,51 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
             for (int k=0;k<n;k++) sum += xs[off+k]*w[k];
         }
     } else if (fmt == 7) {
-        /* MXFP4: one ue8m0 exponent per 32 columns. Threads stride over columns
-         * and pick up the group exponent as they cross a boundary -- the same
-         * accumulation order as the CPU scalar path, so a mismatch means the
-         * decode is wrong, not the summation. */
+        /* MXFP4: one ue8m0 exponent per 32 columns. The SCALAR CPU reference
+         * (quant.h matmul_mxfp4's scalar loop -- its AVX2 sibling applies the
+         * scale per 8-lane FMA instead and disagrees with it at s=255)
+         * accumulates each 32-group UNSCALED and multiplies the group
+         * subtotal by the scale once. For scales in [0,254] -- every value a
+         * real checkpoint contains -- the scale is a finite power of two,
+         * scaling each element or the subtotal is exact either way, so
+         * threads stride over columns exactly as before and outputs stay
+         * bit-identical with prior builds. s=255 decodes to +inf (the
+         * documented edge), and there the application point is visible:
+         * per-element scaling turns every zero product into 0*inf = NaN,
+         * where the scalar reference's finite-subtotal-times-inf keeps the
+         * group's sign. Rows carrying a 255 scale byte therefore take the
+         * per-group path mirroring that scalar loop; the row's +-inf/NaN
+         * classification does not depend on summation order unless several
+         * large-finite (s~254) group results overflow only in aggregate --
+         * out-of-domain either way -- so the tree reduce below needs no
+         * change. */
         const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
         const uint8_t *scl = reinterpret_cast<const uint8_t *>(scales) + (size_t)o * ng;
-        for (int i = threadIdx.x; i < I; i += blockDim.x) {
-            int g = i >> 5;
-            if (g >= ng) g = ng - 1;
-            sum += xs[i] * mx4_weight_at(wrow, i) * mx4_scale_dev(scl[g]);
+        __shared__ int scale_inf;
+        if (!threadIdx.x) scale_inf = 0;
+        __syncthreads();
+        for (int g = threadIdx.x; g < ng; g += blockDim.x)
+            if (scl[g] == 255) scale_inf = 1;
+        __syncthreads();
+        if (!scale_inf) {
+            for (int i = threadIdx.x; i < I; i += blockDim.x) {
+                int g = i >> 5;
+                if (g >= ng) g = ng - 1;
+                sum += xs[i] * mx4_weight_at(wrow, i) * mx4_scale_dev(scl[g]);
+            }
+        } else {
+            for (int g = threadIdx.x; g < ng; g += blockDim.x) {
+                /* same element->group mapping as the clamp above: the last
+                 * group takes every remaining column, a group past the data
+                 * contributes nothing */
+                int base = g << 5, end = base + 32;
+                if (g == ng - 1 || end > I) end = I;
+                if (base >= end) continue;
+                float ga = 0.0f;
+                for (int i = base; i < end; i++)
+                    ga += xs[i] * mx4_weight_at(wrow, i);
+                sum += ga * mx4_scale_dev(scl[g]);
+            }
         }
     } else if (fmt == 4) {
         /* Grouped int4: one f32 scale per gs elements along I (ng groups per row).
