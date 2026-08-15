@@ -226,6 +226,7 @@ See [docs/vulkan.md](vulkan.md). On multi-core boxes also set `COLI_NO_OMP_TUNE=
 | `COLI_CUDA_ASYNC` | on | `=0` forces synchronous `cudaMemcpy` instead of async + pinned host staging. |
 | `COLI_CUDA_DUAL_PROJ` | on | `=0` issues gate+up as two separate launches instead of one fused `grouped_hidden_w4_dual`. |
 | `COLI_CUDA_W4_PACKED` | on | `=0` disables the grouped packed-int4 path. |
+| `COLI_CUDA_F8_WARP` | on | fmt=8 (fp8-e4m3) kernel selector. Default: warp-per-row kernels with shared-memory LUT decode and reference-mirroring accumulation (f32 per 128-block, double across blocks, like the CPU `matmul_fp8`). `=0` falls back to the original per-`(o,s)` kernels; `=2` decodes through the sm_89+ hardware `cvt` path (CUDA-only, experimental until the 256-value sweep certifies it on the target silicon). |
 | `COLI_CUDA_TC_INT4` | off | `=1` uses the W4A4 WMMA Tensor Core path (when all expert tensors are int4 and dims divide). |
 | `COLI_CUDA_TC_MIN_ROWS` | `8` | Min rows-per-expert to engage the W4A4 Tensor Core path. |
 | `COLI_CUDA_TC_W4A16` | off | `=1` uses the lossless W4A16 Tensor Core path (compute capability ≥7). |
