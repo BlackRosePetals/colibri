@@ -2809,7 +2809,7 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
             v=0; if(cluster_u32(cfd,&v,1)) break; v=n; if(cluster_u32(cfd,&v,1)) break;
             ESlot *slot=&cache[layer];
             for(uint32_t j=0;j<n;j++){
-                if(slot->eid!=items[j].eid){
+                if(slot->eid!=items[j].eid || !slot->slab){
                     char miss[288];
                     if(worker_expert_missing_tensor(&m,(int)layer,items[j].eid,miss,sizeof(miss))){
                         fprintf(stderr,"[CLUSTER] worker cannot resolve expert tensor %s (layer %d, expert %d)\n",
