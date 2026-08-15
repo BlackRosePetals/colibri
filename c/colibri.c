@@ -1245,12 +1245,14 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
  * SEMPRE — e' la forma CANONICA, pura funzione del fmt del down-tensor. Perche' resta
  * byte-identica al vecchio inline: (a) i fallback device-lost Vulkan ricaricano solo
  * expert che erano in registry (vk_reg_at), e vk_registry_fill ammette solo fmt 2/4/5 —
- * li' d->fmt!=6 e la rotazione e' un no-op; (b) l'oracolo e ogni modello single-format
- * (l'output di una conversione normale) non hanno mai un expert fmt=6 accanto a fmt 2/4/5.
+ * li' d->fmt!=6 e la rotazione e' un no-op; (b) l'oracolo e' single-format, e una
+ * conversione normale single-pass produce un modello single-format: le due copie che
+ * POSSONO vedere fmt=6 lo fanno solo su un container mixed-format, che il tooling
+ * normale non emette mai.
  * Le DUE copie che saltavano la rotazione e potevano davvero vedere fmt=6 — la CPU-share
- * del blocco Vulkan e il fallback CUDA — ora seguono il canonico: su un container
- * mixed-format (fmt per-tensor da qt_resolve_fmt, nessuna uniformita' tra expert, vedi il
- * commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
+ * del blocco Vulkan e il fallback CUDA early-issued — ora seguono il canonico: su un
+ * container mixed-format (fmt per-tensor da qt_resolve_fmt, nessuna uniformita' tra
+ * expert, vedi il commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
 static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, QT *u, QT *d, int nr, int I){
     expert_gate_up(gg,uu,xg,g,u,nr);
     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
