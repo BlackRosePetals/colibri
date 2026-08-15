@@ -465,6 +465,31 @@ int main(void){
         coli_cuda_tensor_free(t);
     }
 
+    /* ---- dense accumulation-convention bite ---------------------------------
+     * The dense variant of the grouped bite, through the real entry point
+     * (coli_cuda_matmul -> quant_matmul_f8w with the suite's pinned mode):
+     * block partials x scales staged as {1.0, 2^-25, -1.0}, result asserted
+     * BITWISE == 2^-25. In quant_matmul_f8w the three blocks land on three
+     * warps, so a double->float degradation of either the per-warp
+     * accumulator or the cross-warp dsum sum absorbs the 2^-25 into 1.0 and
+     * cancels to exactly 0. (The denormal test above is single-block and
+     * cannot see this; the census checks are RMS-level.) */
+    {
+        uint8_t w[384]={}; float sc[3]={1.f,ldexpf(1.f,-25),-1.f};
+        float x[384]={},y[1]={-1.f};
+        w[0]=0x38; w[128]=0x38; w[256]=0x38;          /* e4m3 1.0 in each block */
+        x[0]=1.f; x[128]=1.f; x[256]=1.f;
+        ColiCudaTensor *t=nullptr;
+        if(!coli_cuda_matmul(&t,y,x,w,sc,8,1,384,1,0,0)){ printf("FAIL dense accum-bite matmul\n"); return 1; }
+        float expect=ldexpf(1.f,-25);
+        if(memcmp(&y[0],&expect,4)){
+            printf("FAIL dense accumulation convention: got %a want %a\n",y[0],expect);
+            return 1;
+        }
+        printf("dense accumulation convention: bitwise 2^-25\n");
+        coli_cuda_tensor_free(t);
+    }
+
     coli_cuda_shutdown();
     printf("OK\n"); return 0;
 }
