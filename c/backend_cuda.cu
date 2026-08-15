@@ -2,6 +2,16 @@
 
 #include "backend_gpu_compat.h"
 
+/* Optional fmt=8 decode candidate (COLI_CUDA_F8_WARP=2): cuda_fp8.h maps
+ * __nv_cvt_fp8_to_halfraw to an sm_89+ cvt instruction, with a bit-manip
+ * fallback below 890. CUDA-only; the HIP build keeps the LUT decode. */
+#if !(defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)) && defined(CUDART_VERSION) && CUDART_VERSION >= 11080
+#include <cuda_fp8.h>
+#define COLI_F8_HWCVT 1
+#else
+#define COLI_F8_HWCVT 0
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -284,6 +294,84 @@ __global__ static void offset_to_signed_s4(uint8_t *q,size_t n){
     size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;if(i<n)q[i]^=0x88;
 }
 
+/* ---- fmt=8 (fp8-e4m3) warp decode/accumulate helpers -----------------------
+ * The fmt=8 dot products are compared against the CPU reference (quant.h
+ * matmul_fp8) by the cross-tier parity tests, so this TU must never be built
+ * with fast-math: nvcc's --use_fast_math implies -ftz=true, which flushes the
+ * scale*subnormal contributions the denormal-scale test pins down. (-ftz has
+ * no macro of its own to test; the Makefile pins -ftz=false on the nvcc line.) */
+#if defined(__USE_FAST_MATH__) || defined(__FAST_MATH__)
+#error "backend_cuda.cu: fmt=8 kernels forbid fast-math builds (FTZ breaks CPU parity)"
+#endif
+
+/* Fixed-order 5-shuffle reduce over a 32-lane logical warp. Width pinned to 32
+ * so a HIP wave64 device does not fold two output rows into one reduction. */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define f8_shfl_down(v,o) __shfl_down((v),(o),32)
+#else
+#define f8_shfl_down(v,o) __shfl_down_sync(0xffffffffu,(v),(o),32)
+#endif
+
+/* Decode one e4m3 byte. Default: a __shared__ copy of c_e4m3 — per-thread
+ * data-dependent indices are the __constant__ cache's documented worst case
+ * (accesses to different addresses within a warp serialize), while shared
+ * memory takes them at full rate. HW=1 (COLI_CUDA_F8_WARP=2, CUDA-only): the
+ * cuda_fp8.h route. Every finite e4m3 value is exactly representable in f16,
+ * so the two paths should agree bit for bit — but the on-device 256-value
+ * sweep is the authority, and the LUT stays the default until the sweep
+ * certifies the cvt path on the target silicon. */
+template<int HW>
+__device__ __forceinline__ float f8_dec(const float *slut, uint8_t b){
+#if COLI_F8_HWCVT
+    if (HW) return __half2float(__half(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3)));
+#endif
+    return slut[b];
+}
+
+/* One 128-column scale block, one warp: 32 lanes x 4 bytes is the exact
+ * FP8_BLOCK fit. Weights are decoded once and reused across ns activation
+ * rows (weights are the traffic; activations come from cache), then each
+ * row's per-lane products are tree-reduced in fixed order — the block partial
+ * lands in LANE 0 of gp[]/up_[] (other lanes hold partials). vec: full blocks
+ * go through uchar4/float4 loads; tails and unaligned rows take the guarded
+ * byte path. DUAL folds a second weight row (gate+up) against the same
+ * activations without re-reading x. The per-row arithmetic never depends on
+ * ns or s, so S-tiling cannot reorder a dot (B5). */
+template<int HW,int DUAL>
+__device__ __forceinline__ void f8w_block(const float *slut,const uint8_t *gr,
+        const uint8_t *ur,const float *xs,int xstride,int ns,int base,int len,
+        int vec,float *gp,float *up_){
+    int lane=threadIdx.x&31,i0=base+lane*4,full=vec&&len==128;
+    float gw[4],uw[4]={0,0,0,0};
+    if(full){
+        uchar4 q=*(const uchar4*)(gr+i0);
+        gw[0]=f8_dec<HW>(slut,q.x);gw[1]=f8_dec<HW>(slut,q.y);
+        gw[2]=f8_dec<HW>(slut,q.z);gw[3]=f8_dec<HW>(slut,q.w);
+        if(DUAL){uchar4 r=*(const uchar4*)(ur+i0);
+            uw[0]=f8_dec<HW>(slut,r.x);uw[1]=f8_dec<HW>(slut,r.y);
+            uw[2]=f8_dec<HW>(slut,r.z);uw[3]=f8_dec<HW>(slut,r.w);}
+    }else for(int k=0;k<4;k++){
+        int in=i0+k<base+len;
+        gw[k]=in?f8_dec<HW>(slut,gr[i0+k]):0.f;
+        if(DUAL)uw[k]=in?f8_dec<HW>(slut,ur[i0+k]):0.f;
+    }
+    for(int s=0;s<ns;s++){
+        const float *xr=xs+(size_t)s*xstride;
+        float g,u=0;
+        if(full){
+            float4 xf=*(const float4*)(xr+i0);
+            g=xf.x*gw[0]+xf.y*gw[1]+xf.z*gw[2]+xf.w*gw[3];
+            if(DUAL)u=xf.x*uw[0]+xf.y*uw[1]+xf.z*uw[2]+xf.w*uw[3];
+        }else{
+            g=0;
+            for(int k=0;k<4;k++)if(i0+k<base+len){float xv=xr[i0+k];
+                g+=xv*gw[k];if(DUAL)u+=xv*uw[k];}
+        }
+        for(int off=16;off;off>>=1){g+=f8_shfl_down(g,off);if(DUAL)u+=f8_shfl_down(u,off);}
+        gp[s]=g;if(DUAL)up_[s]=u;
+    }
+}
+
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
                                     const float *scales, int fmt, int S, int I, int O,
                                     size_t rb, int gs, int ng) {
@@ -333,12 +421,37 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * scale per 128x128 BLOCK of [O,I] — scales[(o/128)*ceil(I/128) + i/128].
          * The block edge is a fixed property of the format (FP8_BLOCK), so the
          * geometry derives from I alone and gs/ng are ignored: this branch is
-         * correct no matter which call site launched it. NaN bytes decode to NaN
-         * through the LUT and propagate, same policy as the CPU path. */
+         * correct no matter which call site launched it. Accumulation mirrors
+         * the CPU reference: f32 partial per 128-block (f8w_block), the scale
+         * applied ONCE per partial, double across blocks. Warps stride the
+         * block axis; the cross-warp double sum runs in fixed warp order, so
+         * the reduction order is a pure function of the dims. Decode reads a
+         * shared copy of c_e4m3 (data-dependent __constant__ indices
+         * serialize). NaN bytes decode to NaN and propagate, same policy as
+         * the CPU path. fmt is uniform across the grid, so the branch-local
+         * __syncthreads and the early return are block-uniform. */
+        __shared__ float slut[256];
+        __shared__ double dsum[32];
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) slut[i] = c_e4m3[i];
+        __syncthreads();
         const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
         const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
-        for (int i = threadIdx.x; i < I; i += blockDim.x)
-            sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
+        int warp = threadIdx.x >> 5, nw = blockDim.x >> 5, nblk = (I + 127) >> 7;
+        int vec = !(I & 3) && !((size_t)wrow & 3) && !((size_t)xs & 15);
+        double a = 0;
+        for (int bi = warp; bi < nblk; bi += nw) {
+            int base = bi << 7, len = I - base < 128 ? I - base : 128;
+            float p;
+            f8w_block<0,0>(slut, wrow, nullptr, xs, 0, 1, base, len, vec, &p, nullptr);
+            if (!(threadIdx.x & 31)) a += (double)p * scl[bi];
+        }
+        if (!(threadIdx.x & 31)) dsum[warp] = a;
+        __syncthreads();
+        if (!threadIdx.x) {
+            for (int w = 1; w < nw; w++) a += dsum[w];
+            y[(size_t)s * O + o] = (float)a;
+        }
+        return;
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -710,6 +823,78 @@ __global__ static void grouped_down_f8(float *y,const float *x,const GroupDesc *
     __shared__ float p[256];p[threadIdx.x]=sum;__syncthreads();
     for(int n=128;n;n>>=1){if(threadIdx.x<n)p[threadIdx.x]+=p[threadIdx.x+n];__syncthreads();}
     if(!threadIdx.x)y[(size_t)(d.offset+s)*D+o]=p[0];
+}
+
+/* fmt=8 warp rework (COLI_CUDA_F8_WARP, default on): one WARP owns one
+ * (expert,output-row) pair and walks the row block-major through f8w_block —
+ * weights stream once per tile of up to 4 activation rows instead of once per
+ * (o,s) 256-thread block, and the accumulation is the CPU reference's (f32
+ * block partial, scale once per block, double across blocks) instead of the
+ * old flat per-element-scale f32 sum. Same descriptor surface as the old
+ * kernels; grid (ceil(O/8), count): 8 warps per 256-thread block, rows looped
+ * in-kernel. The old kernels stay compiled and selectable (=0) as the field
+ * escape hatch. */
+template<int HW>
+__global__ static void grouped_hidden_f8w_dual(float *gate,float *up,const float *x,
+                                               const GroupDesc *desc,int I,int D){
+    __shared__ float slut[256];
+    for(int i=threadIdx.x;i<256;i+=blockDim.x)slut[i]=c_e4m3[i];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o=blockIdx.x*(blockDim.x>>5)+warp,c=blockIdx.y;GroupDesc d=desc[c];
+    if(o>=I)return;
+    const uint8_t *gr=(const uint8_t*)d.g+(size_t)o*D;
+    const uint8_t *ur=(const uint8_t*)d.u+(size_t)o*D;
+    int nblk=(D+127)>>7;
+    const float *gsc=d.gs+(size_t)(o>>7)*nblk;
+    const float *usc=d.us+(size_t)(o>>7)*nblk;
+    int vec=!(D&3)&&!(((size_t)gr|(size_t)ur)&3)&&!((size_t)x&15);
+    for(int s0=0;s0<d.rows;s0+=4){
+        int ns=d.rows-s0<4?d.rows-s0:4;
+        const float *xs=x+(size_t)(d.offset+s0)*D;
+        double ga[4]={0,0,0,0},ua[4]={0,0,0,0};
+        for(int bi=0;bi<nblk;bi++){
+            int base=bi<<7,len=D-base<128?D-base:128;
+            float gp[4],up_[4];
+            f8w_block<HW,1>(slut,gr,ur,xs,D,ns,base,len,vec,gp,up_);
+            if(!lane){float sg=gsc[bi],su=usc[bi];
+                for(int s=0;s<ns;s++){ga[s]+=(double)gp[s]*sg;ua[s]+=(double)up_[s]*su;}}
+        }
+        /* same fused epilogue as the old dual: silu(gate)*up lands in gate[],
+         * up[] is never written */
+        if(!lane)for(int s=0;s<ns;s++){
+            float g=(float)ga[s],u=(float)ua[s];
+            gate[(size_t)(d.offset+s0+s)*I+o]=(g/(1.f+expf(-g)))*u;
+        }
+    }
+    (void)up;
+}
+template<int HW>
+__global__ static void grouped_down_f8w(float *y,const float *x,const GroupDesc *desc,int D,int I){
+    __shared__ float slut[256];
+    for(int i=threadIdx.x;i<256;i+=blockDim.x)slut[i]=c_e4m3[i];
+    __syncthreads();
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    int o=blockIdx.x*(blockDim.x>>5)+warp,c=blockIdx.y;GroupDesc d=desc[c];
+    if(o>=D)return;
+    const uint8_t *row=(const uint8_t*)d.d+(size_t)o*I;
+    int nblk=(I+127)>>7;
+    const float *dsc=d.ds+(size_t)(o>>7)*nblk;
+    int vec=!(I&3)&&!((size_t)row&3)&&!((size_t)x&15);
+    for(int s0=0;s0<d.rows;s0+=4){
+        int ns=d.rows-s0<4?d.rows-s0:4;
+        const float *xs=x+(size_t)(d.offset+s0)*I;
+        double a[4]={0,0,0,0};
+        for(int bi=0;bi<nblk;bi++){
+            int base=bi<<7,len=I-base<128?I-base:128;
+            float p[4];
+            f8w_block<HW,0>(slut,row,nullptr,xs,I,ns,base,len,vec,p,nullptr);
+            if(!lane){float sd=dsc[bi];
+                for(int s=0;s<ns;s++)a[s]+=(double)p[s]*sd;}
+        }
+        if(!lane)for(int s=0;s<ns;s++)
+            y[(size_t)(d.offset+s0+s)*D+o]=(float)a[s];
+    }
 }
 
 __global__ static void attention_absorb_kernel(float *ctx,const float *q,const float *latent,
@@ -1483,6 +1668,34 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
     return 1;
 }
 
+/* Single launch site for the fmt=8 group kernels, shared by the sync and the
+ * issue/take dispatches so both stay one-line call sites (rebase-tolerant
+ * against #935's e8_group_launch refactor of the adjacent branch).
+ * COLI_CUDA_F8_WARP (docs/ENVIRONMENT.md): unset/1 = warp kernels (default),
+ * 0 = the original per-(o,s) kernels (field escape hatch), 2 = warp kernels
+ * decoding through cuda_fp8.h (CUDA-only; experimental until the 256-value
+ * sweep certifies it bit-identical on the target silicon). */
+static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
+                            int max_rows,int count){
+    const char *e=getenv("COLI_CUDA_F8_WARP");int mode=e?atoi(e):1;
+    if(mode){
+        dim3 hg((unsigned)((I+7)/8),(unsigned)count),og((unsigned)((D+7)/8),(unsigned)count);
+#if COLI_F8_HWCVT
+        if(mode==2){
+            grouped_hidden_f8w_dual<1><<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+            grouped_down_f8w<1><<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+            return;
+        }
+#endif
+        grouped_hidden_f8w_dual<0><<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+        grouped_down_f8w<0><<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        return;
+    }
+    dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
+    grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
+    grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+}
+
 extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                                         ColiCudaTensor *const *ups,
                                         ColiCudaTensor *const *downs,
@@ -1563,9 +1776,7 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_f8){
         /* fp8-e4m3 groups: silu fused in the dual epilogue, like the w4/g4 duals. */
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count),og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        f8_group_launch(ctx,dev,I,D,max_rows,count);
     }else if(tc){
         size_t qb=(size_t)(total+7)*(size_t)(D>I?D:I)/2;
         if(!reserve_bytes((void**)&ctx->qx,&ctx->qx_cap,qb)||
@@ -1737,13 +1948,9 @@ extern "C" int coli_cuda_expert_group_issue(ColiCudaTensor *const *gates,
         if(!e8_rot_rows_dev(ctx->gate,total,I,ctx->stream))return 0;
         grouped_down_e8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
     }else if(all_f8){
-        /* fp8-e4m3 groups on the async decode path: same kernels as the sync
-         * dispatch, silu fused in the dual epilogue. */
-        GroupDesc *dev=(GroupDesc*)ctx->group_desc;
-        dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
-        dim3 og((unsigned)D,(unsigned)max_rows,(unsigned)count);
-        grouped_hidden_f8_dual<<<hg,256,0,ctx->stream>>>(ctx->gate,ctx->up,ctx->x,dev,I,D);
-        grouped_down_f8<<<og,256,0,ctx->stream>>>(ctx->y,ctx->gate,dev,D,I);
+        /* fp8-e4m3 groups on the async decode path: same launch helper as the
+         * sync dispatch, silu fused in the dual epilogue. */
+        f8_group_launch(ctx,(GroupDesc*)ctx->group_desc,I,D,max_rows,count);
     }else if(all_s4&&(!getenv("COLI_CUDA_W4_PACKED")||atoi(getenv("COLI_CUDA_W4_PACKED")))){
         GroupDesc *dev=(GroupDesc*)ctx->group_desc;
         dim3 hg((unsigned)I,(unsigned)max_rows,(unsigned)count);
