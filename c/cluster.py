@@ -3,6 +3,8 @@
 
 import argparse
 import json
+import os
+import sys
 import threading
 import time
 from http.server import ThreadingHTTPServer
@@ -99,14 +101,18 @@ class _Handler(openai_server.APIHandler):
 
 
 class ClusterServer(openai_server.APIServer):
-    def __init__(self, address, registry):
+    def __init__(self, address, registry, allowed_hosts=()):
         ThreadingHTTPServer.__init__(self, address, _Handler)
         self.registry = registry
         # Shared APIHandler plumbing reads these off the server. The registry has
         # no API key or CORS surface, and its Host guard stays loopback + bind
-        # address (the same default openai_server enforces).
+        # address (the same default openai_server enforces). A cross-host worker
+        # registers from a LAN IP, so the operator opts those hosts in via
+        # --allowed-host (the same #597 escape hatch coli serve exposes); the
+        # default stays loopback + bind address.
         self.cors_origins = ()
-        self.allowed_hosts = ()
+        self.allowed_hosts = tuple(
+            h.strip().lower() for h in allowed_hosts if h and h.strip())
         # Connection-cap bookkeeping for the inherited APIServer.process_request /
         # _release / close_request. There is no engine or model to carry, so
         # initialise the tracking state directly rather than APIServer.__init__.
@@ -120,8 +126,11 @@ def _endpoint(coordinator, path):
     return coordinator.rstrip("/") + "/v1/cluster/" + path
 
 
-def serve(host="127.0.0.1", port=8765, stale_after=30.0):
-    server = ClusterServer((host, port), ClusterRegistry(stale_after))
+def serve(host="127.0.0.1", port=8765, stale_after=30.0, allowed_hosts=()):
+    if allowed_hosts and "*" in allowed_hosts:
+        print("WARNING: --allowed-host '*' accepts ANY Host header "
+              "(DNS-rebinding guard disabled)", file=sys.stderr)
+    server = ClusterServer((host, port), ClusterRegistry(stale_after), allowed_hosts)
     print(f"colibri cluster coordinator listening on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
@@ -157,8 +166,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--stale-after", type=float, default=30.0)
+    parser.add_argument("--allowed-host", action="append",
+                        default=[h.strip() for h in os.environ.get("COLI_ALLOWED_HOSTS", "").split(",") if h.strip()],
+                        help="additional Host header accepted by the DNS-rebinding guard; repeat as needed")
     args = parser.parse_args()
-    serve(args.host, args.port, args.stale_after)
+    serve(args.host, args.port, args.stale_after, args.allowed_host)
 
 
 if __name__ == "__main__":
