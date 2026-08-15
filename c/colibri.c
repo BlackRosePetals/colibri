@@ -360,11 +360,26 @@ typedef struct {
  * expert non hanno tutti la stessa taglia (layer MTP int8 = 2x i layer int4). */
 typedef struct { int eid; QT g,u,d; uint8_t *slab; float *fslab;
                  int64_t slab_cap, fslab_cap; uint64_t used;
+                 unsigned in_flight; /* async GPU readers borrowing this slot */
                  /* pin-arena backing (#419): when set, slab/fslab are interior
                   * slices of a per-layer arena and must never be free()d —
                   * expert_host_release detaches them, expert_host_ensure
                   * re-attaches. NULL for every individually-allocated slot. */
                  uint8_t *aslab; float *afslab; } ESlot;
+
+static void eslot_acquire(ESlot *s){ __atomic_add_fetch(&s->in_flight,1,__ATOMIC_ACQ_REL); }
+static void eslot_release(ESlot *s){
+    unsigned old=__atomic_fetch_sub(&s->in_flight,1,__ATOMIC_ACQ_REL);
+    if(!old){ fprintf(stderr,"[CUDA] ESlot reference underflow\n"); abort(); }
+}
+static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
+static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
+static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
+static int eslot_lru_victim(ESlot *slots,int n){
+    int lru=-1;
+    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||slots[i].used<slots[lru].used)) lru=i;
+    return lru;
+}
 
 typedef struct {
     float **Lc, **Rc, **Ic;
@@ -3058,6 +3073,8 @@ static int g_pres_home=-1;                /* home device, -1 = path off        *
 static const float *g_pres_xsrc;          /* nrm_d on the home device          */
 static float *g_pres_slots;               /* [ndev][D] partial slots on home   */
 static int g_pres_used[COLI_CUDA_MAX_DEVICES], g_pres_nused;
+static ESlot *g_pres_refs[COLI_CUDA_MAX_DEVICES*64];
+static int g_pres_nrefs;
 #endif   /* ABSORB: -1 auto (decode S<=4), 0 mai, 1 sempre (test) */
 static int g_dsa_force=0; /* DSA_FORCE=1: selezione sempre attiva (test: top-min(k,T)=denso) */
 static int cmp_fdesc(const void *a,const void *b){
@@ -4503,9 +4520,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     }
                     double tg0=now_s();
                     int all=1, issued[COLI_CUDA_MAX_DEVICES]={0};
-                    for(int di=0;di<g_cuda_ndev && all;di++) if(pd_nc[di])
+                    for(int di=0;di<g_cuda_ndev && all;di++) if(pd_nc[di]){
+                        ESlot *refs[64]; for(int q=0;q<pd_nc[di];q++) refs[q]=pg_e[pd_which[di][q]];
+                        eslots_acquire(refs,pd_nc[di]);
                         all=issued[di]=coli_cuda_expert_group_issue(pd_g[di],pd_u[di],pd_d[di],
                                 pd_rows[di],pd_nc[di],group_x+(int64_t)pd_off[di]*D);
+                        if(!issued[di]) eslots_release(refs,pd_nc[di]);
+                    }
                     g_ovl_issue+=now_s()-tg0;
                     if(all){
                         static int announced2;
@@ -4523,8 +4544,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                             m->gpu_expert_calls++;
                         }
                     } else {
-                        for(int di=0;di<g_cuda_ndev;di++)
-                            if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
+                        for(int di=0;di<g_cuda_ndev;di++) if(issued[di]){
+                            coli_cuda_expert_group_take(g_cuda_devices[di]);
+                            for(int q=0;q<pd_nc[di];q++) eslot_release(pg_e[pd_which[di][q]]);
+                        }
                     }
                 }
             }
@@ -4793,6 +4816,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             g_ovl_cpu+=tg1-g_ovl_mark;               /* CPU-row window between issue and take */
             for(int di=0;di<g_cuda_ndev;di++) if(dev_nc0[di]){
                 const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
+                for(int q=0;q<dev_nc0[di];q++) eslot_release(eg_e[dev_which0[di][q]]);
                 int cur=0;
                 for(int q=0;q<dev_nc0[di];q++){
                     int gi=dev_which0[di][q], nr=eg_n[gi];
@@ -4848,22 +4872,29 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         if(g_group_async<0) g_group_async=getenv("COLI_GROUP_ASYNC")?atoi(getenv("COLI_GROUP_ASYNC")):0;
         if(g_group_async && S<=4 && g_cuda_ndev>0){
             int issued[COLI_CUDA_MAX_DEVICES]={0}, all=1;
-            for(int di=0;di<g_cuda_ndev && all;di++) if(dev_nc[di])
+            for(int di=0;di<g_cuda_ndev && all;di++) if(dev_nc[di]){
+                ESlot *refs[64]; for(int q=0;q<dev_nc[di];q++) refs[q]=group_e[dev_which[di][q]];
+                eslots_acquire(refs,dev_nc[di]);
                 all=issued[di]=coli_cuda_expert_group_issue(dev_g[di],dev_u[di],dev_d[di],
                         dev_rows[di],dev_nc[di],group_x+(int64_t)dev_off[di]*D);
+                if(!issued[di]) eslots_release(refs,dev_nc[di]);
+            }
             if(all){
                 static int announced;
                 if(!announced){ announced=1; fprintf(stderr,"[CUDA] expert group async path active\n"); }
                 async_done=1;
                 for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
                     const float *hy=coli_cuda_expert_group_take(g_cuda_devices[di]);
+                    for(int q=0;q<dev_nc[di];q++) eslot_release(group_e[dev_which[di][q]]);
                     if(hy){ dev_ok[di]=1;
                         memcpy(group_y+(int64_t)dev_off[di]*D,hy,(size_t)dev_total[di]*D*sizeof(float)); }
                     else dev_ok[di]=0;      /* per-device sync failure: CPU fallback below */
                 }
                 if(g_prof) m->t_egpu+=now_s()-tg;
-            } else for(int di=0;di<g_cuda_ndev;di++)
-                if(issued[di]) coli_cuda_expert_group_take(g_cuda_devices[di]);
+            } else for(int di=0;di<g_cuda_ndev;di++) if(issued[di]){
+                coli_cuda_expert_group_take(g_cuda_devices[di]);
+                for(int q=0;q<dev_nc[di];q++) eslot_release(group_e[dev_which[di][q]]);
+            }
         }
         if(!async_done){
             /* resident path (#431 PR-C0): issue the group on its device with the input
@@ -4875,11 +4906,14 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                 for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]){
                     float wbuf[64];
                     for(int q=0;q<dev_nc[di];q++) wbuf[q]=group_weight[(int64_t)dev_which[di][q]*S];
+                    ESlot *refs[64]; for(int q=0;q<dev_nc[di];q++) refs[q]=group_e[dev_which[di][q]];
+                    eslots_acquire(refs,dev_nc[di]);
                     if(coli_cuda_expert_group_resident_issue(dev_g[di],dev_u[di],dev_d[di],wbuf,dev_nc[di],
                             g_pres_home,g_pres_xsrc,g_pres_slots+(int64_t)g_pres_nused*D)){
                         g_pres_used[g_pres_nused++]=g_cuda_devices[di];
+                        for(int q=0;q<dev_nc[di];q++) g_pres_refs[g_pres_nrefs++]=refs[q];
                         dev_ok[di]=2;                       /* handled on device: skip host collection */
-                    }
+                    } else eslots_release(refs,dev_nc[di]);
                 }
             }
         }
@@ -4933,7 +4967,11 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
+              else { int lru=eslot_lru_victim(Sl,*nn);
+                     if(lru<0){ static int warned;
+                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
+                         continue; }
+                     dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
         }
     }
@@ -5122,6 +5160,7 @@ static void pilot_realload(Model *m, int layer, int eid){
     else {
         slot=-1;
         for(int z=0;z<nn;z++){
+            if(eslot_busy(&Sl[z])) continue;             /* borrowed by an async GPU read */
             if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
             if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
             if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
@@ -5157,7 +5196,14 @@ static void pilot_realload(Model *m, int layer, int eid){
         dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED);  /* eid gia' reale (expert_load); timbra used fresco */
         atomic_fetch_add_explicit(&g_pilot_loads,1,memory_order_relaxed);
     } else {
-        dst->eid=-1;                                    /* load fallito: libera la prenotazione (slot resta in ecn ma nascosto, riusabile) */
+        /* load fallito: libera la prenotazione. LO SLOT VA ANCHE RIPORTATO A used=0:
+         * la prenotazione lo aveva marcato used=(uint64_t)-1 ("in carica", mai vittima),
+         * e lasciarlo cosi' lo rendeva invisibile agli hit ma ULTIMO in ogni scan LRU —
+         * mai evictable: ogni speculazione fallita (disco lento, errore I/O transitorio)
+         * sottraeva ~19MB di cache in modo permanente e silenzioso. used=0 e' la stessa
+         * convenzione "slot vergine" di rss_guard: diventa la PRIMA vittima, non l'ultima. */
+        dst->eid=-1;
+        dst->used=0;
         atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
     }
     g_pilot_inflight[layer]--;
@@ -5194,6 +5240,7 @@ static void pilot_uring_batch(Model *m){
         else{
             slot=-1;
             for(int z=0;z<nn;z++){
+                if(eslot_busy(&Sl[z])) continue;      /* borrowed by an async GPU read */
                 if(Sl[z].eid==-1){ slot=z; break; }
                 if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
                 if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
@@ -5568,7 +5615,7 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
     if(g_cuda_resid && S==1){
         g_pres_slots=coli_cuda_pipe_scratch(dev,25,(size_t)g_cuda_ndev*D*sizeof(float));
         res_acc     =coli_cuda_pipe_scratch(dev,26,(size_t)D*sizeof(float));
-        if(g_pres_slots && res_acc){ g_pres_home=dev; g_pres_xsrc=nrm_d; g_pres_nused=0; }
+        if(g_pres_slots && res_acc){ g_pres_home=dev; g_pres_xsrc=nrm_d; g_pres_nused=0; g_pres_nrefs=0; }
         else { g_pres_slots=NULL; res_acc=NULL; }
     }
     moe(m,l,li,nrm_host,S,out_host,0);                            /* self-times its own t_emm */
@@ -5580,8 +5627,9 @@ static int pipe_layer_sparse(Model *m, Layer *l, int li, float *x_dev, int S, in
              * stream behind every issue event and reduces in issue order. A
              * failure here would silently drop routed experts — that is a wrong
              * answer, not a slow one, so it is fatal by design. */
-            if(!coli_cuda_expert_group_resident_take(dev,g_pres_used,nused,g_pres_slots,res_acc,D)||
-               !coli_cuda_pipe_add(dev,x_dev,res_acc,(size_t)D)){
+            int take_ok=coli_cuda_expert_group_resident_take(dev,g_pres_used,nused,g_pres_slots,res_acc,D);
+            eslots_release(g_pres_refs,g_pres_nrefs); g_pres_nrefs=0;
+            if(!take_ok || !coli_cuda_pipe_add(dev,x_dev,res_acc,(size_t)D)){
                 fprintf(stderr,"[CUDA] resident expert take failed — refusing to drop routed experts\n");
                 exit(1);
             }
@@ -6990,7 +7038,7 @@ static void rss_guard(Model *m){
             int nn=m->ecn[l], lru=-1;
             for(int z=0;z<nn;z++){                        /* solo slot pubblicati e con slab */
                 ESlot *cand=&m->ecache[l][z];
-                if(cand->eid<0 || !cand->slab) continue;
+                if(cand->eid<0 || !cand->slab || eslot_busy(cand)) continue;
                 if(lru<0 || cand->used<m->ecache[l][lru].used) lru=z;
             }
             if(lru<0){ pthread_mutex_unlock(&g_pilot_mx); continue; }
