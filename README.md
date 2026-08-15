@@ -474,7 +474,9 @@ python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
 # also: coli run / coli serve / coli web
 ```
 
-Greedy decode, one KV slot; tools and grammar are not wired up yet.
+Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
+with V4's native prompt and DSML call blocks; grammar is not supported. See the
+[per-engine API matrix](docs/api.md#tool-calling-support).
 
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`

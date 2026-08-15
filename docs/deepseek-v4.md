@@ -76,9 +76,13 @@ If the ceiling exceeds what the context window can hold, the engine clamps it
 and says so on stderr; raise `CTX` for genuinely longer answers.
 
 V4 chat uses native model markers. Native serving currently supports greedy
-generation and one active KV slot; tools and grammar are rejected. Requests
-re-prefill their context, while the process, weights, dense tensors, head, and
-expert cache stay warm.
+generation and one active KV slot. The HTTP gateway renders OpenAI and
+Anthropic tools into V4's native prompt contract, then parses DSML call blocks
+back into each protocol; grammar remains unsupported. See the
+[per-engine API matrix](api.md#tool-calling-support). Requests reuse a strict
+prompt prefix and prefill only its new suffix; divergent prompts prefill from
+the start. The process, weights, dense tensors, head, and expert cache stay
+warm.
 
 ## Validation
 
