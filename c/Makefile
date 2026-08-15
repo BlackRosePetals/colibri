@@ -196,8 +196,9 @@ endif
 # only (fast local dev). A headless CI/Docker build has no GPU, so `-arch=native`
 # there detects nothing and the shipped coli_cuda.dll fails at first kernel dispatch.
 # For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
-# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
-# plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
+# newer archs, build with CUDA_ARCH=portable: it emits SASS for
+# sm_80/86/89/90/120/121 plus a compute_120 PTX fallback (sm_120 / RTX
+# 50-series needs CUDA >= 12.8; sm_121 / GB10 Spark needs CUDA >= 12.9).
 CUDA_ARCH ?= native
 ifeq ($(CUDA_ARCH),portable)
 CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
@@ -205,6 +206,7 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_89,code=sm_89 \
                -gencode arch=compute_90,code=sm_90 \
                -gencode arch=compute_120,code=sm_120 \
+               -gencode arch=compute_121,code=sm_121 \
                -gencode arch=compute_120,code=compute_120
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
@@ -215,9 +217,13 @@ ifneq ($(IS_WIN),)
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=c++17 -ftz=false $(CUDA_GENCODE) -Xcompiler=-W3
 else
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+# -ftz=false is nvcc's default, pinned explicitly: the fmt=8 kernels are
+# cross-tier parity instruments and a flushed scale*subnormal contribution
+# silently diverges from the CPU reference (backend_cuda.cu also #errors on
+# fast-math builds, but -ftz alone defines no macro to guard on).
+NVCCFLAGS ?= -O3 -std=c++17 -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
 # glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
 # with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
 # under C++17 (noexcept is part of the function type since C++17). Force-include
