@@ -2753,8 +2753,33 @@ fail:
     }
 }
 typedef struct { int eid,nr; float *inputs; } ClusterRequestItem;
+/* Mirror expert_load_impl's resolution so the worker can NAME the tensor it can't
+ * resolve instead of dying inside a fatal path (st_die_missing / st_read_* exit(1)).
+ * Returns 1 and fills `out` with the first missing expert tensor — quantized: a
+ * gate/up/down weight or its .qs sidecar; unquantized: the full weight — else 0. */
+static int worker_expert_missing_tensor(Model *m,int layer,int eid,char *out,size_t outsz){
+    static const char *suf[3]={"gate_proj","up_proj","down_proj"};
+    char nm[288], qn[320];
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid);
+    snprintf(qn,sizeof(qn),"%s.qs",nm);
+    if(!st_has(&m->S,qn)){                       /* unquantized: full weights only */
+        for(int k=0;k<3;k++){
+            snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+            if(!st_has(&m->S,nm)){ snprintf(out,outsz,"%s",nm); return 1; }
+        }
+        return 0;
+    }
+    for(int k=0;k<3;k++){                        /* quantized: weight + .qs sidecar */
+        snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
+        snprintf(qn,sizeof(qn),"%s.qs",nm);
+        if(!st_has(&m->S,nm)||!st_has(&m->S,qn)){ snprintf(out,outsz,"%s",nm); return 1; }
+    }
+    return 0;
+}
 static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
-    Model m; memset(&m,0,sizeof(m)); m.ebits=ebits; m.dbits=dbits; load_cfg(&m.c,snap); st_init(&m.S,snap);
+    Model m; memset(&m,0,sizeof(m)); m.ebits=ebits; m.dbits=dbits; load_cfg(&m.c,snap);
+    { const char *xd=getenv("COLI_MODEL_DIRS");        /* SPLIT: expert shards spread across N drives */
+      st_init_multi(&m.S,snap,(xd&&*xd)?xd:NULL); }
     int nr_layers=m.c.n_layers+1; ESlot *cache=calloc((size_t)nr_layers,sizeof(ESlot));
     for(int i=0;i<nr_layers;i++) cache[i].eid=-1;
     int fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0){perror("cluster worker socket");return 1;}
@@ -2784,7 +2809,15 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
             v=0; if(cluster_u32(cfd,&v,1)) break; v=n; if(cluster_u32(cfd,&v,1)) break;
             ESlot *slot=&cache[layer];
             for(uint32_t j=0;j<n;j++){
-                if(slot->eid!=items[j].eid && expert_load(&m,(int)layer,items[j].eid,slot,1,0)){bad=1;break;}
+                if(slot->eid!=items[j].eid){
+                    char miss[288];
+                    if(worker_expert_missing_tensor(&m,(int)layer,items[j].eid,miss,sizeof(miss))){
+                        fprintf(stderr,"[CLUSTER] worker cannot resolve expert tensor %s (layer %d, expert %d)\n",
+                                miss,(int)layer,items[j].eid);
+                        bad=1; break;
+                    }
+                    if(expert_load(&m,(int)layer,items[j].eid,slot,0,0)){bad=1;break;}
+                }
                 int rows=items[j].nr; float *g=falloc((int64_t)rows*I),*u=falloc((int64_t)rows*I),*y=falloc((int64_t)rows*D);
                 expert_gate_up(g,u,items[j].inputs,&slot->g,&slot->u,rows);
                 for(int64_t z=0;z<(int64_t)rows*I;z++)g[z]=siluf(g[z])*u[z];
