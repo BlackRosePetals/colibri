@@ -83,6 +83,13 @@ static void one_case(const char *what, int S, int I, int O, int fixed_exp) {
         int bad = 0;
         for (int i = 0; i < S * O; i++) {
             float a = y_cpu[i], b = y_gpu[i];
+            if (std::isnan(a) || std::isnan(b)) { /* NaN only agrees with NaN: without this,
+                                                     NaN against anything falls through the
+                                                     relative compare (NaN > tol is false)
+                                                     and silently counts as a pass */
+                if (std::isnan(a) != std::isnan(b)) bad++;
+                continue;
+            }
             if (isinf(a) || isinf(b)) {           /* exponent 255: both must agree it is inf */
                 if (isinf(a) != isinf(b) || (isinf(a) && ((a > 0) != (b > 0)))) bad++;
                 continue;
