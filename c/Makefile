@@ -196,9 +196,12 @@ endif
 # only (fast local dev). A headless CI/Docker build has no GPU, so `-arch=native`
 # there detects nothing and the shipped coli_cuda.dll fails at first kernel dispatch.
 # For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
-# newer archs, build with CUDA_ARCH=portable: it emits SASS for
-# sm_80/86/89/90/120/121 plus a compute_120 PTX fallback (sm_120 / RTX
-# 50-series needs CUDA >= 12.8; sm_121 / GB10 Spark needs CUDA >= 12.9).
+# newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
+# plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
+# sm_121 (GB10 Spark) needs CUDA >= 12.9, so its gencode joins only when the
+# detected toolkit supports it — the portable floor stays 12.8. The version
+# probe fails closed: no or unparsable nvcc means no compute_121 (the
+# compute_120 PTX still JITs on sm_121).
 CUDA_ARCH ?= native
 ifeq ($(CUDA_ARCH),portable)
 CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
@@ -206,8 +209,11 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_89,code=sm_89 \
                -gencode arch=compute_90,code=sm_90 \
                -gencode arch=compute_120,code=sm_120 \
-               -gencode arch=compute_121,code=sm_121 \
                -gencode arch=compute_120,code=compute_120
+NVCC_RELEASE := $(shell "$(NVCC)" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1),12.9)
+CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
+endif
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
@@ -695,17 +701,19 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	./backend_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
 	./ragged_attention_test$(EXE)
+	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
+	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
+	# itself (kernel-level oracle), so only the test file is compiled.
+	# Runs BEFORE the MXFP4 test: that one has a pre-existing exponent-255
+	# failure on some hosts and would otherwise abort the recipe first.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
+	./fp8_warp_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
 	$(CC) $(CFLAGS) -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
 	./mxfp4_cuda_test$(EXE)
-	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
-	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
-	# itself (kernel-level oracle), so only the test file is compiled.
-	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
-	./fp8_warp_test$(EXE)
 
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
@@ -725,7 +733,7 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 
 # fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
 # expert shapes, JSON on stdout (kernel time only). The build is a separate
-# file target so run_f8_bench.sh (repo root) can keep stdout pure JSON.
+# file target so tools/run_f8_bench.sh can keep stdout pure JSON.
 fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_fp8_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) tests/bench_fp8_cuda.cu -o fp8_bench$(EXE) $(ANS_NVCC_LIBS)
