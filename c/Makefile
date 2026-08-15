@@ -723,6 +723,15 @@ cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tens
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
 
+# fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
+# expert shapes, JSON on stdout (kernel time only). The build is a separate
+# file target so run_f8_bench.sh (repo root) can keep stdout pure JSON.
+fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_fp8_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_fp8_cuda.cu -o fp8_bench$(EXE) $(ANS_NVCC_LIBS)
+fp8-bench: fp8_bench$(EXE)
+	./fp8_bench$(EXE)
+
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
 # build whose compile line, libraries and exit status all claim "CUDA" while
@@ -1123,7 +1132,7 @@ bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
