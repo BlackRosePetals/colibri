@@ -2819,10 +2819,11 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
                     if(expert_load(&m,(int)layer,items[j].eid,slot,0,0)){bad=1;break;}
                 }
                 int rows=items[j].nr; float *g=falloc((int64_t)rows*I),*u=falloc((int64_t)rows*I),*y=falloc((int64_t)rows*D);
-                expert_gate_up(g,u,items[j].inputs,&slot->g,&slot->u,rows);
-                for(int64_t z=0;z<(int64_t)rows*I;z++)g[z]=siluf(g[z])*u[z];
-                if(slot->d.fmt==6) e8_rot_rows(g,rows,I);
-                matmul_qt(y,g,&slot->d,rows);
+                /* fmt=6: the gate/up input is per-item here (never reused after this
+                 * expert), so rotate it in place — the same Q^T x that moe() applies
+                 * once per layer via E8_XE. The down-input rotation lives in expert_ffn. */
+                if(slot->g.fmt==6) e8_rot_rows(items[j].inputs,rows,D);
+                expert_ffn(y,g,u,items[j].inputs,&slot->g,&slot->u,&slot->d,rows,I);
                 v=(uint32_t)items[j].eid; if(cluster_u32(cfd,&v,1)){bad=1;free(g);free(u);free(y);break;}
                 v=(uint32_t)rows; if(cluster_u32(cfd,&v,1)||cluster_io(cfd,y,(size_t)rows*D*sizeof(float),1)){bad=1;free(g);free(u);free(y);break;}
                 free(g);free(u);free(y);
