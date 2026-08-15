@@ -332,9 +332,13 @@ __device__ __forceinline__ float f8_dec(const float *slut, uint8_t b){
  * FP8_BLOCK fit. Weights are decoded once and reused across ns activation
  * rows (weights are the traffic; activations come from cache), then each
  * row's per-lane products are tree-reduced in fixed order — the block partial
- * lands in LANE 0 of gp[]/up_[] (other lanes hold partials). vec: full blocks
- * go through uchar4/float4 loads; tails and unaligned rows take the guarded
- * byte path. DUAL folds a second weight row (gate+up) against the same
+ * lands in LANE 0 of gp[]/up_[] (other lanes hold partials). vec picks the
+ * LOAD width only (uchar4/float4 on aligned full blocks, guarded bytes on
+ * tails and unaligned bases — e.g. zero-copy views: correct, slower); both
+ * load paths feed ONE shared product/accumulate sequence below, and the
+ * vec/byte parity test asserts their bit-equality on identical data. Tail
+ * padding contributes +0.0f terms, which can at most flip a -0.0 partial to
+ * +0.0. DUAL folds a second weight row (gate+up) against the same
  * activations without re-reading x. The per-row arithmetic never depends on
  * ns or s, so S-tiling cannot reorder a dot (B5). */
 template<int HW,int DUAL>
@@ -357,19 +361,55 @@ __device__ __forceinline__ void f8w_block(const float *slut,const uint8_t *gr,
     }
     for(int s=0;s<ns;s++){
         const float *xr=xs+(size_t)s*xstride;
-        float g,u=0;
+        float xv[4];
         if(full){
             float4 xf=*(const float4*)(xr+i0);
-            g=xf.x*gw[0]+xf.y*gw[1]+xf.z*gw[2]+xf.w*gw[3];
-            if(DUAL)u=xf.x*uw[0]+xf.y*uw[1]+xf.z*uw[2]+xf.w*uw[3];
-        }else{
-            g=0;
-            for(int k=0;k<4;k++)if(i0+k<base+len){float xv=xr[i0+k];
-                g+=xv*gw[k];if(DUAL)u+=xv*uw[k];}
-        }
+            xv[0]=xf.x;xv[1]=xf.y;xv[2]=xf.z;xv[3]=xf.w;
+        }else for(int k=0;k<4;k++) xv[k]=i0+k<base+len?xr[i0+k]:0.f;
+        float g=0,u=0;
+        for(int k=0;k<4;k++){g+=xv[k]*gw[k];if(DUAL)u+=xv[k]*uw[k];}
         for(int off=16;off;off>>=1){g+=f8_shfl_down(g,off);if(DUAL)u+=f8_shfl_down(u,off);}
         gp[s]=g;if(DUAL)up_[s]=u;
     }
+}
+
+/* Dense fmt=8 rework: quant_matmul's fmt=8 branch as its OWN kernel, so
+ * COLI_CUDA_F8_WARP=0 restores the fully original dense behavior too (the
+ * host picks in quant_matmul_launch). Same grid/block contract as
+ * quant_matmul: one 256-thread block per (o,s). Accumulation mirrors the CPU
+ * reference: f32 partial per 128-block (f8w_block), the scale applied ONCE
+ * per partial, double across blocks. Warps stride the block axis; the
+ * cross-warp double sum runs in fixed warp order, so the reduction order is
+ * a pure function of the dims. Decode reads a shared copy of c_e4m3
+ * (data-dependent __constant__ indices serialize); the cvt candidate stays
+ * grouped-path-only until certified. NaN bytes decode to NaN and propagate,
+ * same policy as the CPU path. */
+__global__ static void quant_matmul_f8w(float *y,const float *x,const void *weights,
+                                        const float *scales,int S,int I,int O){
+    int o=blockIdx.x,s=blockIdx.y;
+    const float *xs=x+(size_t)s*I;
+    __shared__ float slut[256];
+    __shared__ double dsum[32];
+    for(int i=threadIdx.x;i<256;i+=blockDim.x) slut[i]=c_e4m3[i];
+    __syncthreads();
+    const uint8_t *wrow=(const uint8_t*)weights+(size_t)o*I;
+    const float *scl=scales+(size_t)(o>>7)*(size_t)((I+127)>>7);
+    int warp=threadIdx.x>>5,nw=blockDim.x>>5,nblk=(I+127)>>7;
+    int vec=!(I&3)&&!((size_t)wrow&3)&&!((size_t)xs&15);
+    double a=0;
+    for(int bi=warp;bi<nblk;bi+=nw){
+        int base=bi<<7,len=I-base<128?I-base:128;
+        float p;
+        f8w_block<0,0>(slut,wrow,nullptr,xs,0,1,base,len,vec,&p,nullptr);
+        if(!(threadIdx.x&31)) a+=(double)p*scl[bi];
+    }
+    if(!(threadIdx.x&31)) dsum[warp]=a;
+    __syncthreads();
+    if(!threadIdx.x){
+        for(int w=1;w<nw;w++) a+=dsum[w];
+        y[(size_t)s*O+o]=(float)a;
+    }
+    (void)S;
 }
 
 __global__ static void quant_matmul(float *y, const float *x, const void *weights,
@@ -421,37 +461,14 @@ __global__ static void quant_matmul(float *y, const float *x, const void *weight
          * scale per 128x128 BLOCK of [O,I] — scales[(o/128)*ceil(I/128) + i/128].
          * The block edge is a fixed property of the format (FP8_BLOCK), so the
          * geometry derives from I alone and gs/ng are ignored: this branch is
-         * correct no matter which call site launched it. Accumulation mirrors
-         * the CPU reference: f32 partial per 128-block (f8w_block), the scale
-         * applied ONCE per partial, double across blocks. Warps stride the
-         * block axis; the cross-warp double sum runs in fixed warp order, so
-         * the reduction order is a pure function of the dims. Decode reads a
-         * shared copy of c_e4m3 (data-dependent __constant__ indices
-         * serialize). NaN bytes decode to NaN and propagate, same policy as
-         * the CPU path. fmt is uniform across the grid, so the branch-local
-         * __syncthreads and the early return are block-uniform. */
-        __shared__ float slut[256];
-        __shared__ double dsum[32];
-        for (int i = threadIdx.x; i < 256; i += blockDim.x) slut[i] = c_e4m3[i];
-        __syncthreads();
+         * correct no matter which call site launched it. NaN bytes decode to NaN
+         * through the LUT and propagate, same policy as the CPU path. This is
+         * the ORIGINAL dense path, kept for COLI_CUDA_F8_WARP=0; the default
+         * routes fmt=8 to quant_matmul_f8w instead (quant_matmul_launch). */
         const uint8_t *wrow = static_cast<const uint8_t *>(weights) + row;
         const float *scl = scales + (size_t)(o >> 7) * (size_t)((I + 127) >> 7);
-        int warp = threadIdx.x >> 5, nw = blockDim.x >> 5, nblk = (I + 127) >> 7;
-        int vec = !(I & 3) && !((size_t)wrow & 3) && !((size_t)xs & 15);
-        double a = 0;
-        for (int bi = warp; bi < nblk; bi += nw) {
-            int base = bi << 7, len = I - base < 128 ? I - base : 128;
-            float p;
-            f8w_block<0,0>(slut, wrow, nullptr, xs, 0, 1, base, len, vec, &p, nullptr);
-            if (!(threadIdx.x & 31)) a += (double)p * scl[bi];
-        }
-        if (!(threadIdx.x & 31)) dsum[warp] = a;
-        __syncthreads();
-        if (!threadIdx.x) {
-            for (int w = 1; w < nw; w++) a += dsum[w];
-            y[(size_t)s * O + o] = (float)a;
-        }
-        return;
+        for (int i = threadIdx.x; i < I; i += blockDim.x)
+            sum += xs[i] * c_e4m3[wrow[i]] * scl[i >> 7];
     } else {
         for (int i = threadIdx.x; i < I; i += blockDim.x)
             sum += xs[i] * weight_at(weights, fmt, row, i);
@@ -1532,6 +1549,36 @@ static int fault_injected(void) {
     return fa && g_gpu_calls++ >= std::atol(fa);
 }
 
+/* COLI_CUDA_F8_WARP mode, re-read per dispatch like its siblings. Strict
+ * parse: a non-numeric value selects the DEFAULT, not atoi's silent 0.
+ * Default 1 (warp kernels) on CUDA; 0 (original kernels) on HIP — the warp
+ * kernels' wave64 width-32 shuffle sub-grouping has never been validated on
+ * AMD silicon, and a scoring instrument must not default onto an untested
+ * reduction. Opt in explicitly with =1/=2 once hip-test certifies it. */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define COLI_F8_DEFAULT 0
+#else
+#define COLI_F8_DEFAULT 1
+#endif
+static int f8_warp_mode(void) {
+    const char *e = std::getenv("COLI_CUDA_F8_WARP");
+    if (!e || !*e) return COLI_F8_DEFAULT;
+    char *end; long v = std::strtol(e, &end, 10);
+    return *end ? COLI_F8_DEFAULT : (int)v;
+}
+
+/* One launch site for the dense matvec so fmt=8 honors the same toggle as
+ * f8_group_launch: mode 0 runs the original quant_matmul branch (fully
+ * original behavior), anything else the warp/shared-LUT rework. */
+static void quant_matmul_launch(float *y, const float *x, const void *w,
+        const float *sc, int fmt, int S, int I, int O, size_t rb, int gs, int ng) {
+    dim3 grid((unsigned)O, (unsigned)S);
+    if (fmt == 8 && f8_warp_mode())
+        quant_matmul_f8w<<<grid, 256>>>(y, x, w, sc, S, I, O);
+    else
+        quant_matmul<<<grid, 256>>>(y, x, w, sc, fmt, S, I, O, rb, gs, ng);
+}
+
 extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
                                  float *y, const float *x,
                                  const void *weights, const float *scales,
@@ -1552,8 +1599,7 @@ extern "C" int coli_cuda_matmul(ColiCudaTensor **tensor,
     size_t xb = (size_t)S * I * sizeof(float), yb = (size_t)S * O * sizeof(float);
     if (!reserve(&ctx->x, &ctx->x_cap, xb) || !reserve(&ctx->y, &ctx->y_cap, yb)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x, x, xb, cudaMemcpyHostToDevice), "input upload")) return 0;
-    dim3 grid((unsigned)O, (unsigned)S);
-    quant_matmul<<<grid, 256>>>(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
+    quant_matmul_launch(ctx->y, ctx->x, t->weights, t->scales, fmt, S, I, O, rb, t->gs, t->ng);
     if (!cuda_ok(cudaGetLastError(), "matmul launch") ||
         !cuda_ok(cudaMemcpy(y, ctx->y, yb, cudaMemcpyDeviceToHost), "output download")) return 0;
     return 1;
@@ -1621,10 +1667,9 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
     if (!reserve(&ctx->x,&ctx->x_cap,xb) || !reserve(&ctx->y,&ctx->y_cap,yb) ||
         !reserve(&ctx->gate,&ctx->gate_cap,ib) || !reserve(&ctx->up,&ctx->up_cap,ib)) return 0;
     if (!cuda_ok(cudaMemcpy(ctx->x,x,xb,cudaMemcpyHostToDevice),"expert input upload")) return 0;
-    dim3 hidden_grid((unsigned)I,(unsigned)S), output_grid((unsigned)D,(unsigned)S);
-    quant_matmul<<<hidden_grid,256>>>(ctx->gate,ctx->x,gate->weights,gate->scales,
+    quant_matmul_launch(ctx->gate,ctx->x,gate->weights,gate->scales,
         gate->fmt,S,D,I,row_bytes(gate->fmt,D),gate->gs,gate->ng);
-    quant_matmul<<<hidden_grid,256>>>(ctx->up,ctx->x,up->weights,up->scales,
+    quant_matmul_launch(ctx->up,ctx->x,up->weights,up->scales,
         up->fmt,S,D,I,row_bytes(up->fmt,D),up->gs,up->ng);
     size_t n=(size_t)S*I;
     silu_mul<<<(unsigned)((n+255)/256),256>>>(ctx->gate,ctx->up,n);
@@ -1632,7 +1677,7 @@ extern "C" int coli_cuda_expert_mlp(ColiCudaTensor *gate, ColiCudaTensor *up,
      * one is per-expert (the silu product is not shared), unlike the gate/up input
      * rotation, which the caller does once per layer -- same split as moe(). */
     if (down->fmt == 6 && !e8_rot_rows_dev(ctx->gate, S, I, 0)) return 0;
-    quant_matmul<<<output_grid,256>>>(ctx->y,ctx->gate,down->weights,down->scales,
+    quant_matmul_launch(ctx->y,ctx->gate,down->weights,down->scales,
         down->fmt,S,I,D,row_bytes(down->fmt,I),down->gs,down->ng);
     if (!cuda_ok(cudaGetLastError(),"expert MLP launch") ||
         !cuda_ok(cudaMemcpy(y,ctx->y,yb,cudaMemcpyDeviceToHost),"expert output download")) return 0;
@@ -1671,13 +1716,16 @@ extern "C" int coli_cuda_shared_mlp_w4a16(ColiCudaTensor *gate,ColiCudaTensor *u
 /* Single launch site for the fmt=8 group kernels, shared by the sync and the
  * issue/take dispatches so both stay one-line call sites (rebase-tolerant
  * against #935's e8_group_launch refactor of the adjacent branch).
- * COLI_CUDA_F8_WARP (docs/ENVIRONMENT.md): unset/1 = warp kernels (default),
- * 0 = the original per-(o,s) kernels (field escape hatch), 2 = warp kernels
- * decoding through cuda_fp8.h (CUDA-only; experimental until the 256-value
- * sweep certifies it bit-identical on the target silicon). */
+ * COLI_CUDA_F8_WARP (docs/ENVIRONMENT.md, parsed by f8_warp_mode): 1 = warp
+ * kernels (the CUDA default; HIP defaults to 0), 0 = the original per-(o,s)
+ * kernels (field escape hatch, dense path included via quant_matmul_launch),
+ * 2 = warp kernels decoding through cuda_fp8.h — a real cvt instruction only
+ * on sm_89+, the header's bit-manip emulation below that, and plain =1
+ * behavior where cuda_fp8.h is absent (HIP); experimental until the
+ * 256-value sweep certifies it bit-identical on the target silicon. */
 static void f8_group_launch(DeviceContext *ctx,GroupDesc *dev,int I,int D,
                             int max_rows,int count){
-    const char *e=getenv("COLI_CUDA_F8_WARP");int mode=e?atoi(e):1;
+    int mode=f8_warp_mode();
     if(mode){
         dim3 hg((unsigned)((I+7)/8),(unsigned)count),og((unsigned)((D+7)/8),(unsigned)count);
 #if COLI_F8_HWCVT
