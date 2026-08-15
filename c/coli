@@ -323,17 +323,31 @@ def engine_for(model):
     local = os.path.join(HERE, name + _EXE)
     return local if os.path.exists(local) else os.path.join(_LIBEXEC, name + _EXE)
 
-def need_model(model, engine=None):
+def require_model(model, file="tokenizer.json", engine=None, target="", build="coli build"):
+    """Shared model-directory / required-file / engine presence check.
+
+    `need_model` and `need_worker_model` differ only in which file they require
+    (tokenizer.json vs config.json) and whether non-GLM families are allowed
+    (expert workers live in the GLM engine only). The exit wording and
+    the check order are shared so the two validators cannot drift apart.
+    """
     if not model:
         sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     if not os.path.isdir(model):
         sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
-    if not os.path.exists(os.path.join(model,"tokenizer.json")):
-        sys.exit(f"{C.yel}tokenizer.json is missing from {model}{C.r}")
+    if file and not os.path.exists(os.path.join(model, file)):
+        sys.exit(f"{C.yel}{file} is missing from {model}{C.r}")
+    if engine and not os.path.exists(engine):
+        label = f"{target} " if target else ""
+        sys.exit(f"{C.yel}{label}engine is not built.{C.r} Run: {build}")
+
+def need_model(model, engine=None):
+    if not model:
+        sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
     engine = engine or engine_for(model)
-    if not os.path.exists(engine):
-        target = resolve_model(model).descriptor.build_target
-        sys.exit(f"{C.yel}{target} engine is not built.{C.r} Run: make -C c {target}")
+    target = resolve_model(model).descriptor.build_target
+    require_model(model, file="tokenizer.json", engine=engine, target=target,
+                  build=f"make -C c {target}")
 
 # One-shot runs keep the historic 1024. Interactive sessions get 16384, because
 # the browser and the TUI both offer a per-request limit and the server treats
@@ -456,17 +470,14 @@ def dsv4_cuda_available(model=None):
     return os.path.exists(dll)
 
 def need_worker_model(model):
-    if not os.path.isdir(model):
-        sys.exit(f"{C.yel}model not found:{C.r} {model}\n  set COLI_MODEL or use --model")
-    if not os.path.exists(os.path.join(model,"config.json")):
-        sys.exit(f"{C.yel}config.json is missing from:{C.r} {model}")
+    require_model(model, file="config.json")
     family = resolve_model(model).descriptor
     if family.id != "glm":
         sys.exit(f"{C.yel}cluster expert workers currently support the GLM engine only;{C.r} "
                  f"{family.display_name} models cannot serve experts")
     engine = engine_for(model)
-    if not os.path.exists(engine):
-        sys.exit(f"{C.yel}engine is not built.{C.r} Run: coli build")
+    require_model(model, file="config.json", engine=engine, target=family.build_target,
+                  build=f"make -C c {family.build_target}")
     return engine
 
 def cuda_binary():

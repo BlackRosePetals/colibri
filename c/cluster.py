@@ -5,8 +5,10 @@ import argparse
 import json
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
+
+import openai_server
 
 
 PROTOCOL_VERSION = 1
@@ -56,51 +58,66 @@ class ClusterRegistry:
                 for node in self.snapshot()["nodes"] if node["role"] == "expert"]
 
 
-class _Handler(BaseHTTPRequestHandler):
+class _Handler(openai_server.APIHandler):
+    # The original registry served HTTP/1.0: one request per connection, no
+    # keep-alive. Keep that wire shape; the shared APIHandler machinery (Host
+    # guard, body cap, deadline reader, connection bookkeeping) still applies.
+    protocol_version = "HTTP/1.0"
     server_version = "colibri-cluster/1"
 
     def log_message(self, *_args):
         return
 
-    def _json(self, status, value):
-        payload = json.dumps(value, separators=(",", ":")).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _body(self):
-        length = int(self.headers.get("Content-Length", "0"))
-        if length > 1 << 20:
-            raise ValueError("request body is too large")
-        return json.loads(self.rfile.read(length) or b"{}")
+    def _fail(self, error):
+        self.send_json(error.status, {"error": error.message})
 
     def do_GET(self):  # noqa: N802 - stdlib handler API
-        if self.path in ("/health", "/v1/cluster/topology"):
-            self._json(200, self.server.registry.snapshot())
+        try:
+            self._check_host()
+        except openai_server.APIError as error:
+            self._fail(error)
             return
-        self._json(404, {"error": "not found"})
+        if self.path in ("/health", "/v1/cluster/topology"):
+            self.send_json(200, self.server.registry.snapshot())
+            return
+        self.send_json(404, {"error": "not found"})
 
     def do_POST(self):  # noqa: N802 - stdlib handler API
         try:
-            body = self._body()
+            self._check_host()
+            body = self.read_json()
             if self.path == "/v1/cluster/register":
-                self._json(200, self.server.registry.register(body))
+                self.send_json(200, self.server.registry.register(body))
             elif self.path == "/v1/cluster/heartbeat":
-                self._json(200, self.server.registry.heartbeat(body["node_id"]))
+                self.send_json(200, self.server.registry.heartbeat(body["node_id"]))
             else:
-                self._json(404, {"error": "not found"})
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError) as error:
-            self._json(400, {"error": str(error)})
+                self.send_json(404, {"error": "not found"})
+        except openai_server.APIError as error:
+            self._fail(error)
+        except (KeyError, ValueError, TypeError) as error:
+            self.send_json(400, {"error": str(error)})
 
 
-class ClusterServer(ThreadingHTTPServer):
-    daemon_threads = True
-
+class ClusterServer(openai_server.APIServer):
     def __init__(self, address, registry):
-        super().__init__(address, _Handler)
+        ThreadingHTTPServer.__init__(self, address, _Handler)
         self.registry = registry
+        # Shared APIHandler plumbing reads these off the server. The registry has
+        # no API key or CORS surface, and its Host guard stays loopback + bind
+        # address (the same default openai_server enforces).
+        self.cors_origins = ()
+        self.allowed_hosts = ()
+        # Connection-cap bookkeeping for the inherited APIServer.process_request /
+        # _release / close_request. There is no engine or model to carry, so
+        # initialise the tracking state directly rather than APIServer.__init__.
+        self._conn_lock = threading.Lock()
+        self._conn_live = 0
+        self._conn_by_ip = {}
+        self._conn_owner = {}
+
+
+def _endpoint(coordinator, path):
+    return coordinator.rstrip("/") + "/v1/cluster/" + path
 
 
 def serve(host="127.0.0.1", port=8765, stale_after=30.0):
@@ -113,7 +130,7 @@ def serve(host="127.0.0.1", port=8765, stale_after=30.0):
 
 
 def register(coordinator, node):
-    request = Request(coordinator.rstrip("/") + "/v1/cluster/register",
+    request = Request(_endpoint(coordinator, "register"),
                       data=json.dumps(node).encode(),
                       headers={"Content-Type": "application/json"}, method="POST")
     with urlopen(request, timeout=5) as response:
@@ -121,7 +138,7 @@ def register(coordinator, node):
 
 
 def heartbeat(coordinator, node_id):
-    request = Request(coordinator.rstrip("/") + "/v1/cluster/heartbeat",
+    request = Request(_endpoint(coordinator, "heartbeat"),
                       data=json.dumps({"node_id": node_id}).encode(),
                       headers={"Content-Type": "application/json"}, method="POST")
     with urlopen(request, timeout=5) as response:
@@ -129,7 +146,7 @@ def heartbeat(coordinator, node_id):
 
 
 def discover_workers(coordinator):
-    with urlopen(coordinator.rstrip("/") + "/v1/cluster/topology", timeout=5) as response:
+    with urlopen(_endpoint(coordinator, "topology"), timeout=5) as response:
         topology = json.load(response)
     return [f"{node['host']}:{int(node['port'])}"
             for node in topology.get("nodes", []) if node.get("role") == "expert"]
