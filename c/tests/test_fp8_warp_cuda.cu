@@ -127,6 +127,11 @@ static void cpu_expert_chain(const uint8_t *g,const uint8_t *u,const uint8_t *d,
 #define NEXP 3
 int main(void){
     srand(11);
+    /* Pin the warp path explicitly: HIP defaults COLI_CUDA_F8_WARP to 0
+     * (unvalidated wave64 seam), and this suite exists to validate exactly
+     * that path — on both vendors. The old-kernel leg below sets 0 and
+     * restores this. */
+    setenv("COLI_CUDA_F8_WARP","1",1);
     int devs[1]={0};
     if(!coli_cuda_init(devs,1)){ printf("FAIL cuda init\n"); return 1; }
     float lut[256]; for(int i=0;i<256;i++) lut[i]=e4m3_ref((uint8_t)i);
@@ -243,7 +248,7 @@ int main(void){
          * the accumulation convention is what changed) */
         setenv("COLI_CUDA_F8_WARP","0",1);
         if(!coli_cuda_expert_group(tg,tu,td,rows,NC,yold,x)){ printf("FAIL census old-path group\n"); return 1; }
-        unsetenv("COLI_CUDA_F8_WARP");
+        setenv("COLI_CUDA_F8_WARP","1",1);
         if(!rms_named("census grouped (old kernels) vs CPU",yold,want,(size_t)total*D,1e-4f)) return 1;
         rms_named("census grouped old vs new (informational)",yold,ys,(size_t)total*D,1e9f);
 
@@ -280,6 +285,92 @@ int main(void){
         for(int c=0;c<NC;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
         free(x);free(ys);free(yold);free(want);free(h);
+    }
+
+    /* ---- grouped accumulation-convention bite ------------------------------
+     * Cross-block cancellation staged so the reference-mirroring convention
+     * (double across blocks) is load-bearing: block partials x scales are
+     * exactly {1.0, 2^-25, -1.0}. A float cross-block accumulator absorbs
+     * the 2^-25 into 1.0 and cancels to exactly 0 — the down kernel is
+     * compared BITWISE against 2^-25, the hidden dual (through its silu
+     * epilogue) against nonzero-and-near silu(2^-25)*1. Kernels launched
+     * raw so both grouped kernels are pinned regardless of the toggle. */
+    {
+        uint8_t hwb[384]={}; float hx[384]={};
+        hwb[0]=0x38; hwb[128]=0x38; hwb[256]=0x38;   /* e4m3 1.0 in each block */
+        hx[0]=1.f; hx[128]=1.f; hx[256]=1.f;
+        float cancel[3]={1.f,ldexpf(1.f,-25),-1.f},one[3]={1.f,0.f,0.f};
+        void *dw,*dx,*dcs,*dos,*dy,*dg,*du,*ddesc;
+        cudaMalloc(&dw,384); cudaMalloc(&dx,384*4);
+        cudaMalloc(&dcs,3*4); cudaMalloc(&dos,3*4);
+        cudaMalloc(&dy,4); cudaMalloc(&dg,4); cudaMalloc(&du,4);
+        cudaMalloc(&ddesc,sizeof(GroupDesc));
+        cudaMemcpy(dw,hwb,384,cudaMemcpyHostToDevice);
+        cudaMemcpy(dx,hx,384*4,cudaMemcpyHostToDevice);
+        cudaMemcpy(dcs,cancel,12,cudaMemcpyHostToDevice);
+        cudaMemcpy(dos,one,12,cudaMemcpyHostToDevice);
+        GroupDesc hd_={dw,dw,dw,(const float*)dcs,(const float*)dcs,(const float*)dcs,
+                       8,8,8,1,0,0,0,0};
+        cudaMemcpy(ddesc,&hd_,sizeof(hd_),cudaMemcpyHostToDevice);
+        grouped_down_f8w<0><<<dim3(1,1),256>>>((float*)dy,(const float*)dx,
+                                               (const GroupDesc*)ddesc,1,384);
+        float got=0,expect=ldexpf(1.f,-25);
+        if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL accum-bite launch\n"); return 1; }
+        cudaMemcpy(&got,dy,4,cudaMemcpyDeviceToHost);
+        if(memcmp(&got,&expect,4)){
+            printf("FAIL grouped down accumulation convention: got %a want %a\n",got,expect);
+            return 1; }
+        GroupDesc hh_={dw,dw,dw,(const float*)dcs,(const float*)dos,(const float*)dcs,
+                       8,8,8,1,0,0,0,0};
+        cudaMemcpy(ddesc,&hh_,sizeof(hh_),cudaMemcpyHostToDevice);
+        grouped_hidden_f8w_dual<0><<<dim3(1,1),256>>>((float*)dg,(float*)du,
+                (const float*)dx,(const GroupDesc*)ddesc,1,384);
+        if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL accum-bite launch 2\n"); return 1; }
+        cudaMemcpy(&got,dg,4,cudaMemcpyDeviceToHost);
+        float g25=ldexpf(1.f,-25),hexp=(g25/(1.f+expf(-g25)))*1.f;
+        if(got==0.f||fabsf(got-hexp)>1e-3f*hexp){
+            printf("FAIL grouped hidden accumulation convention: got %a want ~%a\n",got,hexp);
+            return 1; }
+        printf("grouped accumulation convention: down bitwise 2^-25, hidden %a\n",got);
+        cudaFree(dw);cudaFree(dx);cudaFree(dcs);cudaFree(dos);
+        cudaFree(dy);cudaFree(dg);cudaFree(du);cudaFree(ddesc);
+    }
+
+    /* ---- vec/byte load-path parity (bitwise) --------------------------------
+     * f8w_block selects uchar4/float4 loads by runtime pointer alignment but
+     * feeds ONE shared product sequence: the two paths must be bit-identical
+     * on the same data. Force the byte path by offsetting x one float into a
+     * copy (4-byte aligned, 16-byte misaligned) and compare against the
+     * aligned run. */
+    {
+        const int O=8,K=256;
+        uint8_t hq[8*256]; float hxv[256],hs[2*2];
+        for(size_t i=0;i<sizeof(hq);i++) hq[i]=rnd_e4m3();
+        for(int i=0;i<K;i++) hxv[i]=(rand()/(float)RAND_MAX-.5f)*2.f;
+        for(int i=0;i<4;i++) hs[i]=ldexpf(1.f+rand()/(float)RAND_MAX,-10);
+        void *dq,*dxa,*dxm,*dya,*dym,*ds,*ddesc;
+        cudaMalloc(&dq,sizeof(hq)); cudaMalloc(&dxa,K*4); cudaMalloc(&dxm,(K+1)*4);
+        cudaMalloc(&dya,O*4); cudaMalloc(&dym,O*4); cudaMalloc(&ds,sizeof(hs));
+        cudaMalloc(&ddesc,sizeof(GroupDesc));
+        cudaMemcpy(dq,hq,sizeof(hq),cudaMemcpyHostToDevice);
+        cudaMemcpy(dxa,hxv,K*4,cudaMemcpyHostToDevice);
+        cudaMemcpy((float*)dxm+1,hxv,K*4,cudaMemcpyHostToDevice);
+        cudaMemcpy(ds,hs,sizeof(hs),cudaMemcpyHostToDevice);
+        GroupDesc pd={dq,dq,dq,(const float*)ds,(const float*)ds,(const float*)ds,
+                      8,8,8,1,0,0,0,0};
+        cudaMemcpy(ddesc,&pd,sizeof(pd),cudaMemcpyHostToDevice);
+        grouped_down_f8w<0><<<dim3(1,1),256>>>((float*)dya,(const float*)dxa,
+                                               (const GroupDesc*)ddesc,O,K);
+        grouped_down_f8w<0><<<dim3(1,1),256>>>((float*)dym,(const float*)dxm+1,
+                                               (const GroupDesc*)ddesc,O,K);
+        if(cudaDeviceSynchronize()!=cudaSuccess){ printf("FAIL parity launch\n"); return 1; }
+        float ya[O],ym[O];
+        cudaMemcpy(ya,dya,O*4,cudaMemcpyDeviceToHost);
+        cudaMemcpy(ym,dym,O*4,cudaMemcpyDeviceToHost);
+        if(memcmp(ya,ym,sizeof(ya))){ printf("FAIL vec/byte load paths differ bitwise\n"); return 1; }
+        printf("vec/byte load-path parity: bitwise OK\n");
+        cudaFree(dq);cudaFree(dxa);cudaFree(dxm);cudaFree(dya);cudaFree(dym);
+        cudaFree(ds);cudaFree(ddesc);
     }
 
     /* ---- mixed group (fmt=8 + fmt=2): fallback equals per-expert MLP ------- */
