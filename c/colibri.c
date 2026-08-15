@@ -888,7 +888,9 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                     accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0u, accu);
                     accu=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1u, accu);
                 }
-                ag+=hsum256(accg)*scg; au+=hsum256(accu)*scu;
+                /* Same pinning as matmul_i4_grouped in quant.h: contraction
+                 * here is the compiler's choice, so the result was too. */
+                ag=fmaf(hsum256(accg),scg,ag); au=fmaf(hsum256(accu),scu,au);
 #endif
                 for(; i+1<base+glen; i+=2){
                     uint8_t bg=wg[i>>1], bu=wu2[i>>1];
