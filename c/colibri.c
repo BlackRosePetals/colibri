@@ -2682,7 +2682,7 @@ static void cluster_init(void){
     char *copy=strdup(list),*save=NULL;
     for(char *tok=strtok_r(copy,",",&save);tok&&g_cluster_n<16;tok=strtok_r(NULL,",",&save)){
         while(*tok==' '||*tok=='\t') tok++;
-        if(cluster_connect_one(tok,&g_cluster_workers[g_cluster_n])) g_cluster_n++;
+        if(!cluster_connect_one(tok,&g_cluster_workers[g_cluster_n])) g_cluster_n++;
         else fprintf(stderr,"[CLUSTER] cannot connect to expert worker %s\n",tok);
     }
     free(copy);
