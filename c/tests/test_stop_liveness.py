@@ -27,7 +27,7 @@ class StopLivenessTest(unittest.TestCase):
     def test_probe_exists(self):
         """cmd_stop must not use the raw POSIX idiom for liveness."""
         self.assertTrue(hasattr(self.coli, "_pid_alive"))
-        src = open(COLI, encoding="utf-8").read()
+        with open(COLI, encoding="utf-8") as f: src = f.read()
         stop = src[src.index("def cmd_stop("):]
         stop = stop[:stop.index("\ndef ")]
         self.assertNotIn("os.kill(pid,0)", stop)
@@ -44,7 +44,7 @@ class StopLivenessTest(unittest.TestCase):
 
     def test_sigkill_lookup_is_guarded(self):
         """signal.SIGKILL is absent on win32 and AttributeError is not OSError."""
-        src = open(COLI, encoding="utf-8").read()
+        with open(COLI, encoding="utf-8") as f: src = f.read()
         stop = src[src.index("def cmd_stop("):]
         stop = stop[:stop.index("\ndef ")]
         # the *call* must not name it directly; the explanatory comment may.
@@ -57,8 +57,9 @@ class OrphanJobTest(unittest.TestCase):
     KILL_ON_JOB_CLOSE is what ties it to the server's lifetime on Windows."""
 
     def test_engine_takes_a_job_handle(self):
-        src = open(os.path.join(os.path.dirname(HERE), "openai_server.py"),
-                   encoding="utf-8").read()
+        with open(os.path.join(os.path.dirname(HERE), "openai_server.py"),
+                  encoding="utf-8") as f:
+            src = f.read()
         self.assertIn("_win_kill_on_close_job", src)
         self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", src)
         self.assertIn("_win_kill_on_close_job(getattr(self.process,", src)
@@ -66,13 +67,45 @@ class OrphanJobTest(unittest.TestCase):
         # with a fake process object that has none.
         self.assertIn('if sys.platform == "win32":', src)
 
-    def test_helper_is_a_noop_off_windows(self):
+    @staticmethod
+    def _server():
         sys.path.insert(0, os.path.dirname(HERE))
         try:
             import openai_server
-            self.assertIsNone(openai_server._win_kill_on_close_job(os.getpid()))
+            return openai_server
         finally:
             sys.path.pop(0)
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "on win32 it returns a real job handle; see the test below")
+    def test_helper_is_a_noop_off_windows(self):
+        self.assertIsNone(self._server()._win_kill_on_close_job(os.getpid()))
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are a Windows mechanism")
+    def test_job_kills_the_child_when_the_handle_closes(self):
+        """The whole point: closing the job must take the process with it.
+
+        Never pass os.getpid() here. Assigning the test runner itself to a
+        KILL_ON_JOB_CLOSE job means the first CloseHandle -- ours, or a GC of a
+        stray reference -- terminates the runner. An earlier version of this
+        file did exactly that and CI only survived because a raw HANDLE is a
+        plain int that Python never closes for you.
+        """
+        import ctypes
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        job = None
+        try:
+            job = self._server()._win_kill_on_close_job(child.pid)
+            self.assertIsNotNone(job, "job creation failed on a live child")
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
+            job = None
+            child.wait(timeout=15)          # raises TimeoutExpired if it survived
+            self.assertIsNotNone(child.returncode)
+        finally:
+            if job:
+                ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(job)
+            if child.poll() is None:
+                child.kill(); child.wait(timeout=10)
 
 
 if __name__ == "__main__":
