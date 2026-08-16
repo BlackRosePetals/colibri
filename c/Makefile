@@ -174,6 +174,8 @@ CUDA      ?= 0
 CUDA_DLL  ?= 0
 COLI_ANS  ?= 0
 DIETGPU_ROOT ?=
+DEEPGEMM  ?= 0
+NCCL      ?= 0
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
 # GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
@@ -221,19 +223,24 @@ endif
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
+# NVCC_STD is a variable so an optional backend can raise the standard without
+# rewriting the whole flag line: DEEPGEMM=1 needs C++20, and replacing
+# NVCCFLAGS wholesale to get it would also discard $(CUDA_GENCODE) and any
+# -ccbin the user set above.
+NVCC_STD ?= c++17
 ifneq ($(IS_WIN),)
 # nvcc's host compiler on Windows is MSVC cl.exe: the GCC-style
 # -Xcompiler=-Wall,-Wextra is rejected ("D8021 invalid numeric argument
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 -ftz=false $(CUDA_GENCODE) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-W3
 else
 # -ftz=false is nvcc's default, pinned explicitly: the fmt=8 kernels are
 # cross-tier parity instruments and a flushed scale*subnormal contribution
 # silently diverges from the CPU reference (backend_cuda.cu also #errors on
 # fast-math builds, but -ftz alone defines no macro to guard on).
-NVCCFLAGS ?= -O3 -std=c++17 -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+NVCCFLAGS ?= -O3 -std=$(NVCC_STD) -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
 # glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
 # with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
 # under C++17 (noexcept is part of the function type since C++17). Force-include
@@ -437,7 +444,7 @@ ifeq ($(HIP),1)
 $(error choose CUDA=1 or HIP=1, not both)
 endif
 CFLAGS   += -DCOLI_CUDA
-LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lstdc++
+LDFLAGS  += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcudart -lcublasLt -lcublas -lstdc++
 CUDA_OBJ  = backend_cuda.o
 INK_CUDA_OBJ = backend_cuda_ink.o
 ifeq ($(COLI_ANS),1)
@@ -449,6 +456,36 @@ GPUFLAGS += -DCOLI_ANS -I$(DIETGPU_ROOT) -I$(DIETGPU_ROOT)/build/third_party/glo
 ANS_LIBS  = -L$(DIETGPU_ROOT)/build/lib -Wl,-rpath,$(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
 ANS_NVCC_LIBS = -L$(DIETGPU_ROOT)/build/lib -Xlinker -rpath -Xlinker $(DIETGPU_ROOT)/build/lib -lgpu_ans -ldietgpu_utils -lglog
 LDFLAGS  += $(ANS_LIBS)
+endif
+
+# --- DeepSeek V4 CUDA kernels -------------------------------------------
+# The GPU tier for the DeepSeek V4 engine in Makefile.deepseek-v4. These
+# objects are self-contained: backend_cuda_dsv4.* include only their own header
+# and the CUDA runtime, so they build and their tests run without the engine.
+#
+# DEEPGEMM is unsupported: CI cannot compile it without an external checkout,
+# and its kernels require Blackwell to run. It gates nothing and blocks nothing;
+# the default build is the supported configuration.
+DSV4_CUDA_OBJ = backend_cuda_dsv4.o
+ifeq ($(DEEPGEMM),1)
+ifndef DEEPGEMM_HOME
+$(error DEEPGEMM_HOME must point to a DeepGEMM include tree)
+endif
+CFLAGS += -DCOLI_DSV4_DEEPGEMM
+# Append, never replace. This was `:=` and discarded the whole inherited flag
+# set: $(CUDA_GENCODE), so any CUDA_ARCH the user chose was silently swapped for
+# a hardcoded sm_120f -- making DEEPGEMM=1 a Blackwell-only path by accident
+# rather than by design -- and the -ccbin above, which is how a host whose
+# default g++ is too new for CUDA names a supported host compiler. DeepGEMM
+# needs C++20 and the relaxed-constexpr/extended-lambda pair, not its own arch.
+override NVCC_STD  := c++20
+override NVCCFLAGS += --expt-relaxed-constexpr --expt-extended-lambda -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)"
+LDFLAGS += -lcuda
+endif
+ifeq ($(NCCL),1)
+CFLAGS += -DCOLI_DSV4_NCCL
+override NVCCFLAGS += -DCOLI_DSV4_NCCL
+LDFLAGS += -lnccl
 endif
 endif
 
@@ -655,6 +692,10 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
+
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -719,6 +760,24 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
 	./mxfp4_cuda_test$(EXE)
 
+
+# The DeepSeek V4 kernels on their own: dense, batched attention and routed MoE
+# against the CPU reference in each test. Needs a GPU, so CI compiles it via
+# gpu-compile rather than running it.
+dsv4-cuda-test: tests/test_dsv4_dense_batch_cuda.c tests/test_dsv4_attention_batch_cuda.c tests/test_dsv4_moe_batch_cuda.c backend_cuda_dsv4.h $(DSV4_CUDA_OBJ)
+	$(CC) $(CFLAGS) tests/test_dsv4_dense_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_attention_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_attention_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_attention_cuda_test$(EXE)
+	$(CC) $(CFLAGS) tests/test_dsv4_moe_batch_cuda.c $(DSV4_CUDA_OBJ) -o dsv4_moe_cuda_test$(EXE) $(LDFLAGS)
+	./dsv4_moe_cuda_test$(EXE)
+
+# Pure-CPU unit tests for the two headers the kernels consume. No GPU, no model.
+tests/test_dsv4_mhc$(EXE): tests/test_dsv4_mhc.c dsv4_mhc.h
+	$(CC) $(CFLAGS) tests/test_dsv4_mhc.c -o tests/test_dsv4_mhc$(EXE) $(LDFLAGS)
+
+tests/test_dsv4_quant$(EXE): tests/test_dsv4_quant.c dsv4_quant.h
+	$(CC) $(CFLAGS) tests/test_dsv4_quant.c -o tests/test_dsv4_quant$(EXE) $(LDFLAGS)
 # convenience alias: kernel correctness on AMD (same test, hipcc toolchain)
 hip-test:
 	$(MAKE) cuda-test HIP=1
@@ -1150,6 +1209,7 @@ bench: iobench$(EXE)
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
 .PHONY: test-asan
+.PHONY: dsv4-cuda-test
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)
