@@ -571,8 +571,15 @@ def env_for(a):
         if (sys.platform == "win32" and a.gpu is None and not a.vram
                 and e.get("COLI_CUDA") != "0"):
             if cuda_binary():
-                from resource_plan import discover_gpus, build_plan, environment_for_plan, format_bytes
-                gpus = discover_gpus()
+                from resource_plan import (discover_gpus, plans_placement, build_plan,
+                                           environment_for_plan, format_bytes)
+                # Auto-enable is an automatic placement decision, so it may only
+                # be made from devices whose free memory is a qualified budget.
+                # A discovered-but-unqualified device (free_bytes None: a Windows
+                # AMD part found through hipInfo) reaches the engine env here
+                # WITHOUT passing through environment_for_plan, so the planner's
+                # own gate cannot cover this path -- filter at the source.
+                gpus = [g for g in discover_gpus() if plans_placement(g)]
                 if gpus:
                     e["COLI_CUDA"]="1"
                     e.setdefault("COLI_GPUS", ",".join(str(g["index"]) for g in gpus))
