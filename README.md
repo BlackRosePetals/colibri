@@ -476,7 +476,10 @@ python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
 
 Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
 with V4's native prompt and DSML call blocks; grammar is not supported. See the
-[per-engine API matrix](docs/api.md#tool-calling-support).
+[per-engine API matrix](docs/api.md#tool-calling-support). Prefix checkpoints
+(in memory + on disk) make agent sessions and follow-up turns start in seconds
+after the first prefill of a system prompt — see
+[docs/deepseek-v4.md](docs/deepseek-v4.md).
 
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`

@@ -79,10 +79,71 @@ V4 chat uses native model markers. Native serving currently supports greedy
 generation and one active KV slot. The HTTP gateway renders OpenAI and
 Anthropic tools into V4's native prompt contract, then parses DSML call blocks
 back into each protocol; grammar remains unsupported. See the
-[per-engine API matrix](api.md#tool-calling-support). Requests reuse a strict
-prompt prefix and prefill only its new suffix; divergent prompts prefill from
-the start. The process, weights, dense tensors, head, and expert cache stay
-warm.
+[per-engine API matrix](api.md#tool-calling-support). The process, weights,
+dense tensors, head, and expert cache stay warm across requests, and prefix
+checkpoints (next section) let a new request skip the part of its context the
+engine has already prefilled — including across sessions and restarts, not
+only a strict extension of the previous prompt.
+
+## Prefill: segments, chunks, checkpoints
+
+Prefill is layer-major over token chunks; a serve session that receives an
+agent's second turn used to re-prefill the whole conversation because the
+window/compressor/indexer state cannot rewind. This section is what changed.
+
+- **Chunks/segments.** Prefill runs over 128-token chunks (`V4_PREFILL_CHUNK`,
+  clamp [1,128]; was 64 — one fewer expert sweep per token, +3 % on the CPU
+  path) inside 4096-token segments (`V4_PREFILL_SEGMENT`). Segments are
+  atomic: the client-cancel poll (`ColiV4SessionAbortFn should_abort` in the
+  session options, driven by the gateway when the HTTP client disconnects)
+  runs between them, and completed segments are recorded, so an identical
+  retry after a client timeout resumes instead of restarting. Every segment
+  re-sweeps each layer's routed experts (disk-bound), so fewer/larger segments
+  = fewer sweeps at the price of cancel latency. Progress lines
+  `v4_prefill N/M tokens` print per segment on multi-segment prompts.
+- **Prefix checkpoints** (`V4_PREFIX_CKPT` (1), min length
+  `V4_PREFIX_CKPT_MIN` (512)). A snapshot of the attention transaction
+  (window KV + compressed slots + compressor/indexer state, the existing
+  `ColiV4AttentionSnapshot`) is taken at a shared boundary and restored on a
+  later request whose prompt starts with the same bytes. Three capture rules:
+  (1) the gateway tells the engine where the rendered system turn ends
+  (optional 8th `SUBMIT` header field, `prefix_bytes` in the session options)
+  → snapshot there on the very first request; (2) fallback: the longest
+  common prefix of two successive fresh prompts; (3) **prompt-end** snapshot
+  after every prefill, because agent clients (opencode and friends) re-render
+  the assistant reply, so strict "extends everything fed" reuse fails at the
+  reply boundary. `V4_PREFIX_CKPT_SLOTS` (4) in-memory slots, LRU with
+  prompt-end captures evicted first. Log lines: `v4_ckpt store prefix=N` /
+  `prompt_end=N`, `v4_ckpt hit prefix=N`; `V4_PREFIX_LOG=1` explains
+  decisions.
+- **Persistence.** Prefix captures are written to `<model>/.coli_ckpt/`
+  (`V4_PREFIX_CKPT_DISK` (1); `2` also persists prompt-end captures, `0` off;
+  ~140 MB for an 8.3k-token prefix, config-fingerprinted, temp+rename) and
+  loaded lazily on the first request after a restart, so a fresh serve does
+  not re-prefill a known system prompt. Snapshot (de)serialization is the new
+  `coli_v4_{attention,compressor,indexer}_snapshot_write/read`.
+- **Batched indexer selection** (`V4_IDX_BATCH` (1)): in prefill the Lightning
+  Indexer advances per token but scores/selects once per chunk (past
+  `index_topk` candidates), with per-token numerics unchanged; `0` restores
+  the per-token loop. `V4_IDX_IDENTITY` (0): `1` skips scoring while every
+  candidate fits under `index_topk` (index order instead of score order,
+  ~8 % faster prefill, changes rounding — off so greedy text matches
+  upstream).
+
+Measured with an 8.3k-token agent system prompt (opencode) on the CPU path:
+the second and every later turn/session skips the shared prefix entirely
+(seconds instead of a full re-prefill), and a serve restart restores it from
+disk.
+
+### Environment (added here)
+
+| var | meaning |
+|---|---|
+| `V4_PREFILL_CHUNK` (128) / `V4_PREFILL_SEGMENT` (4096) | chunk width / atomic segment length |
+| `V4_PREFIX_CKPT` (1), `V4_PREFIX_CKPT_MIN` (512), `V4_PREFIX_CKPT_SLOTS` (4), `V4_PREFIX_CKPT_DISK` (1), `V4_PREFIX_LOG` | prefix checkpoints, see above |
+| `V4_IDX_BATCH` (1) / `V4_IDX_IDENTITY` (0) | batched indexer selection / identity short-circuit |
+| `COLI_V4_ROWS16` (1) | `0` = never repack hot experts into the rows16 layout (reference matvec for every expert; for numerics comparisons) |
+| `DSV4_ATTN_PROF`, `DSV4_DECODE_PROF` | per-chunk attention-block / per-token decode profilers on stderr |
 
 ## Validation
 
@@ -107,9 +168,30 @@ make deepseek-v4-oracle MODEL=/path/to/DeepSeek-V4-Flash \
 The oracle is target-only. DSpark on/off speed, acceptance, and token identity
 evidence belong to the stacked DSpark PR.
 
+### What "identical output" means on the CPU path
+
+Greedy text is a regression check within one configuration, not an identity
+proof across configurations: the hot-expert rows16 kernel and the reference
+matvec accumulate in different orders, and the hot set itself depends on the
+`.coli_usage` history, chunk width and cache hits, so two runs of *upstream*
+can differ after a few dozen tokens. With the variables that make both sides
+run the same kernels on the same experts —
+
+```bash
+COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 COLI_V4_SAVE_USAGE=0 V4_PREFIX_CKPT=0
+```
+
+— an 826-token prompt, 48 greedy tokens, `--memory-gb 22`, gives byte-identical
+text between upstream `dev` and this branch (2026-08-16). Compare with 48
+tokens rather than 8 (short outputs hide the first divergence) and strip the
+`TUNE decode` line. The tiny fixture (`make deepseek-v4-tiny-check`) is
+token-exact.
+
 ## Follow-ups
 
 - Add non-greedy sampling and more serving slots.
 - Add shared replacements for the two temporary private quant paths above.
 - In the stacked PR, restore DSpark without changing target tokens and report
   DSpark on/off performance and acceptance data.
+- Prefix checkpoints are keyed on prompt bytes; a tokenizer-level key would
+  also survive whitespace-only differences in the rendered system turn.
