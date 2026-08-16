@@ -1133,6 +1133,8 @@ static int v4_dspark_draft(ColiV4Engine *engine,
 
     int noise_token = getenv("V4_MTP_NOISE")
         ? atoi(getenv("V4_MTP_NOISE")) : 128799;
+    if (noise_token < 0 || noise_token >= config->vocab_size)
+        noise_token = 0;
     size_t flat = (size_t)hc * hidden;
     for (int item = 0; item < V4_DSPARK_BLOCK; item++) {
         int token = item == 0 ? anchor_token : noise_token;

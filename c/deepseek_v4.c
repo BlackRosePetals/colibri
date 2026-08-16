@@ -857,6 +857,7 @@ const void *coli_v4_layer_data(const ColiDeepSeekV4LayerWeights *weights,
     }
     return NULL;
 }
+
 /* ---- end include deepseek_v4_layer.c ---- */
 
 #undef coli_v4_layer_free
@@ -1834,6 +1835,17 @@ static int prepare_compressed_state(
     return 0;
 }
 
+/* Create/bind this layer's compressor and indexer without attending: a
+ * checkpoint restore on a fresh process needs the recurrent objects to
+ * exist before the snapshot can be copied into them. */
+int coli_v4_window_attention_prepare(ColiDeepSeekV4WindowAttentionState *state,
+                                     const ColiDeepSeekV4LayerWeights *weights,
+                                     const ColiDeepSeekV4Config *config,
+                                     char *error, size_t error_size) {
+    if (!state || !weights || !config) return -1;
+    return prepare_compressed_state(state, weights, config, error, error_size);
+}
+
 static int grow_compressed_state(ColiDeepSeekV4WindowAttentionState *state,
                                  char *error, size_t error_size) {
     if (state->compressed_count < state->compressed_capacity) return 0;
@@ -1961,9 +1973,19 @@ static int attention_token_impl(float *output,
             compressed_indices = malloc((size_t)config->index_topk *
                                         sizeof(*compressed_indices));
             if (!compressed_indices) result = -1;
-            else compressed_selected = coli_v4_indexer_step(
-                state->indexer, compressed_indices, config->index_topk,
-                qa, input, position, error, error_size);
+            else {
+                /* Same split as prefill: advance, then select_batch with a
+                 * batch of one (chunk-wide scoring past index_topk). */
+                int visible = coli_v4_indexer_advance(
+                    state->indexer, input, position, NULL, NULL,
+                    error, error_size);
+                if (visible < 0) result = -1;
+                else if (coli_v4_indexer_select_batch(
+                             state->indexer, compressed_indices,
+                             config->index_topk, qa, input, position, 1,
+                             &visible, &compressed_selected, error,
+                             error_size)) result = -1;
+            }
             if (compressed_selected < 0) result = -1;
         }
     }
@@ -2077,19 +2099,21 @@ static int attention_token_impl(float *output,
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    for (int group = 0; !result && group < groups; group++) {
-        ColiTensorView group_view = wo_a;
-        group_view.rows = o_rank;
-        group_view.columns = group_width;
-        group_view.data = (const uint8_t *)wo_a.data +
-            (size_t)group * o_rank * group_width;
-        group_view.scales = (const uint8_t *)wo_a.scales +
-            (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
-        group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes =
-            (size_t)scale_rows_per_group * scale_columns * sizeof(float);
-        result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
-                                     attended + (size_t)group * group_width);
+    if (!result) {
+        for (int group = 0; group < groups; group++) {
+            ColiTensorView group_view = wo_a;
+            group_view.rows = o_rank;
+            group_view.columns = group_width;
+            group_view.data = (const uint8_t *)wo_a.data +
+                (size_t)group * o_rank * group_width;
+            group_view.scales = (const uint8_t *)wo_a.scales +
+                (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
+            group_view.data_bytes = (size_t)o_rank * group_width;
+            group_view.scale_bytes =
+                (size_t)scale_rows_per_group * scale_columns * sizeof(float);
+            result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
+                                         attended + (size_t)group * group_width);
+        }
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
     if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
@@ -2466,19 +2490,21 @@ static int attention_token_impl(float *output,
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    for (int group = 0; !result && group < groups; group++) {
-        ColiTensorView group_view = wo_a;
-        group_view.rows = o_rank;
-        group_view.columns = group_width;
-        group_view.data = (const uint8_t *)wo_a.data +
-            (size_t)group * o_rank * group_width;
-        group_view.scales = (const uint8_t *)wo_a.scales +
-            (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
-        group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes =
-            (size_t)scale_rows_per_group * scale_columns * sizeof(float);
-        result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
-                                     attended + (size_t)group * group_width);
+    if (!result) {
+        for (int group = 0; group < groups; group++) {
+            ColiTensorView group_view = wo_a;
+            group_view.rows = o_rank;
+            group_view.columns = group_width;
+            group_view.data = (const uint8_t *)wo_a.data +
+                (size_t)group * o_rank * group_width;
+            group_view.scales = (const uint8_t *)wo_a.scales +
+                (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
+            group_view.data_bytes = (size_t)o_rank * group_width;
+            group_view.scale_bytes =
+                (size_t)scale_rows_per_group * scale_columns * sizeof(float);
+            result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
+                                         attended + (size_t)group * group_width);
+        }
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
     if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
@@ -2519,13 +2545,53 @@ int coli_v4_attention_window_token_ref(
 #include "deepseek_v4_internal.h"
 #include "native_quant_batch.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+/* DSV4_ATTN_PROF=1: per-phase wall-clock accumulators for the batched
+ * attention path, printed once per chunk-layer call. Diagnostic only. */
+static int v4_attn_prof_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("DSV4_ATTN_PROF");
+        enabled = setting && atoi(setting) != 0;
+    }
+    return enabled;
+}
+static double v4_attn_prof_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+/* Per-chunk-layer scratch, reused across calls: these buffers were malloc/
+ * calloc'd and freed on EVERY chunk-layer (43 layers x 13 chunks for an
+ * 826-token prompt = 559 rounds of MB-scale heap churn and fresh page
+ * faults). Generation is single-threaded (target_batch's chunk loop), so one
+ * cached arena per slot amortizes them to zero; explicit memset keeps the old
+ * calloc semantics where the algorithm may read before writing. */
+static void *v4_attn_scratch(int slot, size_t bytes, int zero) {
+    enum { V4_ATTN_SCRATCH_SLOTS = 24 };
+    static void *arena[V4_ATTN_SCRATCH_SLOTS];
+    static size_t capacity[V4_ATTN_SCRATCH_SLOTS];
+    if (slot < 0 || slot >= V4_ATTN_SCRATCH_SLOTS || !bytes) return NULL;
+    if (capacity[slot] < bytes) {
+        free(arena[slot]);
+        arena[slot] = malloc(bytes);
+        capacity[slot] = arena[slot] ? bytes : 0;
+    }
+    if (arena[slot] && zero) memset(arena[slot], 0, bytes);
+    return arena[slot];
+}
+
 int coli_v4_attention_window_batch_ref(
     float *outputs, ColiDeepSeekV4WindowAttentionState *state,
     const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, const float *inputs,
     int start_position, int batch, char *error, size_t error_size) {
     if (!outputs || !state || !weights || !config || !inputs ||
-        start_position < 0 || batch < 1 || batch > 64)
+        start_position < 0 || batch < 1 || batch > 128)
         return set_error(error, error_size, "invalid batched attention arguments");
     int hidden = config->hidden_size, heads = config->num_attention_heads;
     int head_dim = config->head_dim, rope_dim = config->qk_rope_head_dim;
@@ -2542,30 +2608,32 @@ int coli_v4_attention_window_batch_ref(
         fp8_view(&wo_b, weights, "attn.wo_b"))
         return set_error(error, error_size, "missing batched attention tensor");
 
-    float *qa = calloc((size_t)batch * q_rank, sizeof(*qa));
-    float *q = calloc((size_t)batch * q_width, sizeof(*q));
-    float *kv = calloc((size_t)batch * head_dim, sizeof(*kv));
-    float *attended = calloc((size_t)batch * q_width, sizeof(*attended));
-    float *oa = calloc((size_t)batch * oa_width, sizeof(*oa));
-    float *norm = malloc((size_t)(q_rank > head_dim ? q_rank : head_dim) *
-                         sizeof(*norm));
-    int *selected_counts = calloc((size_t)batch, sizeof(*selected_counts));
-    int *compressed_counts = calloc((size_t)batch, sizeof(*compressed_counts));
-    int *compressed_indices = malloc((size_t)batch * config->index_topk *
-                                     sizeof(*compressed_indices));
+    float *qa = v4_attn_scratch(0, (size_t)batch * q_rank * sizeof(*qa), 1);
+    float *q = v4_attn_scratch(1, (size_t)batch * q_width * sizeof(*q), 1);
+    float *kv = v4_attn_scratch(2, (size_t)batch * head_dim * sizeof(*kv), 1);
+    float *attended = v4_attn_scratch(3, (size_t)batch * q_width * sizeof(*attended), 1);
+    float *oa = v4_attn_scratch(4, (size_t)batch * oa_width * sizeof(*oa), 1);
+    float *norm = v4_attn_scratch(5, (size_t)(q_rank > head_dim ? q_rank : head_dim) *
+                                  sizeof(*norm), 0);
+    int *selected_counts = v4_attn_scratch(6, (size_t)batch * sizeof(*selected_counts), 1);
+    int *compressed_counts = v4_attn_scratch(7, (size_t)batch * sizeof(*compressed_counts), 1);
+    int *compressed_indices = v4_attn_scratch(8, (size_t)batch * config->index_topk *
+                                              sizeof(*compressed_indices), 0);
     size_t rope_pairs = (size_t)rope_dim / 2;
     /* The batch consumes only its own positions.  A table from position zero
      * made long-context prefill scale with history that is never read here. */
-    float *cosines = malloc((size_t)batch * rope_pairs * sizeof(*cosines));
-    float *sines = malloc((size_t)batch * rope_pairs * sizeof(*sines));
+    float *cosines = v4_attn_scratch(9, (size_t)batch * rope_pairs * sizeof(*cosines), 0);
+    float *sines = v4_attn_scratch(10, (size_t)batch * rope_pairs * sizeof(*sines), 0);
     if (!qa || !q || !kv || !attended || !oa || !norm || !selected_counts ||
-        !compressed_counts || !compressed_indices || !cosines || !sines) {
-        free(sines); free(cosines); free(compressed_indices);
-        free(compressed_counts); free(selected_counts); free(norm); free(oa);
-        free(attended); free(kv); free(q); free(qa);
+        !compressed_counts || !compressed_indices || !cosines || !sines)
         return set_error(error, error_size, "out of memory in batched attention");
-    }
 
+    double prof_t = v4_attn_prof_enabled() ? v4_attn_prof_now() : 0.0;
+    double prof_qa = 0, prof_comp = 0, prof_idx = 0, prof_qb = 0,
+           prof_kv = 0, prof_rope = 0, prof_attn = 0, prof_wo = 0;
+#define V4_ATTN_PROF_MARK(slot) do { if (prof_t) { \
+        double _now = v4_attn_prof_now(); (slot) += _now - prof_t; \
+        prof_t = _now; } } while (0)
     int result = coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
@@ -2576,7 +2644,21 @@ int coli_v4_attention_window_batch_ref(
                                  config->rms_norm_eps);
         if (!result) coli_bf16_round_array(item_qa, (size_t)q_rank);
     }
+    V4_ATTN_PROF_MARK(prof_qa);
 
+    /* Whole-chunk precomputed wkv/wgate projections for the compressor and
+     * the indexer's compressor (a batched projection hook; the per-token
+     * state advance always runs here). NULL = not available: the per-token
+     * projection runs inside the step. */
+    float *comp_kv_proj = NULL, *comp_gate_proj = NULL;
+    float *idx_kv_proj = NULL, *idx_gate_proj = NULL;
+    int comp_rows = 0, idx_rows = 0;
+
+    static int idx_batch = -1;
+    if (idx_batch < 0) {
+        const char *env = getenv("V4_IDX_BATCH");
+        idx_batch = !(env && *env == '0');
+    }
     for (int item = 0; !result && item < batch; item++) {
         int position = start_position + item;
         if (weights->plan.compression_ratio) {
@@ -2585,26 +2667,69 @@ int coli_v4_attention_window_batch_ref(
             if (!result && (position + 1) % state->ratio == 0)
                 result = grow_compressed_state(state, error, error_size);
             int produced = 0;
-            if (!result) result = coli_v4_compressor_step(
-                state->compressor,
-                state->compressed + (size_t)state->compressed_count * head_dim,
-                &produced, inputs + (size_t)item * hidden, position,
-                error, error_size);
+            if (!result) result = comp_kv_proj
+                ? coli_v4_compressor_advance(
+                    state->compressor,
+                    state->compressed + (size_t)state->compressed_count * head_dim,
+                    &produced, comp_kv_proj + (size_t)item * comp_rows,
+                    comp_gate_proj + (size_t)item * comp_rows, position,
+                    error, error_size)
+                : coli_v4_compressor_step(
+                    state->compressor,
+                    state->compressed + (size_t)state->compressed_count * head_dim,
+                    &produced, inputs + (size_t)item * hidden, position,
+                    error, error_size);
             if (!result && produced) state->compressed_count++;
             compressed_counts[item] = state->compressed_count;
-            if (!result && state->indexer) {
-                selected_counts[item] = coli_v4_indexer_step(
-                    state->indexer,
-                    compressed_indices + (size_t)item * config->index_topk,
-                    config->index_topk, qa + (size_t)item * q_rank,
-                    inputs + (size_t)item * hidden, position,
+            V4_ATTN_PROF_MARK(prof_comp);
+            if (!result && state->indexer && idx_batch) {
+                /* Advance only; selection happens once for the whole chunk
+                 * below (batched wq_b projection + scoring kernel). Until
+                 * then selected_counts holds the visible candidate count. */
+                selected_counts[item] = coli_v4_indexer_advance(
+                    state->indexer, inputs + (size_t)item * hidden, position,
+                    idx_kv_proj ? idx_kv_proj + (size_t)item * idx_rows : NULL,
+                    idx_gate_proj ? idx_gate_proj + (size_t)item * idx_rows : NULL,
                     error, error_size);
+                if (selected_counts[item] < 0) result = -1;
+            } else if (!result && state->indexer) {
+                /* V4_IDX_BATCH=0: legacy per-token projection + scoring. */
+                selected_counts[item] = idx_kv_proj
+                    ? coli_v4_indexer_step_projected(
+                        state->indexer,
+                        compressed_indices + (size_t)item * config->index_topk,
+                        config->index_topk, qa + (size_t)item * q_rank,
+                        inputs + (size_t)item * hidden, position,
+                        idx_kv_proj + (size_t)item * idx_rows,
+                        idx_gate_proj + (size_t)item * idx_rows,
+                        error, error_size)
+                    : coli_v4_indexer_step(
+                        state->indexer,
+                        compressed_indices + (size_t)item * config->index_topk,
+                        config->index_topk, qa + (size_t)item * q_rank,
+                        inputs + (size_t)item * hidden, position,
+                        error, error_size);
                 if (selected_counts[item] < 0) result = -1;
             } else if (!result) {
                 selected_counts[item] = state->compressed_count;
             }
+            V4_ATTN_PROF_MARK(prof_idx);
         }
     }
+    if (!result && weights->plan.compression_ratio && state->indexer &&
+        idx_batch) {
+        int *visible = v4_attn_scratch(23, (size_t)batch * sizeof(*visible), 0);
+        if (!visible) result = -1;
+        else {
+            memcpy(visible, selected_counts, (size_t)batch * sizeof(*visible));
+            result = coli_v4_indexer_select_batch(
+                state->indexer, compressed_indices, config->index_topk, qa,
+                inputs, start_position, batch, visible, selected_counts,
+                error, error_size);
+        }
+        V4_ATTN_PROF_MARK(prof_idx);
+    }
+
 
     if (!result) result = coli_fp8_matmul_batch_ref(q, &wq_b, qa, batch);
     if (!result) coli_bf16_round_array(q, (size_t)batch * q_width);
@@ -2617,6 +2742,7 @@ int coli_v4_attention_window_batch_ref(
             for (int i = 0; i < head_dim; i++)
                 values[i] = coli_bf16_round(values[i] * scale);
         }
+    V4_ATTN_PROF_MARK(prof_qb);
 
     if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
@@ -2628,6 +2754,7 @@ int coli_v4_attention_window_batch_ref(
                                  config->rms_norm_eps);
         if (!result) coli_bf16_round_array(item_kv, (size_t)head_dim);
     }
+    V4_ATTN_PROF_MARK(prof_kv);
 
     int compressed = weights->plan.compression_ratio != 0;
     if (!result) result = coli_v4_rope_precompute_range(
@@ -2649,16 +2776,16 @@ int coli_v4_attention_window_batch_ref(
         coli_v4_rope_apply(kv_rope, 1, rope_dim, item_cos, item_sin, 0);
         coli_bf16_round_array(kv_rope, (size_t)rope_dim);
         size_t nope = (size_t)(head_dim - rope_dim);
-        float *qdq = malloc(nope * sizeof(*qdq));
-        uint8_t *scales = malloc((nope + 63) / 64);
+        float *qdq = v4_attn_scratch(17, nope * sizeof(*qdq), 0);
+        uint8_t *scales = v4_attn_scratch(18, (nope + 63) / 64, 0);
         if (!qdq || !scales || coli_fp8_activation_qdq_ref(
                 qdq, scales, item_kv, nope, 64)) result = -1;
         if (!result) {
             memcpy(item_kv, qdq, nope * sizeof(*item_kv));
             coli_bf16_round_array(item_kv, nope);
         }
-        free(scales); free(qdq);
     }
+    V4_ATTN_PROF_MARK(prof_rope);
 
     const float *sinks = layer_data(weights, "attn.attn_sink", NULL);
     for (int item = 0; !result && item < batch; item++) {
@@ -2673,9 +2800,10 @@ int coli_v4_attention_window_batch_ref(
         int compressed_count = compressed_counts[item];
         int topk = state->window_size + selected;
         int kv_count = state->window_size + compressed_count;
-        int *indices = malloc((size_t)topk * sizeof(*indices));
+        int *indices = v4_attn_scratch(21, (size_t)topk * sizeof(*indices), 0);
         float *all_kv = compressed_count
-            ? malloc((size_t)kv_count * head_dim * sizeof(*all_kv)) : NULL;
+            ? v4_attn_scratch(22, (size_t)kv_count * head_dim * sizeof(*all_kv), 0)
+            : NULL;
         if (!indices || (compressed_count && !all_kv)) result = -1;
         if (!result) {
             if (position < state->window_size - 1)
@@ -2704,7 +2832,7 @@ int coli_v4_attention_window_batch_ref(
                 item_attended, item_q, values, sinks, indices, heads, head_dim,
                 kv_count, topk, 1.0f / sqrtf((float)head_dim));
         }
-        free(all_kv); free(indices);
+
         const float *item_cos = cosines + (size_t)item * rope_pairs;
         const float *item_sin = sines + (size_t)item * rope_pairs;
         for (int head = 0; !result && head < heads; head++) {
@@ -2714,13 +2842,14 @@ int coli_v4_attention_window_batch_ref(
             coli_bf16_round_array(rope, (size_t)rope_dim);
         }
     }
+    V4_ATTN_PROF_MARK(prof_attn);
 
     int heads_per_group = heads / groups;
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows = (o_rank + 127) / 128;
-    float *group_inputs = malloc((size_t)batch * group_width * sizeof(*group_inputs));
-    float *group_outputs = malloc((size_t)batch * o_rank * sizeof(*group_outputs));
+    float *group_inputs = v4_attn_scratch(11, (size_t)batch * group_width * sizeof(*group_inputs), 0);
+    float *group_outputs = v4_attn_scratch(12, (size_t)batch * o_rank * sizeof(*group_outputs), 0);
     if (!group_inputs || !group_outputs) result = -1;
     for (int group = 0; !result && group < groups; group++) {
         for (int item = 0; item < batch; item++)
@@ -2744,14 +2873,20 @@ int coli_v4_attention_window_batch_ref(
                    group_outputs + (size_t)item * o_rank,
                    (size_t)o_rank * sizeof(*oa));
     }
-    if (!result) coli_bf16_round_array(oa, (size_t)batch * oa_width);
-    if (!result) result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
-    if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
+    if (!result) {
+        coli_bf16_round_array(oa, (size_t)batch * oa_width);
+        result = coli_fp8_matmul_batch_ref(outputs, &wo_b, oa, batch);
+        if (!result) coli_bf16_round_array(outputs, (size_t)batch * hidden);
+    }
+    V4_ATTN_PROF_MARK(prof_wo);
+    if (prof_t)
+        fprintf(stderr, "attnprof layer=%d start=%d n=%d qa=%.0f comp=%.0f "
+                "idx=%.0f qb=%.0f kv=%.0f rope=%.0f attn=%.0f wo=%.0f ms\n",
+                weights->plan.layer, start_position, batch, prof_qa * 1e3,
+                prof_comp * 1e3, prof_idx * 1e3, prof_qb * 1e3, prof_kv * 1e3,
+                prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3);
+#undef V4_ATTN_PROF_MARK
 
-    free(group_outputs); free(group_inputs);
-    free(sines); free(cosines);
-    free(compressed_indices); free(compressed_counts); free(selected_counts);
-    free(norm); free(oa); free(attended); free(kv); free(q); free(qa);
     return result ? set_error(error, error_size, "batched attention failed") : 0;
 }
 #endif /* COLI_V4_UNIT_ATTENTION_BATCH */
@@ -2878,6 +3013,11 @@ void coli_v4_compressor_destroy(ColiDeepSeekV4CompressorState *state) {
     free(state);
 }
 
+static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
+                                    float *output, int *produced,
+                                    int position, char *error,
+                                    size_t error_size);
+
 int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                             float *output, int *produced,
                             const float *input, int position,
@@ -2886,7 +3026,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "invalid compressor step arguments");
     *produced = 0;
     int slot = position % state->ratio;
-    int hidden = state->hidden, dimension = state->head_dim;
+    int hidden = state->hidden;
     int projection = state->projection_dim;
     int state_row = state->ratio == 4 ? state->ratio + slot : slot;
     char suffix[128];
@@ -2913,6 +3053,46 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         kv_row[row] = kv_sum;
         score_row[row] = gate_sum + ape[(size_t)slot * projection + row];
     }
+    return compressor_pool_and_emit(state, output, produced, position,
+                                    error, error_size);
+}
+
+/* Precomputed-projection variant: kv_proj/gate_proj are this position's
+ * wkv/wgate matvec results (computed batched); the ape bias, pooling, norm,
+ * RoPE, quantization and the sliding state all still run here so the CPU
+ * state stays canonical for decode and CPU fallbacks. */
+int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
+                               float *output, int *produced,
+                               const float *kv_proj, const float *gate_proj,
+                               int position, char *error, size_t error_size) {
+    if (!state || !produced || !kv_proj || !gate_proj || position < 0)
+        return set_error(error, error_size, "invalid compressor advance arguments");
+    *produced = 0;
+    int slot = position % state->ratio;
+    int projection = state->projection_dim;
+    int state_row = state->ratio == 4 ? state->ratio + slot : slot;
+    char suffix[128];
+    snprintf(suffix, sizeof(suffix), "%s.ape", state->prefix);
+    const float *ape = layer_value(state->weights, suffix);
+    if (!ape)
+        return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
+    float *kv_row = state->kv_state + (size_t)state_row * projection;
+    float *score_row = state->score_state + (size_t)state_row * projection;
+    for (int row = 0; row < projection; row++) {
+        kv_row[row] = kv_proj[row];
+        score_row[row] = gate_proj[row] + ape[(size_t)slot * projection + row];
+    }
+    return compressor_pool_and_emit(state, output, produced, position,
+                                    error, error_size);
+}
+
+static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
+                                    float *output, int *produced,
+                                    int position, char *error,
+                                    size_t error_size) {
+    int dimension = state->head_dim;
+    int projection = state->projection_dim;
+    char suffix[128];
     if ((position + 1) % state->ratio != 0) return 0;
     if (!output) return set_error(error, error_size, "compressor output is required");
 
@@ -3019,6 +3199,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "deepseek_v4_internal.h"
 #include "deepseek_v4_internal.h"
@@ -3162,10 +3343,259 @@ static int apply_position_rope(float *queries,
     return 0;
 }
 
-int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
-                         int index_capacity, const float *query_rank,
-                         const float *input, int position,
-                         char *error, size_t error_size) {
+/* V4_IDX_IDENTITY: when every candidate fits under index_topk, upstream still
+ * scores + sorts and returns the candidates in SCORE order; the CPU sparse
+ * attention reference accumulates the softmax in that order, so returning
+ * identity order changes float rounding (not the selected SET). Default 0 =
+ * upstream order (score); 1 = identity short-circuit (faster). */
+static int indexer_identity_wanted(void) {
+    static int wanted = -1;
+    if (wanted < 0) {
+        const char *env = getenv("V4_IDX_IDENTITY");
+        wanted = env && *env == '1';
+    }
+    return wanted;
+}
+
+/* Advance the indexer's compressor by one position (no scoring). Returns the
+ * candidate count visible to this position, or -1. */
+static int indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
+                           int position, const float *kv_proj,
+                           const float *gate_proj, char *error,
+                           size_t error_size) {
+    int dimension = state->config->index_head_dim;
+    int produced = 0;
+    if ((position + 1) % 4 == 0 && state->count >= state->capacity) {
+        int next_capacity = state->capacity * 2;
+        float *grown = realloc(state->compressed,
+            (size_t)next_capacity * dimension * sizeof(*grown));
+        if (!grown) return set_error(error, error_size, "cannot grow indexer cache");
+        memset(grown + (size_t)state->capacity * dimension, 0,
+               (size_t)(next_capacity - state->capacity) * dimension * sizeof(*grown));
+        state->compressed = grown;
+        state->capacity = next_capacity;
+    }
+    float *next = state->count < state->capacity
+        ? state->compressed + (size_t)state->count * dimension : NULL;
+    if (kv_proj && gate_proj
+            ? coli_v4_compressor_advance(state->compressor, next, &produced,
+                                         kv_proj, gate_proj, position,
+                                         error, error_size)
+            : coli_v4_compressor_step(state->compressor, next, &produced, input,
+                                      position, error, error_size)) return -1;
+    if (produced) {
+        if (state->count >= state->capacity)
+            return set_error(error, error_size, "indexer cache capacity exceeded");
+        state->count++;
+    }
+    return state->count;
+}
+
+int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
+                            int position, const float *kv_proj,
+                            const float *gate_proj, char *error,
+                            size_t error_size) {
+    if (!state || !input || position < 0)
+        return set_error(error, error_size, "invalid indexer advance arguments");
+    return indexer_advance(state, input, position, kv_proj, gate_proj,
+                           error, error_size);
+}
+
+/* Prepare one token's scoring queries in place: bf16 round, RoPE, per-head
+ * hadamard + fp4 round trip. queries holds heads*dimension floats fresh from
+ * the wq_b projection. */
+static int indexer_prepare_queries(float *queries, uint8_t *scales, float *qdq,
+                                   const ColiDeepSeekV4Config *config,
+                                   int position) {
+    int dimension = config->index_head_dim, heads = config->index_n_heads;
+    coli_bf16_round_array(queries, (size_t)heads * dimension);
+    int result = apply_position_rope(queries, config, position);
+    for (int head = 0; !result && head < heads; head++) {
+        float *query = queries + (size_t)head * dimension;
+        result = coli_hadamard_bf16_ref(query, (size_t)dimension);
+        if (!result) result = coli_fp4_activation_qdq_ref(
+            qdq, scales, query, (size_t)dimension, 32);
+        if (!result) {
+            memcpy(query, qdq, (size_t)dimension * sizeof(*query));
+            coli_bf16_round_array(query, (size_t)dimension);
+        }
+    }
+    return result;
+}
+
+static void indexer_head_weights(float *head_weights, const uint16_t *raw,
+                                 const float *input,
+                                 const ColiDeepSeekV4Config *config) {
+    int heads = config->index_n_heads, dimension = config->index_head_dim;
+    float weight_scale = 1.0f / sqrtf((float)(dimension * heads));
+    for (int head = 0; head < heads; head++) {
+        float sum = 0.0f;
+        const uint16_t *row = raw + (size_t)head * config->hidden_size;
+        for (int column = 0; column < config->hidden_size; column++)
+            sum += coli_bf16_decode(row[column]) * input[column];
+        head_weights[head] = sum * weight_scale;
+    }
+}
+
+static float indexer_score_one(const float *q, const float *key,
+                               const float *hw, int heads, int dimension) {
+    float score = 0.0f;
+    for (int head = 0; head < heads; head++) {
+        const float *query = q + (size_t)head * dimension;
+        float dot = 0.0f;
+        for (int d = 0; d < dimension; d++) dot += query[d] * key[d];
+        score += fmaxf(dot, 0.0f) * hw[head];
+    }
+    return score;
+}
+
+/* Batched selection for prefill chunks. counts[t] is the candidate count
+ * visible to token t (from coli_v4_indexer_advance, in order); every token
+ * whose count fits under index_topk gets identity selection for free, the
+ * rest are scored together: reference wq_b matvec per scored token, then
+ * one scoring kernel launch for the chunk (per-token CPU loop when the
+ * backend declines). Numerics match the per-token path exactly:
+ * same rounding chain, same sequential fp32 accumulation, same qsort. */
+int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
+                                 int index_capacity, const float *query_ranks,
+                                 const float *inputs, int start_position,
+                                 int batch, const int *counts, int *selected,
+                                 char *error, size_t error_size) {
+    if (!state || !indices || index_capacity < 1 || !query_ranks || !inputs ||
+        start_position < 0 || batch < 1 || !counts || !selected)
+        return set_error(error, error_size, "invalid indexer batch arguments");
+    const ColiDeepSeekV4Config *config = state->config;
+    int dimension = config->index_head_dim, heads = config->index_n_heads;
+    int topk = config->index_topk;
+    int need = 0, max_count = 0;
+    for (int t = 0; t < batch; t++) {
+        int *out = indices + (size_t)t * index_capacity;
+        if (counts[t] == 0 ||
+            (indexer_identity_wanted() &&
+             counts[t] <= topk && counts[t] <= index_capacity)) {
+            for (int i = 0; i < counts[t]; i++) out[i] = i;
+            selected[t] = counts[t];
+        } else {
+            selected[t] = -1;
+            need++;
+        }
+        if (counts[t] > max_count) max_count = counts[t];
+    }
+    if (!need) return 0;
+    if (max_count > state->count)
+        return set_error(error, error_size, "indexer batch counts exceed cache");
+
+    static int prof = -1;
+    if (prof < 0) prof = getenv("DSV4_ATTN_PROF") != NULL;
+    struct timespec ts_prev, ts_now;
+    double t_proj = 0, t_prep = 0, t_score = 0, t_sort = 0;
+#define IDX_PROF_MARK(acc) do { if (prof) {         clock_gettime(CLOCK_MONOTONIC, &ts_now);         acc += (ts_now.tv_sec - ts_prev.tv_sec) +                (ts_now.tv_nsec - ts_prev.tv_nsec) * 1e-9;         ts_prev = ts_now; } } while (0)
+    if (prof) clock_gettime(CLOCK_MONOTONIC, &ts_prev);
+    ColiTensorView wq;
+    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b"))
+        return set_error(error, error_size, "missing indexer query weight");
+    const uint16_t *raw_weights = value(
+        state->weights, "attn.indexer.weights_proj.weight", NULL);
+    size_t qn = (size_t)heads * dimension;
+    float *queries = malloc((size_t)batch * qn * sizeof(*queries));
+    float *sq = malloc((size_t)need * qn * sizeof(*sq));
+    float *head_weights = malloc((size_t)need * heads * sizeof(*head_weights));
+    int *scounts = malloc((size_t)need * sizeof(*scounts));
+    int *stoken = malloc((size_t)need * sizeof(*stoken));
+    float *scores = malloc((size_t)need * max_count * sizeof(*scores));
+    IndexScore *ranked = malloc((size_t)max_count * sizeof(*ranked));
+    uint8_t *scales = malloc((size_t)dimension / 32);
+    float *qdq = malloc((size_t)dimension * sizeof(*qdq));
+    int result = 0;
+    if (!queries || !sq || !head_weights || !scounts || !stoken || !scores ||
+        !ranked || !scales || !qdq || !raw_weights)
+        result = set_error(error, error_size, "out of memory scoring indexer batch");
+
+    /* Query projection: host fp8 activation quantization (the reference qdq,
+     * per token) + the per-token reference matvec. (Measured earlier: a
+     * batched fp8 GEMM mirror is no faster at 8192x1024 and its activation
+     * quantization is not bitwise the reference — the top-k boundary then
+     * flips.) */
+    for (int t = 0; !result && t < batch; t++)
+        if (selected[t] < 0 &&
+            coli_fp8_matvec_ref(queries + (size_t)t * qn, &wq,
+                                query_ranks + (size_t)t * wq.columns))
+            result = set_error(error, error_size,
+                               "indexer query projection failed");
+    IDX_PROF_MARK(t_proj);
+    /* Per-token query prep (RoPE, hadamard/fp4 round trip) and head weights
+     * are independent across tokens: assign slots first, then run them in
+     * parallel with per-token scratch. Numerics are per token, unchanged. */
+    int s = 0;
+    for (int t = 0; t < batch; t++) {
+        if (selected[t] >= 0) continue;
+        scounts[s] = counts[t];
+        stoken[s] = t;
+        s++;
+    }
+    if (!result) {
+        int prep_failed = 0;
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < need; i++) {
+            int t = stoken[i];
+            float *q = queries + (size_t)t * qn;
+            float tqdq[512];
+            uint8_t tscales[16];
+            if (dimension > 512 ||
+                indexer_prepare_queries(q, tscales, tqdq, config,
+                                        start_position + t)) {
+                #pragma omp atomic write
+                prep_failed = 1;
+                continue;
+            }
+            memcpy(sq + (size_t)i * qn, q, qn * sizeof(*sq));
+            indexer_head_weights(head_weights + (size_t)i * heads, raw_weights,
+                                 inputs + (size_t)t * config->hidden_size,
+                                 config);
+        }
+        if (prep_failed)
+            result = set_error(error, error_size, "indexer query prep failed");
+    }
+    IDX_PROF_MARK(t_prep);
+    if (!result)
+        for (int i = 0; i < need; i++)
+            for (int candidate = 0; candidate < scounts[i]; candidate++)
+                scores[(size_t)i * max_count + candidate] = indexer_score_one(
+                    sq + (size_t)i * qn,
+                    state->compressed + (size_t)candidate * dimension,
+                    head_weights + (size_t)i * heads, heads, dimension);
+    IDX_PROF_MARK(t_score);
+    for (int i = 0; !result && i < need; i++) {
+        int t = stoken[i];
+        const float *row = scores + (size_t)i * max_count;
+        for (int candidate = 0; candidate < scounts[i]; candidate++)
+            ranked[candidate] = (IndexScore){row[candidate], candidate};
+        qsort(ranked, (size_t)scounts[i], sizeof(*ranked), descending_score);
+        int n = scounts[i];
+        if (n > topk) n = topk;
+        if (n > index_capacity) n = index_capacity;
+        int *out = indices + (size_t)t * index_capacity;
+        for (int k = 0; k < n; k++) out[k] = ranked[k].index;
+        selected[t] = n;
+    }
+    IDX_PROF_MARK(t_sort);
+    if (prof)
+        fprintf(stderr, "idxprof layer=%d start=%d scored=%d cand=%d "
+                "proj=%.0f prep=%.0f score=%.0f sort=%.0f ms%s\n",
+                state->layer, start_position, need, max_count, t_proj * 1e3,
+                t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
+                "");
+#undef IDX_PROF_MARK
+    free(qdq); free(scales); free(ranked); free(scores); free(stoken);
+    free(scounts); free(head_weights); free(sq); free(queries);
+    return result;
+}
+
+static int indexer_step_common(ColiDeepSeekV4Indexer *state, int *indices,
+                               int index_capacity, const float *query_rank,
+                               const float *input, int position,
+                               const float *kv_proj, const float *gate_proj,
+                               char *error, size_t error_size) {
     if (!state || !indices || index_capacity < 1 || !query_rank || !input ||
         position < 0)
         return set_error(error, error_size, "invalid indexer step arguments");
@@ -3184,14 +3614,30 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
     }
     float *next = state->count < state->capacity
         ? state->compressed + (size_t)state->count * dimension : NULL;
-    if (coli_v4_compressor_step(state->compressor, next, &produced, input,
-                                position, error, error_size)) return -1;
+    if (kv_proj && gate_proj
+            ? coli_v4_compressor_advance(state->compressor, next, &produced,
+                                         kv_proj, gate_proj, position,
+                                         error, error_size)
+            : coli_v4_compressor_step(state->compressor, next, &produced, input,
+                                      position, error, error_size)) return -1;
     if (produced) {
         if (state->count >= state->capacity)
             return set_error(error, error_size, "indexer cache capacity exceeded");
         state->count++;
     }
     if (!state->count) return 0;
+    /* Selection is the top-index_topk candidates by score.  When every
+     * candidate fits (count <= topk and <= caller capacity) the scores only
+     * permute the index order, and sparse attention sums over the SET of
+     * selected entries, so the query projection, hadamard/fp4 round-trip and
+     * scoring cannot change the output.  Skip them entirely: short prompts
+     * spend ~10M MACs per token per indexer layer here. */
+    if (indexer_identity_wanted() &&
+        state->count <= state->config->index_topk &&
+        state->count <= index_capacity) {
+        for (int i = 0; i < state->count; i++) indices[i] = i;
+        return state->count;
+    }
 
     ColiTensorView wq;
     if (fp8_view(&wq, state->weights, "attn.indexer.wq_b"))
@@ -3246,6 +3692,27 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
     for (int i = 0; !result && i < selected; i++) indices[i] = scores[i].index;
     free(qdq); free(scales); free(scores); free(head_weights); free(queries);
     return result ? set_error(error, error_size, "indexer scoring failed") : selected;
+}
+
+int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
+                         int index_capacity, const float *query_rank,
+                         const float *input, int position,
+                         char *error, size_t error_size) {
+    return indexer_step_common(state, indices, index_capacity, query_rank,
+                               input, position, NULL, NULL, error, error_size);
+}
+
+/* Precomputed-projection variant: kv_proj/gate_proj are this position's rows
+ * of the indexer-compressor wkv/wgate projections (computed batched); scoring and
+ * every piece of indexer state remain on the CPU. */
+int coli_v4_indexer_step_projected(ColiDeepSeekV4Indexer *state, int *indices,
+                                   int index_capacity, const float *query_rank,
+                                   const float *input, int position,
+                                   const float *kv_proj, const float *gate_proj,
+                                   char *error, size_t error_size) {
+    return indexer_step_common(state, indices, index_capacity, query_rank,
+                               input, position, kv_proj, gate_proj,
+                               error, error_size);
 }
 
 const float *coli_v4_indexer_compressed_values(
@@ -3349,6 +3816,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "deepseek_v4_internal.h"
 #include "deepseek_v4_internal.h"
@@ -3984,10 +4452,12 @@ static int moe_token_pipeline(float *output,
         for (int i = 0; i < topk; i++)
             indices[i] = (int)table[(size_t)token * topk + i];
 #ifndef COLI_V4_DISABLE_BF16_ROUTE
-    if (!result) result = coli_v4_route_bf16(
-        route_weights, indices, input, raw_gate, bias,
-        weights->plan.uses_hash_router ? indices : NULL,
-        n, d, topk, config->routed_scaling_factor);
+    if (!result) {
+            result = coli_v4_route_bf16(
+                route_weights, indices, input, raw_gate, bias,
+                weights->plan.uses_hash_router ? indices : NULL,
+                n, d, topk, config->routed_scaling_factor);
+    }
 #else
     if (!result) result = coli_v4_route(
         route_weights, indices, input, gate, bias,
@@ -4052,7 +4522,6 @@ static int moe_token_pipeline(float *output,
             loader_active = 1;
     }
 #endif
-
     ColiTensorView w1, w2, w3;
     if (!result && (fp8_view(&w1, weights, "ffn.shared_experts.w1") ||
                     fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
@@ -4062,46 +4531,56 @@ static int moe_token_pipeline(float *output,
     if (!result) memset(output, 0, (size_t)d * sizeof(*output));
 
 #ifdef COLI_V4_EXPERIMENTAL_DUAL_EXPERT_LOADER
-    for (int current = 0; !result && current < selected; current++) {
-        int slot = current % dual_loader_lanes();
-        if (!loader_active[slot] ||
-            profiled_expert_load_finish(&loaders[slot]) != 0) {
-            result = -1; break;
-        }
-        loader_active[slot] = 0;
-        if (jobs[slot].result) { result = -1; break; }
-        ColiExpertView expert = jobs[slot].view;
+    ColiExpertView *views = malloc((size_t)selected * sizeof(*views));
+    if (!views) result = -1;
+    if (!result) {
+        memset(views, 0, (size_t)selected * sizeof(*views));
+        for (int current = 0; !result && current < selected; current++) {
+            int slot = current % dual_loader_lanes();
+            if (!loader_active[slot] ||
+                profiled_expert_load_finish(&loaders[slot]) != 0) {
+                result = -1; break;
+            }
+            loader_active[slot] = 0;
+            if (jobs[slot].result) { result = -1; break; }
+            views[current] = jobs[slot].view;
 
-        int next = current + dual_loader_lanes();
-        if (next < selected) {
-            memset(&jobs[slot], 0, sizeof(jobs[slot]));
-            jobs[slot].store = store;
-            jobs[slot].key = (ColiExpertKey){weights->plan.layer,
-                                            expert_ids[next]};
-            jobs[slot].result = -1;
-            if (profiled_expert_load_start(&loaders[slot],
-                                           &jobs[slot]) != 0)
-                result = -1;
-            else
-                loader_active[slot] = 1;
+            int next = current + dual_loader_lanes();
+            if (next < selected) {
+                memset(&jobs[slot], 0, sizeof(jobs[slot]));
+                jobs[slot].store = store;
+                jobs[slot].key = (ColiExpertKey){weights->plan.layer,
+                                                expert_ids[next]};
+                jobs[slot].result = -1;
+                if (profiled_expert_load_start(&loaders[slot],
+                                               &jobs[slot]) != 0)
+                    result = -1;
+                else
+                    loader_active[slot] = 1;
+            }
         }
-        if (!result) {
-            double mm0 = v4_now_mono();
-            result = coli_v4_expert_forward_ref(
-                expert_output, &expert, input, expert_weights[current],
-                config->swiglu_limit);
-            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
-        }
-        coli_expert_release(store, &expert);
-        if (!result)
-            for (int i = 0; i < d; i++) output[i] += expert_output[i];
+        for (int slot = 0; slot < dual_loader_lanes(); slot++)
+            if (loader_active[slot]) {
+                profiled_expert_load_finish(&loaders[slot]);
+                if (!jobs[slot].result)
+                    coli_expert_release(store, &jobs[slot].view);
+            }
     }
-    for (int slot = 0; slot < dual_loader_lanes(); slot++)
-        if (loader_active[slot]) {
-            profiled_expert_load_finish(&loaders[slot]);
-            if (!jobs[slot].result)
-                coli_expert_release(store, &jobs[slot].view);
+    {
+        for (int current = 0; !result && current < selected; current++) {
+            if (!result) result = coli_v4_expert_forward_ref(
+                expert_output, &views[current], input,
+                expert_weights[current], config->swiglu_limit);
+            if (!result)
+                for (int i = 0; i < d; i++) output[i] += expert_output[i];
         }
+        if (!result)
+            for (int i = 0; i < d; i++)
+                output[i] = coli_bf16_round(output[i] + shared_output[i]);
+    }
+    for (int current = 0; current < selected; current++)
+        coli_expert_release(store, &views[current]);
+    free(views);
 #else
     for (int current = 0; current < selected && loader_active; current++) {
         if (profiled_expert_load_finish(&loader) != 0) {
@@ -4135,13 +4614,10 @@ static int moe_token_pipeline(float *output,
     }
     if (loader_active) {
         profiled_expert_load_finish(&loader);
-        if (!job.result) coli_expert_release(store, &job.view);
+        if (!job.result)
+            coli_expert_release(store, &job.view);
     }
 #endif
-    if (!result)
-        for (int i = 0; i < d; i++)
-            output[i] = coli_bf16_round(output[i] + shared_output[i]);
-
     free(shared_output); free(expert_output); free(expert_weights);
     free(expert_ids); free(indices); free(route_weights); free(gate);
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
@@ -4175,13 +4651,29 @@ static int block_token_pipeline(float *output_hc,
         free(reduced); free(state); free(residual); return -1;
     }
     memcpy(residual, input_hc, hd * sizeof(*residual));
+    /* DSV4_DECODE_PROF=1: per-token stage totals across layers (printed at
+     * layer 0 for the previous token). */
+    static int dprof = -1;
+    static double dp_hc = 0, dp_attn = 0, dp_moe = 0;
+    static int dp_layers = 0;
+    struct timespec dp0, dp1;
+    if (dprof < 0) dprof = getenv("DSV4_DECODE_PROF") != NULL;
+    if (dprof && weights->plan.layer == 0 && dp_layers) {
+        fprintf(stderr, "decprof position=%d layers=%d hc=%.0f attn=%.0f moe=%.0f ms\n",
+                position - 1, dp_layers, dp_hc * 1e3, dp_attn * 1e3, dp_moe * 1e3);
+        dp_hc = dp_attn = dp_moe = 0; dp_layers = 0;
+    }
+#define DP_MARK(acc) do { if (dprof) { clock_gettime(CLOCK_MONOTONIC, &dp1); acc += (dp1.tv_sec - dp0.tv_sec) + (dp1.tv_nsec - dp0.tv_nsec) * 1e-9; dp0 = dp1; } } while (0)
+    if (dprof) clock_gettime(CLOCK_MONOTONIC, &dp0);
     int result = normalized_hc_pre(reduced, post, comb, normalized, input_hc,
                                    weights, config, "attn", "attn_norm.weight");
+    DP_MARK(dp_hc);
     if (!result) result = attention
         ? coli_v4_attention_window_token_ref(branch, attention, weights, config,
                                              normalized, position, error, error_size)
         : coli_v4_attention_token_ref(branch, weights, config, normalized,
                                       position, error, error_size);
+    DP_MARK(dp_attn);
     if (!result) result = coli_v4_hc_post(state, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(state, hd);
@@ -4189,11 +4681,16 @@ static int block_token_pipeline(float *output_hc,
     if (!result) result = normalized_hc_pre(reduced, post, comb, normalized, state,
                                             weights, config, "ffn",
                                             "ffn_norm.weight");
+    DP_MARK(dp_hc);
     if (!result) result = moe_token_pipeline(branch, weights, config, experts,
                                              normalized, token);
+    DP_MARK(dp_moe);
     if (!result) result = coli_v4_hc_post(output_hc, branch, residual,
                                           post, comb, hc, d);
     if (!result) coli_bf16_round_array(output_hc, hd);
+    DP_MARK(dp_hc);
+    if (dprof) dp_layers++;
+#undef DP_MARK
     free(comb); free(post); free(branch); free(normalized);
     free(reduced); free(state); free(residual);
     return result ? set_error(error, error_size, "block computation failed") : 0;
@@ -4429,6 +4926,23 @@ static int v4_expert_union_enabled(void) {
     return enabled;
 }
 
+#include <time.h>
+
+/* DSV4_ATTN_PROF=1: block-level phase timers (mHC pre/post, attention, MoE). */
+static int v4_block_prof_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("DSV4_ATTN_PROF");
+        enabled = setting && atoi(setting) != 0;
+    }
+    return enabled;
+}
+static double v4_block_prof_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
 int coli_v4_block_window_batch_ref(
     float *outputs_hc, ColiDeepSeekV4WindowAttentionState *attention,
     const ColiDeepSeekV4LayerWeights *weights,
@@ -4436,7 +4950,7 @@ int coli_v4_block_window_batch_ref(
     const float *inputs_hc, const int *tokens, int start_position, int batch,
     char *error, size_t error_size) {
     if (!outputs_hc || !attention || !weights || !config || !experts ||
-        !inputs_hc || !tokens || batch < 1 || batch > 64) return -1;
+        !inputs_hc || !tokens || batch < 1 || batch > 128) return -1;
     int d = config->hidden_size, hc = config->hc_mult;
     size_t hd = (size_t)hc * d;
     float *states = malloc((size_t)batch * hd * sizeof(*states));
@@ -4458,18 +4972,26 @@ int coli_v4_block_window_batch_ref(
         free(normalized); free(states); return -1;
     }
     int result = 0;
+    double prof_t = v4_block_prof_enabled() ? v4_block_prof_now() : 0.0;
+    double prof_hc1 = 0, prof_attn = 0, prof_hc2 = 0, prof_moe = 0,
+           prof_hc3 = 0;
+#define V4_BLOCK_PROF_MARK(slot) do { if (prof_t) { \
+        double _now = v4_block_prof_now(); (slot) += _now - prof_t; \
+        prof_t = _now; } } while (0)
     const char *phase = "attention hyper-connection";
     for (int item = 0; !result && item < batch; item++)
-        result = normalized_hc_pre(
-            reduced, posts + (size_t)item * hc,
-            combs + (size_t)item * hc * hc,
-            normalized + (size_t)item * d,
-            inputs_hc + (size_t)item * hd,
-            weights, config, "attn", "attn_norm.weight");
+            result = normalized_hc_pre(
+                reduced, posts + (size_t)item * hc,
+                combs + (size_t)item * hc * hc,
+                normalized + (size_t)item * d,
+                inputs_hc + (size_t)item * hd,
+                weights, config, "attn", "attn_norm.weight");
+    V4_BLOCK_PROF_MARK(prof_hc1);
     phase = "attention";
     if (!result) result = coli_v4_attention_window_batch_ref(
         branches, attention, weights, config, normalized,
         start_position, batch, error, error_size);
+    V4_BLOCK_PROF_MARK(prof_attn);
     if (!result) phase = "attention post / FFN hyper-connection";
     for (int item = 0; !result && item < batch; item++) {
         float *state = states + (size_t)item * hd;
@@ -4486,6 +5008,7 @@ int coli_v4_block_window_batch_ref(
             ffn_normalized + (size_t)item * d, state,
             weights, config, "ffn", "ffn_norm.weight");
     }
+    V4_BLOCK_PROF_MARK(prof_hc2);
     if (!result) phase = "MoE";
     if (!result && batch > 1 && v4_expert_union_enabled())
         result = v4_moe_batch_union(
@@ -4496,6 +5019,7 @@ int coli_v4_block_window_batch_ref(
             result = moe_token_pipeline(
                 ffn_branch + (size_t)item * d, weights, config, experts,
                 ffn_normalized + (size_t)item * d, tokens[item]);
+    V4_BLOCK_PROF_MARK(prof_moe);
     if (!result) phase = "FFN hyper-connection post";
     for (int item = 0; !result && item < batch; item++) {
         result = coli_v4_hc_post(
@@ -4507,6 +5031,14 @@ int coli_v4_block_window_batch_ref(
         if (!result) coli_bf16_round_array(
             outputs_hc + (size_t)item * hd, hd);
     }
+    V4_BLOCK_PROF_MARK(prof_hc3);
+    if (prof_t)
+        fprintf(stderr, "blockprof layer=%d start=%d n=%d hc1=%.0f attn=%.0f "
+                "hc2=%.0f moe=%.0f hc3=%.0f ms\n",
+                weights->plan.layer, start_position, batch, prof_hc1 * 1e3,
+                prof_attn * 1e3, prof_hc2 * 1e3, prof_moe * 1e3,
+                prof_hc3 * 1e3);
+#undef V4_BLOCK_PROF_MARK
     free(ffn_comb); free(ffn_post); free(ffn_branch); free(ffn_normalized);
     free(reduced); free(combs); free(posts); free(branches);
     free(normalized); free(states);
@@ -4524,6 +5056,7 @@ int coli_v4_block_window_batch_ref(
 #define coli_v4_compressor_bind_weights snapshot_copy_compressor_bind_weights
 #define coli_v4_compressor_destroy snapshot_copy_compressor_destroy
 #define coli_v4_compressor_step snapshot_copy_compressor_step
+#define coli_v4_compressor_advance snapshot_copy_compressor_advance
 /* ---- begin include deepseek_v4_compressor.c ---- */
 #include "deepseek_v4_internal.h"
 
@@ -4645,6 +5178,11 @@ void coli_v4_compressor_destroy(ColiDeepSeekV4CompressorState *state) {
     free(state);
 }
 
+static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
+                                    float *output, int *produced,
+                                    int position, char *error,
+                                    size_t error_size);
+
 int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                             float *output, int *produced,
                             const float *input, int position,
@@ -4653,7 +5191,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         return set_error(error, error_size, "invalid compressor step arguments");
     *produced = 0;
     int slot = position % state->ratio;
-    int hidden = state->hidden, dimension = state->head_dim;
+    int hidden = state->hidden;
     int projection = state->projection_dim;
     int state_row = state->ratio == 4 ? state->ratio + slot : slot;
     char suffix[128];
@@ -4680,6 +5218,46 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
         kv_row[row] = kv_sum;
         score_row[row] = gate_sum + ape[(size_t)slot * projection + row];
     }
+    return compressor_pool_and_emit(state, output, produced, position,
+                                    error, error_size);
+}
+
+/* Precomputed-projection variant: kv_proj/gate_proj are this position's
+ * wkv/wgate matvec results (computed batched); the ape bias, pooling, norm,
+ * RoPE, quantization and the sliding state all still run here so the CPU
+ * state stays canonical for decode and CPU fallbacks. */
+int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
+                               float *output, int *produced,
+                               const float *kv_proj, const float *gate_proj,
+                               int position, char *error, size_t error_size) {
+    if (!state || !produced || !kv_proj || !gate_proj || position < 0)
+        return set_error(error, error_size, "invalid compressor advance arguments");
+    *produced = 0;
+    int slot = position % state->ratio;
+    int projection = state->projection_dim;
+    int state_row = state->ratio == 4 ? state->ratio + slot : slot;
+    char suffix[128];
+    snprintf(suffix, sizeof(suffix), "%s.ape", state->prefix);
+    const float *ape = layer_value(state->weights, suffix);
+    if (!ape)
+        return set_error(error, error_size, "missing compressor tensor for %s", state->prefix);
+    float *kv_row = state->kv_state + (size_t)state_row * projection;
+    float *score_row = state->score_state + (size_t)state_row * projection;
+    for (int row = 0; row < projection; row++) {
+        kv_row[row] = kv_proj[row];
+        score_row[row] = gate_proj[row] + ape[(size_t)slot * projection + row];
+    }
+    return compressor_pool_and_emit(state, output, produced, position,
+                                    error, error_size);
+}
+
+static int compressor_pool_and_emit(ColiDeepSeekV4CompressorState *state,
+                                    float *output, int *produced,
+                                    int position, char *error,
+                                    size_t error_size) {
+    int dimension = state->head_dim;
+    int projection = state->projection_dim;
+    char suffix[128];
     if ((position + 1) % state->ratio != 0) return 0;
     if (!output) return set_error(error, error_size, "compressor output is required");
 
@@ -4777,6 +5355,7 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
 /* ---- end include deepseek_v4_compressor.c ---- */
 
 #undef coli_v4_compressor_step
+#undef coli_v4_compressor_advance
 #undef coli_v4_compressor_destroy
 #undef coli_v4_compressor_bind_weights
 #undef coli_v4_compressor_reset
@@ -4810,6 +5389,38 @@ int coli_v4_compressor_snapshot_create(
     return 0;
 }
 
+int coli_v4_compressor_snapshot_write(const ColiV4CompressorSnapshot *snapshot,
+                                      FILE *stream) {
+    if (!snapshot || !stream) return -1;
+    uint64_t count = (uint64_t)snapshot->count;
+    if (fwrite(&count, sizeof(count), 1, stream) != 1) return -1;
+    if (snapshot->count &&
+        (fwrite(snapshot->kv_state, sizeof(float), snapshot->count, stream) != snapshot->count ||
+         fwrite(snapshot->score_state, sizeof(float), snapshot->count, stream) != snapshot->count))
+        return -1;
+    return 0;
+}
+
+int coli_v4_compressor_snapshot_read(FILE *stream,
+                                     ColiV4CompressorSnapshot **output) {
+    if (!stream || !output) return -1;
+    uint64_t count = 0;
+    if (fread(&count, sizeof(count), 1, stream) != 1 || count > (1u << 28)) return -1;
+    ColiV4CompressorSnapshot *snap = calloc(1, sizeof(*snap));
+    if (!snap) return -1;
+    snap->count = (size_t)count;
+    snap->kv_state = malloc((snap->count ? snap->count : 1) * sizeof(float));
+    snap->score_state = malloc((snap->count ? snap->count : 1) * sizeof(float));
+    if (!snap->kv_state || !snap->score_state ||
+        (snap->count &&
+         (fread(snap->kv_state, sizeof(float), snap->count, stream) != snap->count ||
+          fread(snap->score_state, sizeof(float), snap->count, stream) != snap->count))) {
+        coli_v4_compressor_snapshot_destroy(snap); return -1;
+    }
+    *output = snap;
+    return 0;
+}
+
 int coli_v4_compressor_snapshot_restore(
     ColiDeepSeekV4CompressorState *state,
     const ColiV4CompressorSnapshot *snapshot) {
@@ -4834,6 +5445,7 @@ void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot) {
 #define coli_v4_indexer_reset snapshot_copy_indexer_reset
 #define coli_v4_indexer_destroy snapshot_copy_indexer_destroy
 #define coli_v4_indexer_step snapshot_copy_indexer_step
+#define coli_v4_indexer_step_projected snapshot_copy_indexer_step_projected
 #define coli_v4_indexer_compressed_values snapshot_copy_indexer_values
 #define coli_v4_indexer_compressed_count snapshot_copy_indexer_count
 /* ---- begin include deepseek_v4_indexer.c ---- */
@@ -4988,10 +5600,11 @@ static int apply_position_rope(float *queries,
     return 0;
 }
 
-int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
-                         int index_capacity, const float *query_rank,
-                         const float *input, int position,
-                         char *error, size_t error_size) {
+static int indexer_step_common(ColiDeepSeekV4Indexer *state, int *indices,
+                               int index_capacity, const float *query_rank,
+                               const float *input, int position,
+                               const float *kv_proj, const float *gate_proj,
+                               char *error, size_t error_size) {
     if (!state || !indices || index_capacity < 1 || !query_rank || !input ||
         position < 0)
         return set_error(error, error_size, "invalid indexer step arguments");
@@ -5010,14 +5623,30 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
     }
     float *next = state->count < state->capacity
         ? state->compressed + (size_t)state->count * dimension : NULL;
-    if (coli_v4_compressor_step(state->compressor, next, &produced, input,
-                                position, error, error_size)) return -1;
+    if (kv_proj && gate_proj
+            ? coli_v4_compressor_advance(state->compressor, next, &produced,
+                                         kv_proj, gate_proj, position,
+                                         error, error_size)
+            : coli_v4_compressor_step(state->compressor, next, &produced, input,
+                                      position, error, error_size)) return -1;
     if (produced) {
         if (state->count >= state->capacity)
             return set_error(error, error_size, "indexer cache capacity exceeded");
         state->count++;
     }
     if (!state->count) return 0;
+    /* Selection is the top-index_topk candidates by score.  When every
+     * candidate fits (count <= topk and <= caller capacity) the scores only
+     * permute the index order, and sparse attention sums over the SET of
+     * selected entries, so the query projection, hadamard/fp4 round-trip and
+     * scoring cannot change the output.  Skip them entirely: short prompts
+     * spend ~10M MACs per token per indexer layer here. */
+    if (getenv("V4_IDX_IDENTITY") && *getenv("V4_IDX_IDENTITY") == '1' &&
+        state->count <= state->config->index_topk &&
+        state->count <= index_capacity) {
+        for (int i = 0; i < state->count; i++) indices[i] = i;
+        return state->count;
+    }
 
     ColiTensorView wq;
     if (fp8_view(&wq, state->weights, "attn.indexer.wq_b"))
@@ -5074,6 +5703,27 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
     return result ? set_error(error, error_size, "indexer scoring failed") : selected;
 }
 
+int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
+                         int index_capacity, const float *query_rank,
+                         const float *input, int position,
+                         char *error, size_t error_size) {
+    return indexer_step_common(state, indices, index_capacity, query_rank,
+                               input, position, NULL, NULL, error, error_size);
+}
+
+/* Precomputed-projection variant: kv_proj/gate_proj are this position's rows
+ * of the indexer-compressor wkv/wgate projections (computed batched); scoring and
+ * every piece of indexer state remain on the CPU. */
+int coli_v4_indexer_step_projected(ColiDeepSeekV4Indexer *state, int *indices,
+                                   int index_capacity, const float *query_rank,
+                                   const float *input, int position,
+                                   const float *kv_proj, const float *gate_proj,
+                                   char *error, size_t error_size) {
+    return indexer_step_common(state, indices, index_capacity, query_rank,
+                               input, position, kv_proj, gate_proj,
+                               error, error_size);
+}
+
 const float *coli_v4_indexer_compressed_values(
     const ColiDeepSeekV4Indexer *state) {
     return state ? state->compressed : NULL;
@@ -5087,6 +5737,7 @@ int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state) {
 #undef coli_v4_indexer_compressed_count
 #undef coli_v4_indexer_compressed_values
 #undef coli_v4_indexer_step
+#undef coli_v4_indexer_step_projected
 #undef coli_v4_indexer_destroy
 #undef coli_v4_indexer_reset
 #undef coli_v4_indexer_bind_weights
@@ -5125,11 +5776,55 @@ int coli_v4_indexer_snapshot_create(const ColiDeepSeekV4Indexer *state,
     return 0;
 }
 
+int coli_v4_indexer_snapshot_write(const ColiV4IndexerSnapshot *snapshot,
+                                   FILE *stream) {
+    if (!snapshot || !stream) return -1;
+    int32_t head[2] = {snapshot->count, snapshot->head_dim};
+    if (fwrite(head, sizeof(head), 1, stream) != 1) return -1;
+    size_t n = (size_t)snapshot->count * snapshot->head_dim;
+    if (n && fwrite(snapshot->compressed, sizeof(float), n, stream) != n) return -1;
+    return coli_v4_compressor_snapshot_write(snapshot->compressor, stream);
+}
+
+int coli_v4_indexer_snapshot_read(FILE *stream, ColiV4IndexerSnapshot **output) {
+    if (!stream || !output) return -1;
+    int32_t head[2];
+    if (fread(head, sizeof(head), 1, stream) != 1 || head[0] < 0 || head[1] < 1 ||
+        head[0] > (1 << 24) || head[1] > 4096) return -1;
+    ColiV4IndexerSnapshot *snap = calloc(1, sizeof(*snap));
+    if (!snap) return -1;
+    snap->count = head[0]; snap->head_dim = head[1];
+    size_t n = (size_t)snap->count * snap->head_dim;
+    if (n) {
+        snap->compressed = malloc(n * sizeof(float));
+        if (!snap->compressed || fread(snap->compressed, sizeof(float), n, stream) != n) {
+            coli_v4_indexer_snapshot_destroy(snap); return -1;
+        }
+    }
+    if (coli_v4_compressor_snapshot_read(stream, &snap->compressor)) {
+        coli_v4_indexer_snapshot_destroy(snap); return -1;
+    }
+    *output = snap;
+    return 0;
+}
+
 int coli_v4_indexer_snapshot_restore(ColiDeepSeekV4Indexer *state,
                                      const ColiV4IndexerSnapshot *snapshot) {
     if (!state || !snapshot || !state->config ||
-        state->config->index_head_dim != snapshot->head_dim ||
-        snapshot->count > state->capacity) return -1;
+        state->config->index_head_dim != snapshot->head_dim) return -1;
+    /* A fresh process (disk-loaded checkpoint) has not grown its cache yet:
+     * grow to fit instead of refusing. */
+    if (snapshot->count > state->capacity) {
+        int cap = state->capacity > 0 ? state->capacity : 64;
+        while (cap < snapshot->count) cap *= 2;
+        float *grown = realloc(state->compressed,
+                               (size_t)cap * snapshot->head_dim * sizeof(float));
+        if (!grown) return -1;
+        memset(grown + (size_t)state->capacity * snapshot->head_dim, 0,
+               (size_t)(cap - state->capacity) * snapshot->head_dim * sizeof(float));
+        state->compressed = grown;
+        state->capacity = cap;
+    }
     state->count = snapshot->count;
     if (snapshot->count)
         memcpy(state->compressed, snapshot->compressed,
@@ -5490,19 +6185,21 @@ static int attention_token_impl(float *output,
     int group_width = heads_per_group * head_dim;
     int scale_columns = (group_width + 127) / 128;
     int scale_rows_per_group = (o_rank + 127) / 128;
-    for (int group = 0; !result && group < groups; group++) {
-        ColiTensorView group_view = wo_a;
-        group_view.rows = o_rank;
-        group_view.columns = group_width;
-        group_view.data = (const uint8_t *)wo_a.data +
-            (size_t)group * o_rank * group_width;
-        group_view.scales = (const uint8_t *)wo_a.scales +
-            (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
-        group_view.data_bytes = (size_t)o_rank * group_width;
-        group_view.scale_bytes =
-            (size_t)scale_rows_per_group * scale_columns * sizeof(float);
-        result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
-                                     attended + (size_t)group * group_width);
+    if (!result) {
+        for (int group = 0; group < groups; group++) {
+            ColiTensorView group_view = wo_a;
+            group_view.rows = o_rank;
+            group_view.columns = group_width;
+            group_view.data = (const uint8_t *)wo_a.data +
+                (size_t)group * o_rank * group_width;
+            group_view.scales = (const uint8_t *)wo_a.scales +
+                (size_t)group * scale_rows_per_group * scale_columns * sizeof(float);
+            group_view.data_bytes = (size_t)o_rank * group_width;
+            group_view.scale_bytes =
+                (size_t)scale_rows_per_group * scale_columns * sizeof(float);
+            result = coli_fp8_matvec_ref(oa + (size_t)group * o_rank, &group_view,
+                                         attended + (size_t)group * group_width);
+        }
     }
     if (!result) coli_bf16_round_array(oa, (size_t)groups * o_rank);
     if (!result) result = coli_fp8_matvec_ref(output, &wo_b, oa);
@@ -5584,8 +6281,20 @@ int coli_v4_attention_snapshot_restore(
     ColiDeepSeekV4WindowAttentionState *state,
     const ColiV4AttentionSnapshot *snapshot) {
     if (!state || !snapshot || state->window_size != snapshot->window_size ||
-        state->head_dim != snapshot->head_dim ||
-        snapshot->compressed_count > state->compressed_capacity) return -1;
+        state->head_dim != snapshot->head_dim) return -1;
+    /* Grow the compressed buffer for a snapshot longer than anything this
+     * process has prefilled yet (disk-loaded checkpoints). */
+    if (snapshot->compressed_count > state->compressed_capacity) {
+        int cap = state->compressed_capacity > 0 ? state->compressed_capacity : 64;
+        while (cap < snapshot->compressed_count) cap *= 2;
+        float *grown = realloc(state->compressed,
+                               (size_t)cap * state->head_dim * sizeof(float));
+        if (!grown) return -1;
+        memset(grown + (size_t)state->compressed_capacity * state->head_dim, 0,
+               (size_t)(cap - state->compressed_capacity) * state->head_dim * sizeof(float));
+        state->compressed = grown;
+        state->compressed_capacity = cap;
+    }
     memcpy(state->kv, snapshot->kv,
            (size_t)state->window_size * state->head_dim * sizeof(float));
     state->compressed_count = snapshot->compressed_count;
@@ -5606,6 +6315,51 @@ void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot) {
     coli_v4_indexer_snapshot_destroy(snapshot->indexer);
     coli_v4_compressor_snapshot_destroy(snapshot->compressor);
     free(snapshot->compressed); free(snapshot->kv); free(snapshot);
+}
+
+int coli_v4_attention_snapshot_write(const ColiV4AttentionSnapshot *snapshot,
+                                     FILE *stream) {
+    if (!snapshot || !stream) return -1;
+    int32_t head[5] = {snapshot->window_size, snapshot->head_dim,
+                       snapshot->compressed_count,
+                       snapshot->compressor != NULL, snapshot->indexer != NULL};
+    if (fwrite(head, sizeof(head), 1, stream) != 1) return -1;
+    size_t kv = (size_t)snapshot->window_size * snapshot->head_dim;
+    if (fwrite(snapshot->kv, sizeof(float), kv, stream) != kv) return -1;
+    size_t comp = (size_t)snapshot->compressed_count * snapshot->head_dim;
+    if (comp && fwrite(snapshot->compressed, sizeof(float), comp, stream) != comp) return -1;
+    if (snapshot->compressor &&
+        coli_v4_compressor_snapshot_write(snapshot->compressor, stream)) return -1;
+    if (snapshot->indexer &&
+        coli_v4_indexer_snapshot_write(snapshot->indexer, stream)) return -1;
+    return 0;
+}
+
+int coli_v4_attention_snapshot_read(FILE *stream,
+                                    ColiV4AttentionSnapshot **output) {
+    if (!stream || !output) return -1;
+    int32_t head[5];
+    if (fread(head, sizeof(head), 1, stream) != 1 || head[0] < 1 || head[1] < 1 ||
+        head[2] < 0 || head[0] > 65536 || head[1] > 8192 || head[2] > (1 << 24)) return -1;
+    ColiV4AttentionSnapshot *snap = calloc(1, sizeof(*snap));
+    if (!snap) return -1;
+    snap->window_size = head[0]; snap->head_dim = head[1]; snap->compressed_count = head[2];
+    size_t kv = (size_t)snap->window_size * snap->head_dim;
+    snap->kv = malloc(kv * sizeof(float));
+    if (!snap->kv || fread(snap->kv, sizeof(float), kv, stream) != kv) goto failed;
+    size_t comp = (size_t)snap->compressed_count * snap->head_dim;
+    if (comp) {
+        snap->compressed = malloc(comp * sizeof(float));
+        if (!snap->compressed || fread(snap->compressed, sizeof(float), comp, stream) != comp)
+            goto failed;
+    }
+    if (head[3] && coli_v4_compressor_snapshot_read(stream, &snap->compressor)) goto failed;
+    if (head[4] && coli_v4_indexer_snapshot_read(stream, &snap->indexer)) goto failed;
+    *output = snap;
+    return 0;
+failed:
+    coli_v4_attention_snapshot_destroy(snap);
+    return -1;
 }
 #endif /* COLI_V4_UNIT_ATTENTION_TRANSACTION */
 
@@ -6339,6 +7093,20 @@ static int hot_pack_matrix(ColiTensorView *view, unsigned char *scratch) {
 }
 
 /* state->mutex is held and the slot has at least one reference. */
+/* COLI_V4_ROWS16=0: never repack hot experts into the rows16 layout, so
+ * every expert runs the reference matvec. The rows16 kernel accumulates in a
+ * different order (not bitwise the reference), which makes greedy text depend
+ * on which experts happen to be hot; this valve removes that variable for
+ * numerics comparisons (measured 2026-08-15). */
+static int hot_rows16_wanted(void) {
+    static int rows16 = -1;
+    if (rows16 < 0) {
+        const char *env = getenv("COLI_V4_ROWS16");
+        rows16 = !(env && *env == '0');
+    }
+    return rows16;
+}
+
 static int hot_pack_slot_locked(V4HotPolicy *policy,
                                 V4ExpertStoreState *state,
                                 const V4ExpertRecord *record,
@@ -6348,6 +7116,7 @@ static int hot_pack_slot_locked(V4HotPolicy *policy,
 #else
     size_t slot_index = hot_slot_index(state, slot);
     if (policy->packed[slot_index]) return 0;
+    if (!hot_rows16_wanted()) return -1;
     ColiTensorView gate, down, up;
     fill_tensor_view(&gate, record, slot, V4_W1);
     fill_tensor_view(&down, record, slot, V4_W2);
@@ -6385,6 +7154,7 @@ static unsigned char *hot_pack_slot_prepare(const V4ExpertRecord *record,
 #ifndef COLI_FP4_ROWS16_KERNEL
     (void)record; (void)slot; return NULL;
 #else
+    if (!hot_rows16_wanted()) return NULL;
     ColiTensorView gate, down, up;
     fill_tensor_view(&gate, record, slot, V4_W1);
     fill_tensor_view(&down, record, slot, V4_W2);
@@ -7309,6 +8079,7 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     assert(engine->active_sessions == 0 &&
            "destroy engine while sessions are still alive");
 
+
     for (int layer = 0; layer < COLI_V4_RESIDENT_MAX_LAYERS; layer++) {
         if (!engine->dense_resident.ready[layer]) continue;
         coli_v4_layer_resident_reference_free(
@@ -7452,6 +8223,7 @@ fail:
     return -1;
 }
 #endif /* COLI_V4_UNIT_RUNTIME */
+
 
 #ifdef COLI_V4_UNIT_PROMPT
 /* ######## deepseek_v4_prompt.c ######## */
@@ -8056,7 +8828,9 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, const int *tokens,
-                        int start, int batch, char *error, size_t error_size) {
+                        int start, int batch,
+                        ColiV4SessionAbortFn should_abort, void *abort_ctx,
+                        char *error, size_t error_size) {
     if (!state_ptr || !next_ptr || !*state_ptr || !*next_ptr || !attention ||
         !index || !config || !experts || !tokens || start < 0 || batch < 1) {
         if (error && error_size)
@@ -8071,19 +8845,31 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                                error, error_size)) return -1;
         int result = 0;
         /* Chunk width caps every batch-scaled buffer in the block AND bounds
-         * the expert union: each chunk boundary re-reads the experts it
-         * shares with the previous chunk.  64 is the batch kernels' contract
-         * (coli_fp8/fp4_matmul_batch_ref and both window batch entries
-         * validate batch > 64 and return -1 -- measured: a 256 chunk dies in
-         * seconds at layer 0), so V4_PREFILL_CHUNK clamps to [1, 64]. */
+         * the expert union. The batch kernels' contract is 128 (the CPU
+         * batch refs, both window batch entries and the DLL MoE entries
+         * validate batch > 128 and return -1). Measured 3324 tokens: 128 =
+         * 103.9 s vs 64 = 107.3 s, text identical; V4_PREFILL_CHUNK clamps
+         * to [1, 128]. */
         static int chunk_width;
         if (!chunk_width) {
             const char *chunk_env = getenv("V4_PREFILL_CHUNK");
-            chunk_width = chunk_env ? atoi(chunk_env) : 64;
-            if (chunk_width < 1 || chunk_width > 64) chunk_width = 64;
+            chunk_width = chunk_env ? atoi(chunk_env) : 128;
+            if (chunk_width < 1 || chunk_width > 128) chunk_width = 128;
         }
         for (int offset = 0; !result && offset < batch;
              offset += chunk_width) {
+            /* A multi-thousand-token prefill runs for minutes with the token
+             * callback silent (it first fires after prefill), so this is the
+             * only place a serve-mode CANCEL can land before first token.
+             * "CANCELLED" is a contract with the gateway: openai_server.py
+             * matches that exact ERROR text to close a cancelled request
+             * without logging it as an engine fault. */
+            if (should_abort && should_abort(abort_ctx)) {
+                if (error && error_size)
+                    snprintf(error, error_size, "CANCELLED");
+                result = -1;
+                break;
+            }
             int chunk = batch - offset;
             if (chunk > chunk_width) chunk = chunk_width;
             result = coli_v4_block_window_batch_ref(
@@ -8612,6 +9398,308 @@ static int v4_ngram_draft(const int *prompt, int prompt_count,
     return 0;
 }
 
+/* ---- System-prefix checkpoints (V4_PREFIX_CKPT=0 disables) ----
+ *
+ * The window state cannot rewind, so cross-conversation reuse needs a
+ * snapshot taken AT the shared boundary. The boundary is discovered, not
+ * declared: the longest common prefix of two successive fresh prompts is the
+ * stable system prefix (opencode: system + tool block, identical across
+ * sessions). LRU slots (V4_PREFIX_CKPT_SLOTS, default 4), in-memory only;
+ * each holds the full per-layer attention snapshot (~250 MB for a 2k-window
+ * model, growing with context) plus the prefix ids.
+ *
+ * Two kinds share the slots. PLAN captures are the discovered system prefix.
+ * PROMPT-END captures are taken after every prefill at prompt_count: an
+ * agent's next turn re-renders the assistant reply (tool calls, stripped
+ * reasoning), so strict-prefix session reuse fails at the reply boundary and
+ * without this snapshot the whole conversation re-prefilled (measured:
+ * opencode turn 2 = 677 s for 66 new tokens). Eviction takes the LRU
+ * prompt-end slot first so the system prefix survives a long session. */
+typedef struct {
+    int *ids;
+    int len;
+    int layers;
+    ColiV4AttentionSnapshot **snapshots;
+    uint64_t used;
+    int kind;   /* 0 = plan (system prefix), 1 = prompt end */
+} V4PrefixCkpt;
+enum { V4_CKPT_MAX_SLOTS = 8 };
+static V4PrefixCkpt v4_ckpt_slots[V4_CKPT_MAX_SLOTS];
+static uint64_t v4_ckpt_clock;
+
+static int v4_ckpt_slot_count(void) {
+    static int count = -1;
+    if (count < 0) {
+        const char *setting = getenv("V4_PREFIX_CKPT_SLOTS");
+        count = setting ? atoi(setting) : 4;
+        if (count < 1) count = 1;
+        if (count > V4_CKPT_MAX_SLOTS) count = V4_CKPT_MAX_SLOTS;
+    }
+    return count;
+}
+
+/* ---- On-disk checkpoint slots: <model>/.coli_ckpt/ckpt_<fingerprint>_<n>.bin
+ * The in-memory slots die with the process; the shared system prefix would
+ * then cost a full ~minutes prefill again on the first turn after every serve
+ * restart. Prefix (plan/hint) captures are persisted by default; prompt-end
+ * captures too with V4_PREFIX_CKPT_DISK=2 (one write per request);
+ * V4_PREFIX_CKPT_DISK=0 disables. Loaded lazily on the first generate; a
+ * config fingerprint (layers, window, head dims, topk) guards mismatches. */
+#ifdef _WIN32
+#include <direct.h>
+#define v4_ckpt_mkdir(p) _mkdir(p)
+#else
+#include <sys/stat.h>
+#define v4_ckpt_mkdir(p) mkdir((p), 0755)
+#endif
+static void v4_ckpt_slot_free(V4PrefixCkpt *slot);
+static char v4_ckpt_dir[1024];
+static uint32_t v4_ckpt_fingerprint;
+static int v4_ckpt_disk_mode = -1;
+static int v4_ckpt_disk_loaded;
+
+static int v4_ckpt_disk_wanted(void) {
+    if (v4_ckpt_disk_mode < 0) {
+        const char *setting = getenv("V4_PREFIX_CKPT_DISK");
+        v4_ckpt_disk_mode = setting ? atoi(setting) : 1;
+    }
+    return v4_ckpt_disk_mode;
+}
+
+static void v4_ckpt_disk_init(ColiV4Session *session) {
+    if (v4_ckpt_dir[0] || !session || !session->engine) return;
+    const char *model = coli_v4_engine_target_model_dir(session->engine);
+    if (!model || !*model) { v4_ckpt_dir[0] = '-'; return; }
+    snprintf(v4_ckpt_dir, sizeof(v4_ckpt_dir), "%s/.coli_ckpt", model);
+    const ColiDeepSeekV4Config *c = &session->config;
+    uint32_t h = 2166136261u;
+    int fields[] = {c->num_hidden_layers, c->hidden_size, c->head_dim,
+                    c->index_head_dim, c->index_topk, c->index_n_heads,
+                    c->hc_mult};
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        h ^= (uint32_t)fields[i]; h *= 16777619u;
+    }
+    v4_ckpt_fingerprint = h;
+}
+
+static void v4_ckpt_disk_path(char *out, size_t size, int index) {
+    snprintf(out, size, "%s/ckpt_%08x_%d.bin", v4_ckpt_dir, v4_ckpt_fingerprint, index);
+}
+
+/* Write slot i to disk (its file index = slot index; overwrite in place via
+ * temp + rename so a crash never leaves a torn file). */
+static void v4_ckpt_disk_write(int i) {
+    if (v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
+    V4PrefixCkpt *slot = &v4_ckpt_slots[i];
+    if (!slot->ids) return;
+    char path[1200], tmp[1240];
+    v4_ckpt_disk_path(path, sizeof(path), i);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        v4_ckpt_mkdir(v4_ckpt_dir);
+        f = fopen(tmp, "wb");
+        if (!f) return;
+    }
+    static const char magic[9] = "COLIV4CK";
+    int32_t head[4] = {1, slot->kind, slot->len, slot->layers};
+    int ok = fwrite(magic, 8, 1, f) == 1 &&
+             fwrite(&v4_ckpt_fingerprint, sizeof(v4_ckpt_fingerprint), 1, f) == 1 &&
+             fwrite(head, sizeof(head), 1, f) == 1 &&
+             fwrite(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len;
+    for (int layer = 0; ok && layer < slot->layers; layer++)
+        ok = coli_v4_attention_snapshot_write(slot->snapshots[layer], f) == 0;
+    ok = ok && fclose(f) == 0;
+    if (!ok) { fclose(f); remove(tmp); return; }
+    remove(path);
+    if (rename(tmp, path)) { remove(tmp); return; }
+    fprintf(stderr, "v4_ckpt disk write %s=%d\n", slot->kind ? "prompt_end" : "prefix", slot->len);
+}
+
+/* Load every readable file into empty slots (once per process). */
+static void v4_ckpt_disk_load(void) {
+    if (v4_ckpt_disk_loaded || v4_ckpt_dir[0] == '-' || !v4_ckpt_dir[0]) return;
+    v4_ckpt_disk_loaded = 1;
+    for (int i = 0; i < v4_ckpt_slot_count(); i++) {
+        if (v4_ckpt_slots[i].ids) continue;
+        char path[1200];
+        v4_ckpt_disk_path(path, sizeof(path), i);
+        FILE *f = fopen(path, "rb");
+        if (!f) continue;
+        char magic[8]; uint32_t fp = 0; int32_t head[4];
+        V4PrefixCkpt *slot = &v4_ckpt_slots[i];
+        int ok = fread(magic, 8, 1, f) == 1 && !memcmp(magic, "COLIV4CK", 8) &&
+                 fread(&fp, sizeof(fp), 1, f) == 1 && fp == v4_ckpt_fingerprint &&
+                 fread(head, sizeof(head), 1, f) == 1 && head[0] == 1 &&
+                 head[2] > 0 && head[2] < (1 << 22) && head[3] > 0 && head[3] <= 256;
+        if (ok) {
+            slot->kind = head[1]; slot->len = head[2]; slot->layers = head[3];
+            slot->ids = malloc((size_t)slot->len * sizeof(int));
+            slot->snapshots = calloc((size_t)slot->layers, sizeof(*slot->snapshots));
+            ok = slot->ids && slot->snapshots &&
+                 fread(slot->ids, sizeof(int), (size_t)slot->len, f) == (size_t)slot->len;
+            for (int layer = 0; ok && layer < slot->layers; layer++)
+                ok = coli_v4_attention_snapshot_read(f, &slot->snapshots[layer]) == 0;
+        }
+        fclose(f);
+        if (!ok) { v4_ckpt_slot_free(slot); remove(path); continue; }
+        slot->used = ++v4_ckpt_clock;
+        fprintf(stderr, "v4_ckpt disk load %s=%d\n", slot->kind ? "prompt_end" : "prefix", slot->len);
+    }
+}
+
+static int v4_ckpt_have(const int *ids, int len) {
+    for (int i = 0; i < v4_ckpt_slot_count(); i++)
+        if (v4_ckpt_slots[i].ids && v4_ckpt_slots[i].len == len &&
+            !memcmp(v4_ckpt_slots[i].ids, ids, (size_t)len * sizeof(int)))
+            return 1;
+    return 0;
+}
+static int *v4_ckpt_prev_ids;
+static int v4_ckpt_prev_len;
+
+static int v4_ckpt_min_tokens(void) {
+    static int minimum = -1;
+    if (minimum < 0) {
+        const char *setting = getenv("V4_PREFIX_CKPT");
+        if (setting && atoi(setting) == 0) { minimum = 0; return 0; }
+        setting = getenv("V4_PREFIX_CKPT_MIN");
+        minimum = setting ? atoi(setting) : 512;
+        if (minimum < 64) minimum = 64;
+    }
+    return minimum;
+}
+
+static void v4_ckpt_slot_free(V4PrefixCkpt *slot) {
+    if (slot->snapshots) {
+        for (int layer = 0; layer < slot->layers; layer++)
+            coli_v4_attention_snapshot_destroy(slot->snapshots[layer]);
+        free(slot->snapshots);
+    }
+    free(slot->ids);
+    memset(slot, 0, sizeof(*slot));
+}
+
+/* Longest stored prefix of these ids restored into the session; 0 = none. */
+static int v4_ckpt_restore(ColiV4Session *session, int prompt_count) {
+    if (!v4_ckpt_min_tokens()) return 0;
+    if (v4_ckpt_disk_wanted()) { v4_ckpt_disk_init(session); v4_ckpt_disk_load(); }
+    int layers = session->config.num_hidden_layers;
+    int best = -1, best_len = 0;
+    for (int i = 0; i < v4_ckpt_slot_count(); i++) {
+        V4PrefixCkpt *slot = &v4_ckpt_slots[i];
+        if (!slot->ids || slot->layers != layers || slot->len <= best_len ||
+            slot->len >= prompt_count) continue;
+        if (memcmp(slot->ids, session->prompt_ids,
+                   (size_t)slot->len * sizeof(int))) continue;
+        best = i; best_len = slot->len;
+    }
+    if (best < 0) return 0;
+    /* A fresh process (disk-loaded checkpoint) has never attended: the
+     * per-layer compressor/indexer objects do not exist yet. Load each
+     * layer's weights once and prepare the state before restoring. */
+    {
+        ColiV4Engine *engine = session->engine;
+        const ColiSafetensorsIndex *index = coli_v4_engine_target_index(engine);
+        char perr[256];
+        for (int layer = 0; layer < layers; layer++) {
+            ColiDeepSeekV4LayerWeights lw;
+            if (coli_v4_layer_load(engine, &lw, &session->config, index, layer,
+                                   perr, sizeof(perr))) return 0;
+            int rc = coli_v4_window_attention_prepare(
+                session->attention[layer], &lw, &session->config, perr, sizeof(perr));
+            coli_v4_layer_free(engine, &lw);
+            if (rc) return 0;
+        }
+    }
+    for (int layer = 0; layer < layers; layer++)
+        if (coli_v4_attention_snapshot_restore(
+                session->attention[layer], v4_ckpt_slots[best].snapshots[layer])) {
+            fprintf(stderr, "v4_ckpt restore failed layer=%d\n", layer);
+            return 0;   /* partial restore is harmless: caller full-resets */
+        }
+    kv_prefix_clear(&session->fed);
+    kv_prefix_record(&session->fed, v4_ckpt_slots[best].ids, 0, best_len);
+    v4_ckpt_slots[best].used = ++v4_ckpt_clock;
+    fprintf(stderr, "v4_ckpt hit prefix=%d\n", best_len);
+    return best_len;
+}
+
+/* Absolute position to snapshot at during this fresh prefill, or 0. */
+static int v4_ckpt_plan(const int *ids, int count) {
+    int minimum = v4_ckpt_min_tokens();
+    int plan = 0;
+    if (minimum && v4_ckpt_prev_ids) {
+        int limit = v4_ckpt_prev_len < count ? v4_ckpt_prev_len : count;
+        if (limit >= count) limit = count - 1;   /* never checkpoint the whole prompt */
+        int lcp = 0;
+        while (lcp < limit && v4_ckpt_prev_ids[lcp] == ids[lcp]) lcp++;
+        if (lcp > count - 8) lcp = 0;   /* a tiny tail would prefill at
+                                          * per-token speed; resume covers
+                                          * identical-prompt retries anyway */
+        if (lcp >= minimum) {
+            plan = lcp;
+            if (v4_ckpt_have(ids, plan)) plan = 0;   /* already captured */
+        }
+    }
+    free(v4_ckpt_prev_ids);
+    v4_ckpt_prev_ids = malloc((size_t)count * sizeof(int));
+    if (v4_ckpt_prev_ids) {
+        memcpy(v4_ckpt_prev_ids, ids, (size_t)count * sizeof(int));
+        v4_ckpt_prev_len = count;
+    } else {
+        v4_ckpt_prev_len = 0;
+    }
+    return plan;
+}
+
+static void v4_ckpt_store(ColiV4Session *session, int len, int kind) {
+    int layers = session->config.num_hidden_layers;
+    int slots = v4_ckpt_slot_count();
+    /* Victim: an empty slot, else the LRU prompt-end slot, else the LRU
+     * slot overall (plan captures are the last to go). */
+    int victim = -1;
+    for (int i = 0; i < slots && victim < 0; i++)
+        if (!v4_ckpt_slots[i].ids) victim = i;
+    for (int pass = 1; victim < 0 && pass >= 0; pass--)
+        for (int i = 0; i < slots; i++)
+            if (v4_ckpt_slots[i].kind >= pass &&
+                (victim < 0 ||
+                 v4_ckpt_slots[i].used < v4_ckpt_slots[victim].used))
+                victim = i;
+    V4PrefixCkpt *slot = &v4_ckpt_slots[victim];
+    v4_ckpt_slot_free(slot);
+    slot->ids = malloc((size_t)len * sizeof(int));
+    slot->snapshots = calloc((size_t)layers, sizeof(*slot->snapshots));
+    if (!slot->ids || !slot->snapshots) { v4_ckpt_slot_free(slot); return; }
+    for (int layer = 0; layer < layers; layer++)
+        if (coli_v4_attention_snapshot_create(session->attention[layer],
+                                              &slot->snapshots[layer])) {
+            v4_ckpt_slot_free(slot);
+            return;
+        }
+    memcpy(slot->ids, session->prompt_ids, (size_t)len * sizeof(int));
+    slot->len = len;
+    slot->layers = layers;
+    slot->used = ++v4_ckpt_clock;
+    slot->kind = kind;
+    fprintf(stderr, "v4_ckpt store %s=%d\n",
+            kind ? "prompt_end" : "prefix", len);
+    int disk = v4_ckpt_disk_wanted();
+    if (disk && (kind == 0 || disk >= 2)) {
+        v4_ckpt_disk_init(session);
+        v4_ckpt_disk_write(victim);
+    } else if (disk) {
+        /* This slot's file (if any) now describes a different capture. */
+        char path[1200];
+        v4_ckpt_disk_init(session);
+        if (v4_ckpt_dir[0] && v4_ckpt_dir[0] != '-') {
+            v4_ckpt_disk_path(path, sizeof(path), victim);
+            remove(path);
+        }
+    }
+}
+
 int coli_v4_session_generate(ColiV4Session *session,
                              const char *prompt, size_t prompt_length,
                              const ColiV4SessionGenerateOptions *options,
@@ -8680,10 +9768,48 @@ int coli_v4_session_generate(ColiV4Session *session,
      * would have produced.
      * ------------------------------------------------------------------- */
     int reuse = kv_prefix_reuse(&session->fed, session->prompt_ids, prompt_count);
+    int ckpt_at = 0;
+    if (!reuse) {
+        /* SYSTEM-PREFIX CHECKPOINT: a new conversation shares the previous
+         * one's system prefix but not its answer, so strict-prefix reuse
+         * never fires and the whole 10-20k-token prefix re-prefills. Restore
+         * the longest stored snapshot whose ids strictly prefix this prompt
+         * (bit-exact: the snapshot is the full per-layer attention state
+         * spec decode already round-trips), and only the tail prefills. */
+        reuse = v4_ckpt_restore(session, prompt_count);
+        if (reuse) {
+            session->fed.len = reuse;
+            if (coli_v4_full_dspark_wanted) v4_ds_reset_history();
+        }
+    }
     if (!reuse) {
         for (int layer = 0; layer < config->num_hidden_layers; layer++)
             coli_v4_window_attention_reset(session->attention[layer]);
         if (coli_v4_full_dspark_wanted) v4_ds_reset_history();
+        /* Plan a capture: the longest common prefix of two successive fresh
+         * prompts IS the stable system prefix. Snapshot there mid-prefill. */
+        ckpt_at = v4_ckpt_plan(session->prompt_ids, prompt_count);
+    }
+    /* GATEWAY PREFIX HINT: the client-side renderer knows where the system
+     * turn ends, so the first request of the first conversation can already
+     * capture the shared prefix instead of waiting for a second fresh prompt
+     * to reveal it. The hint is a byte offset; tokenize that substring and
+     * accept it only when its ids are an exact token prefix of the prompt
+     * (template markers make that the normal case). Never overrides a plan
+     * that is already set. */
+    if (!ckpt_at && options->prefix_bytes && v4_ckpt_min_tokens() &&
+        options->prefix_bytes < prompt_length) {
+        int cap = prompt_count + 16;
+        int *pids = malloc((size_t)cap * sizeof(*pids));
+        int pn = pids ? tok_encode(&session->tokenizer, prompt,
+                                   options->prefix_bytes, pids, cap) : 0;
+        if (pn >= v4_ckpt_min_tokens() && pn > reuse && pn < prompt_count - 8 &&
+            !memcmp(pids, session->prompt_ids, (size_t)pn * sizeof(int)) &&
+            !v4_ckpt_have(session->prompt_ids, pn))
+            ckpt_at = pn;
+        free(pids);
+        if (ckpt_at && getenv("V4_PREFIX_LOG"))
+            fprintf(stderr, "[PREFIX] hint boundary at %d tokens\n", ckpt_at);
     }
     session->prefix_reused = reuse;
     if (reuse && getenv("V4_PREFIX_LOG"))
@@ -8691,28 +9817,90 @@ int coli_v4_session_generate(ColiV4Session *session,
                 reuse, prompt_count);
 
     int fresh = prompt_count - reuse;
-    for (int item = 0; item < fresh; item++)
-        if (load_embedding(state + (size_t)item * hd, index, config,
-                           session->prompt_ids[reuse + item])) {
-            /* The state now matches neither the old ids nor the new ones. */
-            kv_prefix_taint(&session->fed);
-            if (error && error_size)
-                snprintf(error, error_size, "cannot load embedding");
-            return -1;
-        }
+    /* Embeddings load per segment inside the prefill loop below. */
 
     double setup_done = spec_now();
-    if (target_batch(engine, &state, &next, attention, index, config, experts,
-                     session->prompt_ids + reuse, reuse, fresh,
-                     error, error_size)) {
-        kv_prefix_taint(&session->fed);
-        return -1;
+    /* RESUMABLE PREFILL: one segment loop replaces the single monolithic
+     * target_batch call. Segments are atomic (no abort callback inside, so
+     * every layer sees a segment exactly once and the recurrent compressor
+     * state stays consistent); the client-cancel poll runs BETWEEN segments,
+     * and completed segments are recorded into fed as they land. A client
+     * that times out and retries the identical prompt therefore resumes
+     * where the cancel struck (strict-prefix reuse) instead of restarting a
+     * multi-minute prefill from zero. The checkpoint boundary is just a
+     * forced segment edge. */
+    /* Segment size trades resume granularity and cancel latency against the
+     * per-call layer-weight sweep (each target_batch call re-loads every
+     * layer's views once: 64-token segments measured 3x slower end to end).
+     * Every segment also re-sweeps each layer's routed experts (disk-bound),
+     * so fewer segments = fewer sweeps: 4096 saves ~30 s on an 8k prompt
+     * against 2048 at the
+     * price of a ~2.5-minute worst-case cancel latency (was ~75 s);
+     * V4_PREFILL_SEGMENT overrides. */
+    static int v4_prefill_segment = 0;
+    if (!v4_prefill_segment) {
+        const char *setting = getenv("V4_PREFILL_SEGMENT");
+        v4_prefill_segment = setting ? atoi(setting) : 4096;
+        if (v4_prefill_segment < 64) v4_prefill_segment = 64;
     }
+    int tail_rows = fresh;
+    int done_upto = reuse;
+    while (done_upto < prompt_count) {
+        int seg = prompt_count - done_upto;
+        if (seg > v4_prefill_segment) seg = v4_prefill_segment;
+        if (ckpt_at > done_upto && ckpt_at < done_upto + seg)
+            seg = ckpt_at - done_upto;
+        if (options->should_abort &&
+            options->should_abort(options->abort_user_data)) {
+            /* Keep what completed: fed already describes [0, done_upto), so
+             * an identical retry resumes here instead of restarting. Worst
+             * cancel latency is one atomic segment. */
+            if (error && error_size) snprintf(error, error_size, "CANCELLED");
+            return -1;
+        }
+        for (int item = 0; item < seg; item++)
+            if (load_embedding(state + (size_t)item * hd, index, config,
+                               session->prompt_ids[done_upto + item])) {
+                kv_prefix_taint(&session->fed);
+                if (error && error_size)
+                    snprintf(error, error_size, "cannot load embedding");
+                return -1;
+            }
+        if (target_batch(engine, &state, &next, attention, index, config,
+                         experts, session->prompt_ids + done_upto, done_upto,
+                         seg, NULL, NULL, error, error_size)) {
+            /* A real failure leaves the segment half-applied across layers;
+             * only then is the record discarded. Cancels never land here —
+             * segments are atomic and the poll runs between them. */
+            kv_prefix_taint(&session->fed);
+            return -1;
+        }
+        kv_prefix_record(&session->fed, session->prompt_ids + done_upto,
+                         done_upto, seg);
+        done_upto += seg;
+        session->fed.len = done_upto;
+        tail_rows = seg;
+        /* A multi-minute prefill with silent stderr reads as a hang; one
+         * line per segment keeps the operator oriented. */
+        if (prompt_count - reuse > v4_prefill_segment)
+            fprintf(stderr, "v4_prefill %d/%d tokens\n",
+                    done_upto, prompt_count);
+        if (ckpt_at == done_upto && ckpt_at < prompt_count)
+            v4_ckpt_store(session, ckpt_at, 0);
+    }
+    /* PROMPT-END snapshot: the next turn of this conversation almost never
+     * extends fed exactly (the reply is re-rendered by the client), but it
+     * always extends the prompt. Skip when the prompt was fully reused (the
+     * identical-retry case) or already captured. */
+    if (fresh > 0 && v4_ckpt_min_tokens() &&
+        prompt_count >= v4_ckpt_min_tokens() &&
+        !v4_ckpt_have(session->prompt_ids, prompt_count))
+        v4_ckpt_store(session, prompt_count, 1);
     session->state = state;
     session->next = next;
-    /* The batch holds only the fresh tail, so the final row is at fresh-1
-     * even though its absolute position is prompt_count-1. */
-    const float *last = state + (size_t)(fresh - 1) * hd;
+    /* The batch holds only the final segment, so its last row is at
+     * tail_rows-1 even though its absolute position is prompt_count-1. */
+    const float *last = state + (size_t)(tail_rows - 1) * hd;
     int current = 0;
     float current_logit = 0.0f;
     if (final_hidden(hidden, last, index, config, error, error_size) ||
@@ -8819,7 +10007,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         }
                     if (target_batch(engine, &state, &next, attention, index,
                                      config, experts, inputs, old_last + 1,
-                                     batch, error, error_size)) {
+                                     batch, NULL, NULL, error, error_size)) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
                         spec_attention_free(snapshots,
@@ -8923,7 +10111,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         if (retained > 0 && target_batch(
                                 engine, &state, &next, attention, index,
                                 config, experts, inputs, old_last + 1,
-                                retained, error, error_size)) {
+                                retained, NULL, NULL, error, error_size)) {
                             spec_attention_free(
                                 snapshots, config->num_hidden_layers);
                             kv_prefix_taint(&session->fed);
@@ -9036,7 +10224,7 @@ static int v4_oracle_teacher_forcing(
             return -1;
         }
     if (target_batch(NULL, &state, &next, attention, index, config, experts,
-                     full_ids, 0, full_count, error, error_size)) {
+                     full_ids, 0, full_count, NULL, NULL, error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -9082,7 +10270,8 @@ static int v4_oracle_greedy_from_prompt(
             return -1;
         }
     if (target_batch(NULL, &state, &next, attention, index, config, experts,
-                     prompt_ids, 0, prompt_count, error, error_size)) {
+                     prompt_ids, 0, prompt_count, NULL, NULL,
+                     error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -9177,6 +10366,7 @@ typedef struct {
     float temperature;
     float top_p;
     int extension_bytes;
+    int prefix_bytes;
 } V4ServeRequest;
 
 typedef struct {
@@ -9186,12 +10376,16 @@ typedef struct {
 } V4ServeStream;
 
 static double v4_serve_rss_gb(void) {
+#ifdef _WIN32
+    return 0.0;
+#else
     struct rusage usage;
     if (getrusage(RUSAGE_SELF, &usage)) return 0.0;
 #ifdef __APPLE__
     return usage.ru_maxrss / (1024.0 * 1024.0 * 1024.0);
 #else
     return usage.ru_maxrss / (1024.0 * 1024.0);
+#endif
 #endif
 }
 
@@ -9266,10 +10460,15 @@ static int v4_serve_read_request(V4ServeRequest *request,
     if (strcmp(command, "SUBMIT")) return 0;
 
     int slot = 0, prompt_bytes = 0, max_tokens = 0, extension_bytes = 0;
+    int prefix_bytes = 0;
     float temperature = 0.0f, top_p = 1.0f;
-    int fields = sscanf(line, "%*s %*s %d %d %d %f %f %d",
+    /* Optional 8th field: byte length of the prompt's stable system prefix
+     * (gateway hint for the prefix checkpoint). Older gateways omit it. */
+    int fields = sscanf(line, "%*s %*s %d %d %d %f %f %d %d",
                         &slot, &prompt_bytes, &max_tokens,
-                        &temperature, &top_p, &extension_bytes);
+                        &temperature, &top_p, &extension_bytes, &prefix_bytes);
+    if (fields < 7) prefix_bytes = 0;
+    if (prefix_bytes < 0 || prefix_bytes > prompt_bytes) prefix_bytes = 0;
     if (fields < 5 || slot != 0 || prompt_bytes < 0 ||
         prompt_bytes > (1 << 24) || max_tokens < 1 ||
         extension_bytes < 0 || extension_bytes > (1 << 24)) {
@@ -9298,6 +10497,7 @@ static int v4_serve_read_request(V4ServeRequest *request,
     request->temperature = temperature;
     request->top_p = top_p;
     request->extension_bytes = extension_bytes;
+    request->prefix_bytes = prefix_bytes;
     return 2;
 }
 
@@ -9307,6 +10507,27 @@ static void v4_serve_data(const char *id, const char *data, int bytes) {
     fwrite(data, 1, (size_t)bytes, stdout);
     fputc('\n', stdout);
     fflush(stdout);
+}
+
+/* Drain gateway commands queued behind an active request: CANCEL/STOP for the
+ * active id (or stdin EOF) reports "stop generating"; a SUBMIT that arrives
+ * while the engine is busy is answered with an engine-busy ERROR so its
+ * gateway thread fails fast instead of waiting on a pipe nobody is reading. */
+static int v4_serve_drain_commands(const char *active_id) {
+    while (coli_stdin_readable()) {
+        V4ServeRequest queued = {0};
+        int result = v4_serve_read_request(&queued, active_id);
+        if (result < 0 || result == 1) {
+            free(queued.prompt);
+            return 1;
+        }
+        if (result == 2) {
+            printf("ERROR %s engine busy\n", queued.id);
+            fflush(stdout);
+            free(queued.prompt);
+        }
+    }
+    return 0;
 }
 
 static int v4_serve_token(void *user_data, int token, float logit,
@@ -9321,19 +10542,23 @@ static int v4_serve_token(void *user_data, int token, float logit,
                                piece, (int)sizeof(piece) - 1);
         v4_serve_data(stream->request_id, piece, bytes);
     }
-    while (coli_stdin_readable()) {
-        V4ServeRequest queued = {0};
-        int result = v4_serve_read_request(&queued, stream->request_id);
-        if (result < 0 || result == 1) {
-            stream->cancelled = 1;
-            free(queued.prompt);
-            return 1;
-        }
-        if (result == 2) {
-            printf("ERROR %s engine busy\n", queued.id);
-            fflush(stdout);
-            free(queued.prompt);
-        }
+    if (v4_serve_drain_commands(stream->request_id)) {
+        stream->cancelled = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Prefill-phase abort poll (ColiV4SessionAbortFn). The token callback above
+ * covers decode; this covers the minutes-long prefill window where no token
+ * callback fires and a gateway CANCEL would otherwise sit unread while every
+ * later SUBMIT queued behind a request nobody wants anymore. */
+static int v4_serve_abort(void *user_data) {
+    V4ServeStream *stream = user_data;
+    if (stream->cancelled) return 1;
+    if (v4_serve_drain_commands(stream->request_id)) {
+        stream->cancelled = 1;
+        return 1;
     }
     return 0;
 }
@@ -9417,6 +10642,9 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
             .max_new_tokens = request->max_tokens,
             .stop_at_sentence = 0,
             .no_dspark = 0,
+            .should_abort = v4_serve_abort,
+            .abort_user_data = &stream,
+            .prefix_bytes = (size_t)request->prefix_bytes,
         },
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
@@ -9473,7 +10701,6 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                                &g_v4_mir_nread[r], __ATOMIC_RELAXED));
         fprintf(stderr, "%s\n", line);
     }
-
 }
 
 static int v4_serve_main(void) {
@@ -9516,6 +10743,20 @@ static int v4_serve_main(void) {
         return 1;
     }
 
+    /* Eagerly load all dense layers at startup so the first request's
+     * prefill does not pay the per-layer dense load in the middle of its
+     * attention + expert disk I/O. */
+    if (engine->runtime.dense_resident) {
+        ColiSafetensorsIndex *idx = coli_v4_engine_target_index(engine);
+        for (int l = 0; l < session->config.num_hidden_layers; l++) {
+            ColiDeepSeekV4LayerWeights lw;
+            if (coli_v4_layer_load(engine, &lw, &session->config, idx, l,
+                                   error, sizeof(error))) {
+                fprintf(stderr, "%s\n", error);
+                break;
+            }
+        }
+    }
     coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
     fputs("\x01\x01READY\x01\x01\n", stdout);
@@ -9844,7 +11085,8 @@ int main(int argc, char **argv) {
             if (load_embedding(tf_state + (size_t)item * hd_tf, index, &config,
                                full_ids[item])) goto cleanup;
         if (target_batch(engine, &tf_state, &tf_next, attention, index, &config,
-                         experts, full_ids, 0, full_count, error, sizeof(error))) {
+                         experts, full_ids, 0, full_count, NULL, NULL,
+                         error, sizeof(error))) {
             fprintf(stderr, "%s\n", error); goto cleanup;
         }
         for (int pos = 0; pos < full_count; pos++) {
@@ -11563,7 +12805,7 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 
 int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
-    if (!outputs || !weight || !inputs || batch < 1 || batch > 64 ||
+    if (!outputs || !weight || !inputs || batch < 1 || batch > 128 ||
         weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
         weight->scale_format != COLI_SCALE_F32 ||
         !weight->data || !weight->scales || weight->rows < 1 ||
@@ -11599,7 +12841,7 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
         const float *scales = weight->scales;
         #pragma omp parallel for schedule(static)
         for (int64_t tile = 0; tile < weight->rows / 8; tile++) {
-            __m256 sums[64];
+            __m256 sums[128];
             for (int item = 0; item < batch; item++)
                 sums[item] = _mm256_setzero_ps();
             size_t scale_row = ((size_t)tile * 8) / 128;
@@ -11635,7 +12877,7 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
 
 int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                               const float *inputs, int batch) {
-    if (!outputs || !weight || !inputs || batch < 1 || batch > 64 ||
+    if (!outputs || !weight || !inputs || batch < 1 || batch > 128 ||
         weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
         weight->scale_format != COLI_SCALE_UE8M0 ||
         !weight->data || !weight->scales || weight->rows < 1 ||

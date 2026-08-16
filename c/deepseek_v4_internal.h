@@ -7,6 +7,7 @@
  */
 #include "deepseek_v4.h"
 
+#include <stdio.h>
 #include "tensor.h"
 #include "expert_store.h"
 #include "native_quant.h"
@@ -342,6 +343,10 @@ extern "C" {
 typedef struct ColiDeepSeekV4WindowAttentionState
     ColiDeepSeekV4WindowAttentionState;
 
+int coli_v4_window_attention_prepare(ColiDeepSeekV4WindowAttentionState *state,
+                                     const ColiDeepSeekV4LayerWeights *weights,
+                                     const ColiDeepSeekV4Config *config,
+                                     char *error, size_t error_size);
 int coli_v4_window_attention_create(ColiDeepSeekV4WindowAttentionState **state,
                                     const ColiDeepSeekV4Config *config);
 void coli_v4_window_attention_reset(ColiDeepSeekV4WindowAttentionState *state);
@@ -389,6 +394,12 @@ int coli_v4_attention_snapshot_restore(
     ColiDeepSeekV4WindowAttentionState *state,
     const ColiV4AttentionSnapshot *snapshot);
 void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot);
+/* Disk (de)serialization of a snapshot (little-endian raw fields + arrays).
+ * write returns 0 on success; read allocates *output (0 on success). */
+int coli_v4_attention_snapshot_write(const ColiV4AttentionSnapshot *snapshot,
+                                     FILE *stream);
+int coli_v4_attention_snapshot_read(FILE *stream,
+                                    ColiV4AttentionSnapshot **output);
 /* ==== end deepseek_v4_attention_transaction.h ==== */
 
 /* ==== begin deepseek_v4_compressor.h ==== */
@@ -433,6 +444,14 @@ int coli_v4_compressor_step(ColiDeepSeekV4CompressorState *state,
                             const float *input, int position,
                             char *error, size_t error_size);
 
+/* Like coli_v4_compressor_step, but consumes precomputed wkv/wgate matvec
+ * rows (projection_dim floats each, precomputed batched) instead of
+ * projecting input itself. State updates are identical. */
+int coli_v4_compressor_advance(ColiDeepSeekV4CompressorState *state,
+                               float *output, int *produced,
+                               const float *kv_proj, const float *gate_proj,
+                               int position, char *error, size_t error_size);
+
 #ifdef __cplusplus
 }
 #endif
@@ -451,6 +470,10 @@ int coli_v4_compressor_snapshot_restore(
     ColiDeepSeekV4CompressorState *state,
     const ColiV4CompressorSnapshot *snapshot);
 void coli_v4_compressor_snapshot_destroy(ColiV4CompressorSnapshot *snapshot);
+int coli_v4_compressor_snapshot_write(const ColiV4CompressorSnapshot *snapshot,
+                                      FILE *stream);
+int coli_v4_compressor_snapshot_read(FILE *stream,
+                                     ColiV4CompressorSnapshot **output);
 /* ==== end deepseek_v4_compressor_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_indexer.h ==== */
@@ -478,6 +501,24 @@ int coli_v4_indexer_step(ColiDeepSeekV4Indexer *state, int *indices,
                          int index_capacity, const float *query_rank,
                          const float *input, int position,
                          char *error, size_t error_size);
+/* Like coli_v4_indexer_step, but consumes precomputed rows of the indexer
+ * compressor's wkv/wgate projections for this position. */
+int coli_v4_indexer_step_projected(ColiDeepSeekV4Indexer *state, int *indices,
+                                   int index_capacity, const float *query_rank,
+                                   const float *input, int position,
+                                   const float *kv_proj, const float *gate_proj,
+                                   char *error, size_t error_size);
+/* Batched prefill split of the step: advance per token (in order), then
+ * select for the whole chunk at once. */
+int coli_v4_indexer_advance(ColiDeepSeekV4Indexer *state, const float *input,
+                            int position, const float *kv_proj,
+                            const float *gate_proj, char *error,
+                            size_t error_size);
+int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
+                                 int index_capacity, const float *query_ranks,
+                                 const float *inputs, int start_position,
+                                 int batch, const int *counts, int *selected,
+                                 char *error, size_t error_size);
 const float *coli_v4_indexer_compressed_values(
     const ColiDeepSeekV4Indexer *state);
 int coli_v4_indexer_compressed_count(const ColiDeepSeekV4Indexer *state);
@@ -494,6 +535,9 @@ int coli_v4_indexer_snapshot_create(const ColiDeepSeekV4Indexer *state,
 int coli_v4_indexer_snapshot_restore(ColiDeepSeekV4Indexer *state,
                                      const ColiV4IndexerSnapshot *snapshot);
 void coli_v4_indexer_snapshot_destroy(ColiV4IndexerSnapshot *snapshot);
+int coli_v4_indexer_snapshot_write(const ColiV4IndexerSnapshot *snapshot,
+                                   FILE *stream);
+int coli_v4_indexer_snapshot_read(FILE *stream, ColiV4IndexerSnapshot **output);
 /* ==== end deepseek_v4_indexer_snapshot.h ==== */
 
 /* ==== begin deepseek_v4_expert.h ==== */
@@ -676,6 +720,7 @@ typedef struct {
 } ColiDeepSeekV4RuntimeOptions;
 
 enum { COLI_V4_RESIDENT_MAX_LAYERS = 128 };
+
 
 struct ColiV4Engine {
     ColiDeepSeekV4Config config;
