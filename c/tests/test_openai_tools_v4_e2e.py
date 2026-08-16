@@ -73,6 +73,8 @@ class ToolCallingV4E2E(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        (Path(cls.tmp.name) / "config.json").write_text(
+            json.dumps({"model_type": "deepseek_v4"}), encoding="utf-8")
         mock = Path(cls.tmp.name) / "mock_engine.py"
         mock.write_text(MOCK_ENGINE)
         mock.chmod(0o755)

@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from family_registry import expert_contributions, planner_geometry, resolve_model
+
 
 GB = 1_000_000_000
 EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\.")
@@ -35,17 +37,16 @@ def _tensor_sizes(path):
 
 
 def analyze_model(model):
-    model = Path(model).resolve()
-    config_path = model / "config.json"
-    if not config_path.is_file():
-        raise ValueError(f"missing config.json: {model}")
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    resolved = resolve_model(model)
+    model = Path(resolved.model_dir)
+    config = resolved.config
     shards = sorted(model.glob("*.safetensors"))
     if not shards:
         raise ValueError(f"no safetensors shards: {model}")
 
     dense_bytes = 0
     expert_groups = {}
+    tensor_names = set()
     for shard in shards:
         try:
             sizes = list(_tensor_sizes(shard))
@@ -60,10 +61,12 @@ def analyze_model(model):
             raise OSError(error.errno,
                           f"{error.strerror or error}: {shard}") from error
         for name, size in sizes:
-            match = EXPERT_RE.search(name)
-            if match:
-                key = tuple(map(int, match.groups()))
-                expert_groups[key] = expert_groups.get(key, 0) + size
+            tensor_names.add(name)
+            contributions = expert_contributions(resolved, name, size)
+            if contributions:
+                for layer, expert, byte_count in contributions:
+                    key = (layer, expert)
+                    expert_groups[key] = expert_groups.get(key, 0) + byte_count
             else:
                 dense_bytes += size
 
@@ -75,6 +78,24 @@ def analyze_model(model):
     typical_expert_bytes = int(statistics.median(per_layer.values())) if per_layer else 0
     max_expert_bytes = max(per_layer.values(), default=0)
     model_bytes = sum(shard.stat().st_size for shard in shards)
+    if resolved.descriptor.id == "glm":
+        family_cfg = resolved.family_config
+        layers = int(family_cfg.get("num_hidden_layers") or 0)
+        kinds = family_cfg.get("indexer_types")
+        if isinstance(kinds, list):
+            required = [layer for layer, kind in enumerate(kinds[:layers])
+                        if kind == "full"]
+        else:
+            frequency = max(1, int(family_cfg.get("index_topk_freq") or 1))
+            offset = int(family_cfg.get("index_skip_topk_offset") or 2)
+            required = [layer for layer in range(layers)
+                        if max(layer - offset + 1, 0) % frequency == 0]
+        indexer_present = bool(required and all(
+            f"model.layers.{layer}.self_attn.indexer.wq_b.weight" in tensor_names
+            for layer in required))
+        family_cfg = dict(family_cfg, _colibri_indexer_present=indexer_present)
+        resolved = type(resolved)(resolved.descriptor, resolved.model_type,
+                                  resolved.config, family_cfg, resolved.model_dir)
     return {
         "path": str(model),
         "shards": len(shards),
@@ -88,6 +109,7 @@ def analyze_model(model):
         "expert_bytes_by_layer": per_layer,
         "per_cap_bytes": per_cap_bytes,
         "config": config,
+        "resolved_family": resolved,
     }
 
 
@@ -689,13 +711,18 @@ POLICIES = {
 
 def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                available_memory=None, available_disk=None, gpus=None,
-               policy="quality", physical_cpus=None, cpu_sockets=None):
+               policy="quality", physical_cpus=None, cpu_sockets=None,
+               kv_slots=1):
     if policy not in POLICIES:
         raise ValueError(f"unknown policy: {policy}")
     info = analyze_model(model)
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
-    cfg = info["config"]
+    resolved = info["resolved_family"]
+    geometry = planner_geometry(resolved, context)
+    if (isinstance(kv_slots, bool) or not isinstance(kv_slots, int) or
+            not 1 <= kv_slots <= resolved.descriptor.limits.max_kv_slots):
+        raise ValueError(f"{resolved.descriptor.id}: invalid KV slot count {kv_slots}")
     available_memory = memory_available() if available_memory is None else available_memory
     if available_disk is None:
         try:
@@ -717,14 +744,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     unified = any(gpu.get("unified_memory", False) for gpu in planning_gpus)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
-    layers = int(cfg.get("num_hidden_layers") or 0) + 1
-    kv_bytes = layers * context * (int(cfg.get("kv_lora_rank") or 0) +
-                                   int(cfg.get("qk_rope_head_dim") or 0)) * 4
-    kv_buffer = context * int(cfg.get("num_attention_heads") or 0) * (
-        int(cfg.get("qk_nope_head_dim") or 0) + int(cfg.get("v_head_dim") or 0)) * 4
+    kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
+    kv_buffer = geometry.workspace_bytes
     runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert + kv_bytes + kv_buffer)
     per_cap = info["per_cap_bytes"]
-    configured_experts = int(cfg.get("n_routed_experts") or 0)
+    configured_experts = geometry.configured_experts
 
     reserve = 2 * GB
     gpu_plan = []
@@ -827,7 +851,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "version": 2,
         "policy": {"name": policy, **POLICIES[policy],
                    "quality_preserving": policy != "experimental-fast"},
-        "model": {key: value for key, value in info.items() if key != "config"},
+        "model": {**{key: value for key, value in info.items()
+                     if key not in ("config", "resolved_family")},
+                  "family_id": resolved.descriptor.id,
+                  "model_type": resolved.model_type,
+                  "configured_experts": configured_experts},
         "cpu": {"physical_cores": _resolve_physical_cores(physical_cpus),
                  "sockets": max(1, int(cpu_sockets)),
                  "thread_policy": "physical-cores"},
@@ -837,7 +865,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
                      "available_bytes": available_disk, "cold_expert_bytes": cold_bytes},
             "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
-                    "runtime_bytes": runtime_bytes, "expert_cache_bytes": cache_bytes,
+                    "runtime_bytes": runtime_bytes,
+                    "sequence_state_bytes": geometry.context_state_bytes,
+                    "fixed_state_bytes": geometry.fixed_state_bytes,
+                    "workspace_bytes": geometry.workspace_bytes,
+                    "expert_cache_bytes": cache_bytes,
                     "warm_expert_bytes": warm_bytes, "cache_slots_per_layer": cap},
             "vram": {"role": "hot-experts", "devices": gpu_plan,
                      "budget_bytes": vram_budget, "hot_expert_bytes": hot_bytes,

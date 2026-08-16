@@ -21,6 +21,8 @@ import time
 import uuid
 
 import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
+from family_registry import (FamilyConfigError, UnknownFamilyError, family_by_id,
+                             family_ids, resolve_model)
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -29,16 +31,16 @@ from urllib.parse import unquote, urlsplit
 HERE = Path(__file__).resolve().parent
 
 
-def default_engine():
-    """The engine next to this file. Since #391 it is built as `colibri`; `glm` stays as a
-    fallback so an old tree (or an old hand-built binary) still starts. Reported by
-    @RDouglasSharp in #488: the default still said `glm`, so `python3 openai_server.py`
-    on a clean checkout looked for a file the build no longer produces."""
-    for name in ("colibri", "colibri.exe", "glm", "glm.exe"):
+def default_engine(family=None):
+    """Resolve the registered family's engine next to this file."""
+    family = family or family_by_id("glm")
+    names = (family.engine_artifact, *family.engine_aliases)
+    candidates = tuple(name + suffix for name in names for suffix in ("", ".exe"))
+    for name in candidates:
         candidate = HERE / name
         if candidate.exists():
             return candidate
-    return HERE / "colibri"
+    return HERE / family.engine_artifact
 END = b"\x01\x01END\x01\x01\n"
 READY = b"\x01\x01READY\x01\x01\n"
 MAX_BODY = 4 << 20
@@ -1611,23 +1613,8 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 
 def model_arch(model):
-    """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi"/"olmoe" substring, everything
-    else (including an unreadable config) is glm."""
-    try:
-        with open(Path(model) / "config.json", encoding="utf-8") as fh:
-            model_type = (json.load(fh).get("model_type") or "").lower()
-    except (OSError, ValueError, TypeError):
-        return "glm"
-    if "inkling" in model_type:
-        return "inkling"
-    if "kimi" in model_type:
-        return "kimi"
-    if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
-        return "deepseek_v4"
-    if "olmoe" in model_type:
-        return "olmoe"
-    return "glm"
+    """Compatibility wrapper over the mandatory family registry."""
+    return resolve_model(model).descriptor.id
 
 
 def cap_for_arch(arch, cap):
@@ -1652,7 +1639,7 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
-    return 0 if arch == "glm" else 8
+    return family_by_id(arch).limits.implicit_cap
 
 
 def tune_child_env(env, arch):
@@ -1777,8 +1764,16 @@ class Engine:
     # cap_for_arch above. Same convention as the --cap flags in coli and
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
-    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
-        arch = model_arch(model)
+    def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1,
+                 family=None):
+        if family is None:
+            # Protocol unit tests and embedders may use a synthetic model name.
+            # Real launcher/server entry points resolve strictly before this
+            # constructor; never reinterpret an existing invalid config.
+            config = Path(model) / "config.json"
+            family = (resolve_model(model).descriptor if config.exists()
+                      else family_by_id(ARCH))
+        arch = family.id
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
@@ -2602,7 +2597,8 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
+        family = family_by_id(ARCH)
+        if grammar is not None and not family.capabilities.grammar_payload:
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -3181,11 +3177,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.generation(body, prompt, request_id, False)
 
 
-def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_key=None,
+def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
-          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=()):
-    if engine is None:
-        engine = default_engine()
+          max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
     if not 1 <= max_tokens:
         raise ValueError("max_tokens must be positive")
     if not 1 <= port <= 65535:
@@ -3196,8 +3190,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
-        raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
+    pending_family = family
+    pending_model_id = model_id
+    pending_engine = engine
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
         # a compute-heavy API to the network. Refuse unless explicitly overridden.
@@ -3219,7 +3214,16 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
     runtime = None
     previous_sigterm = signal.getsignal(signal.SIGTERM)
     try:
-        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots)
+        family = pending_family or resolve_model(model).descriptor
+        global ARCH
+        ARCH = family.id
+        engine = pending_engine or default_engine(family)
+        model_id = pending_model_id or family.default_model_id
+        server.model_id = model_id
+        if kv_slots > family.limits.max_kv_slots:
+            raise ValueError(f"{family.id} engine supports at most "
+                             f"{family.limits.max_kv_slots} KV slot(s)")
+        runtime = Engine(engine,model,cap,max_tokens,env,kv_slots,family)
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
@@ -3238,8 +3242,8 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
-    parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe"), default="auto",
+    parser.add_argument("--engine")
+    parser.add_argument("--arch", choices=("auto", *family_ids()), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -3262,20 +3266,23 @@ def main():
              "(reverse proxy / MagicDNS in front of the loopback bind); repeat as needed, "
              "or set COLI_ALLOWED_HOSTS as a comma-separated list")
     args = parser.parse_args()
+    try:
+        resolved = resolve_model(args.model)
+    except (FamilyConfigError, UnknownFamilyError) as error:
+        parser.error(str(error))
+    family = resolved.descriptor
+    if args.arch != "auto" and args.arch != family.id:
+        parser.error(f"--arch {args.arch} conflicts with model family {family.id}")
     global ARCH
-    ARCH = args.arch
-    if ARCH == "auto":
-        ARCH = model_arch(args.model)
+    ARCH = family.id
+    if args.engine is None:
+        args.engine = str(default_engine(family))
     if args.model_id is None:
-        args.model_id = ("inkling-colibri" if ARCH == "inkling" else
-                         "kimi-k3-colibri" if ARCH == "kimi" else
-                         "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
-                         "olmoe-colibri" if ARCH == "olmoe" else
-                         "glm-5.2-colibri")
+        args.model_id = family.default_model_id
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,
-          allowed_hosts=args.allowed_host)
+          allowed_hosts=args.allowed_host,family=family)
 
 
 if __name__ == "__main__":
