@@ -12,6 +12,21 @@ else
 IS_WIN :=
 UNAME_S := $(shell uname -s 2>/dev/null)
 UNAME_M := $(shell uname -m 2>/dev/null)
+# $(OS) is set by cmd.exe, but an MSYS2/MinGW login shell does not always export
+# it -- there uname reports MINGW64_NT-10.0-26200 / MSYS_NT-* / CYGWIN_NT-*,
+# which matched no branch below and tripped the $(error) on the very platform
+# the message lists as supported. Recognise those families as Windows too.
+#
+# Gated on x86_64 deliberately: the Windows arm below hardcodes ARCH ?= x86-64-v3,
+# so an ARM64 MinGW shell must NOT be routed there -- it would fail later with a
+# confusing -march error instead of the clear $(error) it gets today.
+ifneq (,$(filter MINGW% MSYS% CYGWIN%,$(UNAME_S)))
+ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
+IS_WIN := 1
+UNAME_S :=
+UNAME_M :=
+endif
+endif
 endif
 
 COLI_V4_OK :=
