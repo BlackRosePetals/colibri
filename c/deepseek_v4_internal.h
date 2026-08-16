@@ -74,6 +74,38 @@ int coli_st_prefetch_at(const ColiSafetensorsIndex *index, int shard,
                         uint64_t offset, size_t length);
 const char *coli_st_dtype_name(ColiSafetensorsDType dtype);
 
+/* ==== begin dual-SSD mirror (COLI_MODEL_MIRROR / SNAP_MIRROR) ==== */
+
+/* Registers the read replicas listed in COLI_MODEL_MIRROR (or SNAP_MIRROR) on
+ * `index` and derives the per-drive expert read split from COLI_DISK_WEIGHTS
+ * or a startup bandwidth probe (colibri.c mirror_setup semantics). Runs after
+ * the index is open and before any expert load. Returns 1 when a usable mirror
+ * is active, 0 when none, -1 on error. */
+int coli_st_mirror_setup(ColiSafetensorsIndex *index, const char *model_dir,
+                         int experts_per_layer);
+int coli_st_streaming_direct_available_rep(const ColiSafetensorsIndex *index,
+                                           int shard, int rep);
+
+/* Replica (0 = primary, 1..nrep-1 = mirrors) serving expert (layer, eid). */
+int coli_st_expert_route(int layer, int eid);
+int coli_st_mirror_active(void);
+int coli_st_mirror_nrep(void);
+
+/* Rep-aware reads: route to the replica fd (falling back to the primary when
+ * the shard is absent there or on read error) and account bytes per drive. */
+int coli_st_read_at_rep(const ColiSafetensorsIndex *index, int shard, int rep,
+                        uint64_t offset, size_t length, void *destination);
+int coli_st_read_at_streaming_rep(const ColiSafetensorsIndex *index, int shard,
+                                  int rep, uint64_t offset, size_t length,
+                                  void *destination);
+int coli_st_prefetch_at_rep(const ColiSafetensorsIndex *index, int shard,
+                            int rep, uint64_t offset, size_t length);
+
+/* Per-drive I/O telemetry (bytes / read count), index [0] primary, [r] mirror. */
+extern uint64_t g_v4_mir_bytes[1 + ST_MAX_MIR];
+extern uint64_t g_v4_mir_nread[1 + ST_MAX_MIR];
+/* ==== end dual-SSD mirror ==== */
+
 int coli_tensor_load_fp8(ColiOwnedTensor *output,
                          const ColiSafetensorsIndex *index,
                          const char *prefix, char *error, size_t error_size);
