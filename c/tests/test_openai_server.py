@@ -773,6 +773,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(env["V4_MTP_DRAFT"], "3")
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+        self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
 
     def test_direct_v4_server_preserves_explicit_omp_threads(self):
         env = {"OMP_NUM_THREADS": "3"}

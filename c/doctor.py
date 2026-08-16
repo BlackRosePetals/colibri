@@ -388,6 +388,13 @@ def cuda_linkage(engine_path):
             image = engine.read_bytes()
         except OSError:
             return {"linked": False, "missing": False}
+        # The DeepSeek V4 engine has its own loader (backend_loader_dsv4.c):
+        # it tries coli_cuda_dsv4_dg.dll then coli_cuda_dsv4.dll, so either
+        # next to the engine means the tier can start.
+        if b"[DSV4 CUDA]" in image:
+            present = any((engine.parent / name).is_file()
+                          for name in ("coli_cuda_dsv4_dg.dll", "coli_cuda_dsv4.dll"))
+            return {"linked": present, "missing": not present}
         if b"[CUDA] mode: routed experts" not in image:
             return {"linked": False, "missing": False}
         expected = next((name for name in ("coli_hip.dll", "coli_cuda.dll")

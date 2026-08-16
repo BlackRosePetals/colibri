@@ -1682,6 +1682,10 @@ def tune_child_env(env, arch):
     env.setdefault("V4_MTP_MISS", "96")
     env.setdefault("V4_MTP_MIN", "3")
     env.setdefault("V4_MTP_CONF", "0.55")
+    # CUDA-driven MTP drafting stays opt-in (mirrors GLM's COLI_CUDA_MTP): the
+    # GPU fp4 kernels accumulate fp32 differently from the CPU refs, and a
+    # speculative draft must match the target bit-for-bit to be accepted.
+    env.setdefault("V4_MTP_GPU", "0")
     return env
 
 

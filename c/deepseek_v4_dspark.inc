@@ -416,7 +416,8 @@ static int v4_ds_load_all(const ColiSafetensorsIndex *index,
 
 static int v4_ds_expert(const ColiSafetensorsIndex *index,
                         V4DSparkStage *stage, int expert,
-                        ColiExpertView *view, int *miss_budget) {
+                        ColiExpertView *view, int *miss_budget,
+                        void *gpu_mirrors) {
     int slot = -1;
     int lru = 0;
     for (int i = 0; i < stage->nslots; i++) {
@@ -489,6 +490,17 @@ static int v4_ds_expert(const ColiSafetensorsIndex *index,
         tensor->block_columns = 32;
     }
     view->lease = NULL;
+#ifdef COLI_V4_GPU_TIER
+    /* Mirrors the target model's resident fp4 tier: upload this expert's
+     * gate/up/down byte-for-byte on first use so the fp4 matvecs dispatch
+     * through the CUDA kernels. block_rows==1 + UE8M0 is exactly the layout
+     * dsv4_cuda_upload_fp4 consumes; any failure keeps the CPU path. */
+    if (gpu_mirrors) {
+        view->key.layer = stage->stage;
+        view->key.expert = expert;
+        coli_v4_gpu_dspark_expert_attach(gpu_mirrors, view);
+    }
+#endif
     return 1;
 }
 
@@ -808,7 +820,7 @@ static int v4_ds_moe(float *out, V4DSparkStage *stage,
                      const float *input,
                      const ColiSafetensorsIndex *index,
                      const ColiDeepSeekV4Config *config,
-                     int *miss_budget) {
+                     int *miss_budget, void *gpu_mirrors) {
     int hidden = config->hidden_size;
     int intermediate = config->moe_intermediate_size;
     int topk = config->num_experts_per_tok;
@@ -836,7 +848,8 @@ static int v4_ds_moe(float *out, V4DSparkStage *stage,
     if (!branch) return -1;
     for (int rank = 0; rank < topk; rank++) {
         ColiExpertView expert;
-        if (!v4_ds_expert(index, stage, experts[rank], &expert, miss_budget)) {
+        if (!v4_ds_expert(index, stage, experts[rank], &expert, miss_budget,
+                          gpu_mirrors)) {
             free(branch);
             return 1;                   /* bounded cold-start abort */
         }
@@ -861,7 +874,7 @@ static int v4_ds_stage_forward(float *state, V4DSparkStage *stage,
                                const ColiSafetensorsIndex *index,
                                const ColiDeepSeekV4Config *config,
                                const float *cosines, const float *sines,
-                               int *miss_budget) {
+                               int *miss_budget, void *gpu_mirrors) {
     int hidden = config->hidden_size;
     int hc = config->hc_mult;
     int head_dim = config->head_dim;
@@ -930,7 +943,8 @@ static int v4_ds_stage_forward(float *state, V4DSparkStage *stage,
                      config, post, comb);
         v4_ds_rmsnorm(xn, xn, stage->ffn_norm.data, hidden,
                       config->rms_norm_eps);
-        int result = v4_ds_moe(branch, stage, xn, index, config, miss_budget);
+        int result = v4_ds_moe(branch, stage, xn, index, config, miss_budget,
+                               gpu_mirrors);
         if (result < 0) goto fail;
         if (result > 0) {
             free(branch); free(combs); free(posts); free(block_kv);
@@ -1109,6 +1123,20 @@ static int v4_dspark_draft(ColiV4Engine *engine,
     if (!v4_ds_load_all(index, config)) return 0;
     double loaded = spec_now();
 
+    /* Mirrors GLM's COLI_CUDA_MTP: drafting experts go through the CUDA tier
+     * only when V4_MTP_GPU=1 and the tier opened. Default off because the GPU
+     * kernels accumulate fp32 differently from the CPU refs; speculative
+     * acceptance requires the draft to match the target bit-for-bit, so the
+     * opt-in exists for runs that verify the divergence is below threshold. */
+    void *gpu_mirrors = NULL;
+#ifdef COLI_V4_GPU_TIER
+    const char *mtp_gpu = getenv("V4_MTP_GPU");
+    if (mtp_gpu && atoi(mtp_gpu) != 0 && engine->gpu.enabled) {
+        if (coli_v4_gpu_dspark_mirrors_ensure(engine) == 0)
+            gpu_mirrors = engine->gpu.dspark_mirrors;
+    }
+#endif
+
     int hidden = config->hidden_size;
     int hc = config->hc_mult;
     int rope_dim = config->qk_rope_head_dim;
@@ -1156,7 +1184,7 @@ static int v4_dspark_draft(ColiV4Engine *engine,
         double stage_began = spec_now();
         int result = v4_ds_stage_forward(state, &g_v4ds[stage_id], first_position,
                                          index, config, cosines, sines,
-                                         &miss_budget);
+                                         &miss_budget, gpu_mirrors);
         stage_seconds[stage_id] = spec_now() - stage_began;
         if (result != 0) {
             free(state); free(sines); free(cosines); return 0;
