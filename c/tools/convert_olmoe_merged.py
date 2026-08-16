@@ -25,11 +25,13 @@ import sys
 from pathlib import Path
 
 try:
+    import numpy  # noqa: F401  -- safetensors.torch.save_file imports it internally
     import torch
     from safetensors import safe_open
     from safetensors.torch import save_file
 except ImportError as exc:
-    sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors huggingface_hub")
+    sys.exit(f"Missing dependencies: {exc}. "
+             f"Install: pip install numpy torch safetensors huggingface_hub")
 
 EXPERT_KEY_RE = re.compile(
     r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight"
