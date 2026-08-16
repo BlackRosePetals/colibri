@@ -362,7 +362,7 @@ def env_for_engine(a, arch):
     if arch == "glm":
         return env_for(a)
     env = os.environ.copy()
-    # OMP_NUM_THREADS for the sister engines too.
+    # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
     # #805 set this from physical cores "on every platform" -- but only inside
     # env_for(), which this function calls only for glm. inkling, kimi_k3,
@@ -375,12 +375,18 @@ def env_for_engine(a, arch):
     # Same defect shape as the one #805 fixed, one level out: a mechanism that
     # reaches one engine and not its siblings.
     #
-    # setdefault, so an explicit OMP_NUM_THREADS still wins -- which is also
-    # how to A/B it: OMP_NUM_THREADS=12 reproduces the old behaviour.
+    # DeepSeek V4 is now the exception: its C runtime sizes the team from
+    # logical CPUs minus its expert-loader reservation. Setting the physical
+    # count here makes that runtime mistake a launcher default for a user
+    # override and bypass its loader-aware policy. The other engines still
+    # need the physical-core default below.
+    #
+    # setdefault, so an explicit OMP_NUM_THREADS still wins.
     if not env.get("COLI_NO_OMP_TUNE"):
-        from resource_plan import physical_cpu_count
-        env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
-        if arch == "deepseek_v4":
+        if arch != "deepseek_v4":
+            from resource_plan import physical_cpu_count
+            env.setdefault("OMP_NUM_THREADS", str(physical_cpu_count()))
+        else:
             env.setdefault("OMP_WAIT_POLICY", "active")
             env.setdefault("GOMP_SPINCOUNT", "200000")
             env.setdefault("OMP_DYNAMIC", "FALSE")
@@ -941,7 +947,7 @@ def cmd_run(a):
         prompt_path=None
         try:
             cmd=[engine,os.path.abspath(a.model)]
-            if sys.platform=="win32":
+            if sys.platform in ("win32", "msys", "cygwin"):
                 with tempfile.NamedTemporaryFile(
                         mode="w",encoding="utf-8",newline="",delete=False,
                         prefix="coli-v4-prompt-",suffix=".txt") as stream:
@@ -1302,6 +1308,34 @@ def cmd_chat(a):
 
 def serve_pidfile(port): return os.path.join(tempfile.gettempdir(), f"coli-serve-{port}.pid")
 
+def _serve_cmdline_matches_port(raw, port):
+    argv=[part.decode("utf-8","replace") for part in raw.split(b"\0") if part]
+    try: coli_i=next(i for i,arg in enumerate(argv) if os.path.basename(arg)=="coli")
+    except StopIteration: return False
+    if coli_i+1>=len(argv) or argv[coli_i+1]!="serve":
+        return False
+    configured=8000
+    for i,arg in enumerate(argv[coli_i+2:], start=coli_i+2):
+        if arg=="--port" and i+1<len(argv):
+            try: configured=int(argv[i+1])
+            except ValueError: return False
+        elif arg.startswith("--port="):
+            try: configured=int(arg.split("=",1)[1])
+            except ValueError: return False
+    return configured==port
+
+def _serve_environ_matches_port(raw, port):
+    env={}
+    for entry in raw.split(b"\0"):
+        if b"=" in entry:
+            key,value=entry.split(b"=",1); env[key]=value
+    return env.get(b"SERVE")==b"1" and env.get(b"COLI_SERVE_PORT")==str(port).encode()
+
+def _serve_engine_env(a, arch):
+    env=env_for_engine(a,arch)
+    env["COLI_SERVE_PORT"]=str(a.port)
+    return env
+
 def cmd_serve(a):
     arch=model_arch(a.model)
     engine=engine_for(a.model)
@@ -1321,8 +1355,9 @@ def cmd_serve(a):
                             "olmoe-colibri" if arch=="olmoe" else
                             "glm-5.2-colibri")
     try:
+        if a.temp is not None: os.environ["COLI_TEMP"] = str(a.temp)
         openai_server.serve(a.model,a.host,a.port,model_id,a.api_key,
-              a.cap,ngen_for(a,interactive=True),engine,env_for_engine(a,arch),a.cors_origin,
+              a.cap,ngen_for(a,interactive=True),engine,_serve_engine_env(a,arch),a.cors_origin,
               a.max_queue,a.queue_timeout,a.kv_slots,allowed_hosts=a.allowed_host)
     finally:
         try: os.unlink(serve_pidfile(a.port))
@@ -1334,36 +1369,38 @@ def cmd_stop(a):
     not `glm`: every `pkill -x glm` in history silently killed nothing (that is
     how two 17+5 GB ghost engines OOM'd this box on 2026-07-16). This finds the
     real processes: the pidfile first, then /proc by cmdline/environ — only
-    processes that are demonstrably ours (SERVE=1 + our SNAP, or `coli serve`
-    in the command line)."""
+    the requested port's tagged engine and matching `coli serve` wrapper."""
     banner("stop")
-    targets=[]  # (pid, descrizione)
+    targets={}  # pid -> descrizione
     pf=serve_pidfile(a.port)
     try:
-        pid=int(open(pf).read().split()[0])
-        os.kill(pid,0); targets.append((pid,f"coli serve (pidfile, port {a.port})"))
+        with open(pf) as f: pid=int(f.read().split()[0])
+        os.kill(pid,0); targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
-    for pd in os.listdir("/proc"):
+    try: proc_entries=os.listdir("/proc")
+    except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
+    for pd in proc_entries:
         if not pd.isdigit(): continue
         pid=int(pd)
         try:
-            cmd=open(f"/proc/{pd}/cmdline","rb").read().replace(b"\0",b" ").decode("utf-8","replace")
-            if "coli" in cmd and " serve" in cmd and pid!=os.getpid():
-                if not any(p==pid for p,_ in targets): targets.append((pid,"coli serve (cmdline)"))
-            comm=open(f"/proc/{pd}/comm").read().strip()
+            with open(f"/proc/{pd}/cmdline","rb") as f: cmd=f.read()
+            if pid!=os.getpid() and _serve_cmdline_matches_port(cmd,a.port):
+                targets.setdefault(pid,f"coli serve (cmdline, port {a.port})")
+            with open(f"/proc/{pd}/comm") as f: comm=f.read().strip()
             if comm in ("colibri","glm","exe","olmoe","inkling","kimi_k3","deepseek_v4"):
-                env=open(f"/proc/{pd}/environ","rb").read().replace(b"\0",b"\n").decode("utf-8","replace")
-                if "SERVE=1" in env: targets.append((pid,f"engine `{comm}` (SERVE=1)"))
+                with open(f"/proc/{pd}/environ","rb") as f: env=f.read()
+                if _serve_environ_matches_port(env,a.port):
+                    targets.setdefault(pid,f"engine `{comm}` (port {a.port})")
         except (OSError,PermissionError): continue
     if not targets:
         print(f"  nothing running — no serve on port {a.port}, no SERVE engines"); return
-    for pid,desc in targets: print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
+    for pid,desc in targets.items(): print(f"  {'would stop' if a.dry_run else 'stopping'} {pid}: {desc}")
     if a.dry_run: return
-    for pid,_ in targets:
+    for pid in targets:
         try: os.kill(pid, signal.SIGTERM)
         except OSError: pass
     time.sleep(2.0)
-    for pid,_ in targets:
+    for pid in targets:
         try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
         except OSError: pass       # gia' morto: bene
     try: os.unlink(pf)

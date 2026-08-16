@@ -65,8 +65,11 @@ python ./coli serve --model /path/to/DeepSeek-V4-Flash --ram 32
 python ./coli web --model /path/to/DeepSeek-V4-Flash --ram 32
 ```
 
-V4 chat 使用模型原生标记。原生服务当前只支持 greedy 和一个活动 KV slot，
-tools 与 grammar 会被拒绝。请求会重新 prefill，但进程、权重、dense、
+V4 chat 使用模型原生标记。原生服务当前支持 greedy 和一个活动 KV slot。
+HTTP gateway 会把 OpenAI 与 Anthropic 的工具转换为 V4 原生 prompt 协议，
+再把 DSML 调用块解析回相应协议；grammar 仍不支持。参见
+[各引擎 API 支持表](api.md#tool-calling-support)。请求会复用严格匹配的 prompt
+前缀，只 prefill 新增后缀；prompt 分叉时则从头 prefill。进程、权重、dense、
 head 与专家缓存会保持热状态。
 
 ## 验证

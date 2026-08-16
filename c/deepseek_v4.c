@@ -3607,6 +3607,18 @@ double coli_v4_block_profile_now(void);
 void coli_v4_block_profile_add(int kind, double seconds);
 #endif
 
+/* #890: expert-forward compute accounting — defined in the expert-store unit,
+ * called here around the matmul, read per-turn in the serve loop. Always on
+ * (unlike the block profiler above), because the dashboard always needs it. */
+void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec);
+double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);
+
+static double v4_now_mono(void) {   /* #890 phase timing, same clock as disk_sec */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 static int profiled_expert_load_start(ExpertLoadHandle *handle,
                                       ExpertLoadJob *job) {
 #ifdef COLI_V4_EXPERIMENTAL_BLOCK_OTHER_PROFILE
@@ -3783,9 +3795,13 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active[slot] = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        if (!result) {
+            double mm0 = v4_now_mono();
+            result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -3816,9 +3832,13 @@ static int moe_token_pipeline(float *output,
             else
                 loader_active = 1;
         }
-        if (!result) result = coli_v4_expert_forward_ref(
-            expert_output, &expert, input, expert_weights[current],
-            config->swiglu_limit);
+        if (!result) {
+            double mm0 = v4_now_mono();
+            result = coli_v4_expert_forward_ref(
+                expert_output, &expert, input, expert_weights[current],
+                config->swiglu_limit);
+            coli_v4_expert_store_add_matmul(store, v4_now_mono() - mm0);
+        }
         coli_expert_release(store, &expert);
         if (!result)
             for (int i = 0; i < d; i++) output[i] += expert_output[i];
@@ -5318,6 +5338,15 @@ void coli_v4_attention_snapshot_destroy(ColiV4AttentionSnapshot *snapshot) {
 #include <stdlib.h>
 #include <string.h>
 
+/* The .coli_usage expert history lives in route_trace.h (#700) — one format,
+ * one reader, one writer for every engine. Included inside THIS unit only:
+ * the amalgam builds one object per COLI_V4_UNIT_*, and the shared header's
+ * statics must have a single owner, which is the unit that loads, counts
+ * (lookup_hot) and saves the history. The router runs in other units, so V4
+ * does not emit per-row ROUTE_TRACE lines; if the stream is enabled the
+ * banner says so below at store creation. */
+#include "route_trace.h"
+
 
 #ifdef COLI_V4_EXPERIMENTAL_PREFETCH_BATCH
 int coli_st_prefetch_many(
@@ -5358,6 +5387,12 @@ typedef struct {
     unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
+    double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
+    double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
+                        * dashboard needs alongside disk_sec so it stops folding
+                        * everything into "other". One shared instance per store. */
+    uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
+    uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -5509,6 +5544,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         /* A short read must never expose a partially overwritten old slot. */
         slot->expert = -1;
+        struct timespec disk_t0;
+        clock_gettime(CLOCK_MONOTONIC, &disk_t0);
         if (coli_st_read_at_streaming(
                 state->index, record->shard, record->scale_offset,
                 (size_t)record->scale_bytes, slot->slab) != 0 ||
@@ -5516,9 +5553,21 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 state->index, record->shard, record->weight_offset,
                 (size_t)record->weight_bytes,
                 slot->slab + record->scale_bytes) != 0) {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
+        }
+        {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
         }
         slot->expert = key.expert;
         state->stats.misses++;
@@ -5527,6 +5576,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
+    if (state->ehit) {
+        size_t expert_index =
+            (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->ehit[expert_index] = 1;
+        if (state->eheat && state->eheat[expert_index] < 63)
+            state->eheat[expert_index]++;
+    }
     memset(view, 0, sizeof(*view));
     view->key = key;
     fill_tensor_view(&view->gate, record, slot, V4_W1);
@@ -5630,6 +5686,8 @@ static void destroy(ColiExpertStore *store) {
         coli_st_index_close(state->index);
         free(state->records);
         free(state->slots);
+        free(state->ehit);
+        free(state->eheat);
         free(state);
     }
     free(store);
@@ -5699,6 +5757,14 @@ int coli_deepseek_v4_expert_store_open(
     }
     for (int i = 0; i < state->layers * state->slots_per_layer; i++)
         state->slots[i].expert = -1;
+    size_t telemetry_cells =
+        (size_t)state->layers * state->experts_per_layer;
+    state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
+    state->eheat = calloc(telemetry_cells, sizeof(*state->eheat));
+    if (!state->ehit || !state->eheat) {
+        set_error(error, error_size, "out of memory creating expert telemetry");
+        goto fail;
+    }
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
     store->ops = &operations;
@@ -5709,6 +5775,8 @@ int coli_deepseek_v4_expert_store_open(
 fail:
     if (state->slots) free(state->slots);
     free(state->records);
+    free(state->ehit);
+    free(state->eheat);
     coli_st_index_close(state->index);
     pthread_mutex_destroy(&state->mutex);
     free(state);
@@ -5749,13 +5817,6 @@ static double hot_now(void) {
     return (double)value.tv_sec + value.tv_nsec * 1e-9;
 }
 
-static uint32_t hot_engine_id(void) {
-    const unsigned char *text = (const unsigned char *)"deepseek_v4";
-    uint32_t hash = 2166136261u;
-    while (*text) { hash ^= *text++; hash *= 16777619u; }
-    return hash;
-}
-
 static char *hot_history_path(const char *model_dir) {
     if (!model_dir) return NULL;
     const char suffix[] = "/.coli_usage";
@@ -5765,61 +5826,47 @@ static char *hot_history_path(const char *model_dir) {
     return path;
 }
 
-/* Seed the hot-expert ranking from the same sparse text history used by the
- * other engines.  Placement is the only observable effect: expert ids and
- * weights are still selected by the V4 router on every forward. */
+/* Seed the hot-expert ranking through the shared route_trace.h reader, so the
+ * file format, the dimension and identity refusals, and the legacy layouts
+ * are exactly the ones every other engine honours (#700). Counts land in
+ * policy->usage for the pin ranking; the rt counters are fed in the same
+ * callback (rt_acc_cb) because they are what the next save persists, and the
+ * history must stay cumulative across sessions.
+ *
+ * One semantic widens deliberately: a legacy headerless history is accepted
+ * now, like the sibling engines accept it. The private reader this replaces
+ * demanded the -1 dimensions record and silently dropped headerless files. */
+typedef struct {
+    V4HotPolicy *policy;
+    const V4ExpertStoreState *state;
+} V4UsageAcc;
+
+static int hot_usage_cb(int layer, int expert, uint32_t count, void *ud) {
+    V4UsageAcc *acc = ud;
+    if (layer < 0 || layer >= acc->state->layers || expert < 0 ||
+        expert >= acc->state->experts_per_layer || !count) return 0;
+    uint64_t *slot = &acc->policy->usage[
+        (size_t)layer * acc->state->experts_per_layer + expert];
+    if (UINT64_MAX - *slot < count) *slot = UINT64_MAX;
+    else *slot += count;
+    rt_acc_cb(layer, expert, count, NULL);
+    return 1;
+}
+
 static uint64_t hot_usage_load(V4HotPolicy *policy,
                                const V4ExpertStoreState *state,
                                const char *model_dir) {
     if (!policy || !state || !model_dir) return 0;
     char *path = hot_history_path(model_dir);
     if (!path) return 0;
-    FILE *stream = fopen(path, "rb");
-    if (!stream) { free(path); return 0; }
-
-    int layer = 0, expert = 0, dimensions_seen = 0;
-    unsigned count = 0;
-    while (fscanf(stream, "%d %d %u", &layer, &expert, &count) == 3) {
-        if (layer == -1) {
-            dimensions_seen = 1;
-            if (expert != state->layers ||
-                count != (unsigned)state->experts_per_layer) {
-                fprintf(stderr,
-                        "v4_autopin ignored=%s dimensions=%d/%u expected=%d/%d\n",
-                        path, expert, count, state->layers,
-                        state->experts_per_layer);
-                fclose(stream); free(path); return 0;
-            }
-        } else if (layer == -2 &&
-                   (expert > 1 || count != hot_engine_id())) {
-            fprintf(stderr,
-                    "v4_autopin ignored=%s identity=version-%d/id-%u "
-                    "expected=version-1/id-%u\n",
-                    path, expert, count, hot_engine_id());
-            fclose(stream); free(path); return 0;
-        }
-    }
-    if (!dimensions_seen) {
-        fclose(stream); free(path); return 0;
-    }
-    rewind(stream);
-    uint64_t total = 0;
-    while (fscanf(stream, "%d %d %u", &layer, &expert, &count) == 3) {
-        if (layer < 0 || layer >= state->layers || expert < 0 ||
-            expert >= state->experts_per_layer || !count) continue;
-        uint64_t *slot = &policy->usage[
-            (size_t)layer * state->experts_per_layer + expert];
-        if (UINT64_MAX - *slot < count) *slot = UINT64_MAX;
-        else *slot += count;
-        if (UINT64_MAX - total < count) total = UINT64_MAX;
-        else total += count;
-    }
-    fclose(stream);
+    V4UsageAcc acc = { policy, state };
+    int64_t total = rt_read(path, hot_usage_cb, &acc);
+    if (total < 0) total = 0;
     if (total)
         fprintf(stderr, "v4_autopin history=%s selections=%llu\n", path,
                 (unsigned long long)total);
     free(path);
-    return total;
+    return (uint64_t)total;
 }
 
 static void hot_usage_save(const V4HotPolicy *policy,
@@ -5827,46 +5874,12 @@ static void hot_usage_save(const V4HotPolicy *policy,
     if (!policy || !state || !policy->history_path || !policy->usage) return;
     const char *enabled = getenv("COLI_V4_SAVE_USAGE");
     if (enabled && atoi(enabled) == 0) return;
-    size_t tmp_length = strlen(policy->history_path) + sizeof(".tmp");
-    char *tmp = malloc(tmp_length);
-    if (!tmp) return;
-    snprintf(tmp, tmp_length, "%s.tmp", policy->history_path);
-    FILE *stream = fopen(tmp, "wb");
-    if (!stream) { free(tmp); return; }
-
-    uint64_t total = 0, distinct = 0;
-    for (int layer = 0; layer < state->layers; layer++)
-        for (int expert = 0; expert < state->experts_per_layer; expert++) {
-            uint64_t count = policy->usage[
-                (size_t)layer * state->experts_per_layer + expert];
-            if (!count) continue;
-            total = UINT64_MAX - total < count ? UINT64_MAX : total + count;
-            distinct++;
-        }
-    if (distinct) {
-        fprintf(stream, "-1 %d %d\n", state->layers,
-                state->experts_per_layer);
-        fprintf(stream, "-2 1 %u\n", hot_engine_id());
-        for (int layer = 0; layer < state->layers; layer++)
-            for (int expert = 0; expert < state->experts_per_layer; expert++) {
-                uint64_t count = policy->usage[
-                    (size_t)layer * state->experts_per_layer + expert];
-                if (!count) continue;
-                unsigned stored = count > UINT_MAX ? UINT_MAX : (unsigned)count;
-                fprintf(stream, "%d %d %u\n", layer, expert, stored);
-            }
-    }
-    int failed = ferror(stream);
-    if (fclose(stream) != 0) failed = 1;
-    if (!failed && rename(tmp, policy->history_path) == 0)
-        fprintf(stderr,
-                "v4_autopin saved=%s selections=%llu distinct=%llu\n",
-                policy->history_path, (unsigned long long)total,
-                (unsigned long long)distinct);
-    else
+    /* rt_save persists the shared counters fed at each store lookup, with the
+     * standard [STATS] summary line and the COLI_USAGE_DECAY knob every other
+     * engine already honours. */
+    if (!rt_save(policy->history_path, 0))
         fprintf(stderr, "v4_autopin warning=cannot-save-history path=%s\n",
                 policy->history_path);
-    free(tmp);
 }
 
 
@@ -6100,6 +6113,14 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
     policy->usage[(size_t)key.layer * state->experts_per_layer + key.expert]++;
+    if (state->ehit) {
+        size_t expert_index =
+            (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->ehit[expert_index] = 1;
+        if (state->eheat && state->eheat[expert_index] < 63)
+            state->eheat[expert_index]++;
+    }
+    rt_count(key.layer, &key.expert, 1);   /* selection history, shared format (#700) */
     uint64_t layer_requests = ++policy->layer_requests[key.layer];
     if (policy->repin_interval &&
         layer_requests % policy->repin_interval == 0)
@@ -6154,8 +6175,15 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     state->active_leases++;
     slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
+    struct timespec disk_t0;
+    clock_gettime(CLOCK_MONOTONIC, &disk_t0);
     int read_result = v4_read_expert_record(state, record, slot);
+    struct timespec disk_t1;
+    clock_gettime(CLOCK_MONOTONIC, &disk_t1);
     pthread_mutex_lock(&state->mutex);
+    state->disk_sec +=
+        (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+        (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
     if (read_result) {
         slot->references = 0; slot->expert = -1;
         if (state->active_leases) state->active_leases--;
@@ -6310,6 +6338,11 @@ int COLI_V4_ROWS16_STORE_OPEN(
         ? options->repin_interval : (uint64_t)minimum_slots;
     if (!policy->repin_interval) policy->repin_interval = 1;
     const char *autopin = getenv("COLI_V4_AUTOPIN");
+    rt_init("deepseek_v4", state->layers, state->experts_per_layer);
+    if (rt_tracing())
+        fprintf(stderr, "[ROUTE_TRACE] note: deepseek_v4 keeps the expert "
+                "history here, but per-row routing traces are not wired in "
+                "this engine — the stream will hold no rows\n");
     if (!autopin || atoi(autopin) != 0) {
         policy->history_total = hot_usage_load(policy, state,
                                                 options->model_dir);
@@ -6332,6 +6365,132 @@ int COLI_V4_ROWS16_STORE_OPEN(
         hot_prewarm_history(policy, state))
         fprintf(stderr, "v4_autopin warning=partial-warmup; continuing\n");
     return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Dashboard telemetry (TIERS/EMAP/HITS) — emitted to stdout in the same
+ * wire format openai_server.py parses for the GLM engine (telemetry.h):
+ *
+ *   TIERS vram ram disk vram_gb ram_gb
+ *   EMAP  rows cols hex        (per expert: 2 hex digits, tier<<6 | heat)
+ *   HITS  rows cols hex        (per-turn routed-expert bitmap, then cleared)
+ *
+ * The serve unit (COLI_V4_UNIT_GENERATE_STATS) calls these at turn
+ * boundaries; the per-expert state lives here, so the store emits them.
+ * V4 is CPU-only, so the VRAM tier is always 0 and "ram" means "resident in
+ * the expert-store cache slots". Heat is the cumulative routing-selection
+ * count (capped at 63, matching the GLM map's low-6-bit field).
+ * ---------------------------------------------------------------------- */
+
+void coli_v4_expert_store_emit_tiers(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int resident = 0;
+    pthread_mutex_lock(&state->mutex);
+    for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+        if (state->slots[i].slab && state->slots[i].expert >= 0) resident++;
+    pthread_mutex_unlock(&state->mutex);
+    int total = state->layers * state->experts_per_layer;
+    int ram = resident, disk = total - ram;
+    if (ram < 0) ram = 0;
+    if (disk < 0) disk = 0;
+    printf("TIERS 0 %d %d 0.00 %.2f\n", ram, disk,
+           (double)resident * state->record_bytes / 1e9);
+    fflush(stdout);
+}
+
+void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int rows = state->layers, cols = state->experts_per_layer;
+    size_t cells = (size_t)rows * cols;
+    char *hex = malloc(cells * 2 + 1);
+    if (!hex) return;
+    pthread_mutex_lock(&state->mutex);
+    for (size_t i = 0; i < cells; i++) {
+        int tier = 0;
+        int layer = (int)(i / (size_t)cols), expert = (int)(i % (size_t)cols);
+        V4ExpertSlot *slots = state->slots +
+            (size_t)layer * state->slots_per_layer;
+        for (int z = 0; z < state->slots_per_layer; z++)
+            if (slots[z].slab && slots[z].expert == expert) { tier = 1; break; }
+        int heat = state->eheat ? state->eheat[i] : 0;
+        if (heat > 63) heat = 63;
+        int b = (tier << 6) | heat;
+        hex[i * 2] = "0123456789abcdef"[b >> 4];
+        hex[i * 2 + 1] = "0123456789abcdef"[b & 15];
+    }
+    pthread_mutex_unlock(&state->mutex);
+    hex[cells * 2] = 0;
+    printf("EMAP %d %d %s\n", rows, cols, hex);
+    fflush(stdout);
+    free(hex);
+}
+
+void coli_v4_expert_store_emit_hits(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return;
+    state = store->state;
+    int rows = state->layers, cols = state->experts_per_layer;
+    size_t cells = (size_t)rows * cols;
+    size_t nbytes = (cells + 7) / 8;
+    char *hex = malloc(nbytes * 2 + 1);
+    if (!hex) return;
+    uint8_t *bitmap = calloc(nbytes, 1);
+    if (!bitmap) {
+        free(hex);
+        return;
+    }
+    pthread_mutex_lock(&state->mutex);
+    if (state->ehit) {
+        for (size_t i = 0; i < cells; i++)
+            if (state->ehit[i]) bitmap[i >> 3] |= (uint8_t)(1u << (i & 7));
+        memset(state->ehit, 0, cells);
+    }
+    pthread_mutex_unlock(&state->mutex);
+    for (size_t b = 0; b < nbytes; b++) {
+        hex[b * 2] = "0123456789abcdef"[bitmap[b] >> 4];
+        hex[b * 2 + 1] = "0123456789abcdef"[bitmap[b] & 15];
+    }
+    hex[nbytes * 2] = 0;
+    printf("HITS %d %d %s\n", rows, cols, hex);
+    fflush(stdout);
+    free(bitmap);
+    free(hex);
+}
+
+double coli_v4_expert_store_disk_sec(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return 0.0;
+    state = store->state;
+    double value;
+    pthread_mutex_lock(&state->mutex);
+    value = state->disk_sec;
+    pthread_mutex_unlock(&state->mutex);
+    return value;
+}
+
+/* #890: the compute phase, accumulated by the MoE and read by the serve loop —
+ * the disk_sec twin. add is called from the block units around expert forward;
+ * the getter is read per-turn in v4_serve_one, same as disk_sec. */
+void coli_v4_expert_store_add_matmul(ColiExpertStore *store, double sec) {
+    if (!store || !store->state || sec <= 0.0) return;
+    V4ExpertStoreState *state = store->state;
+    pthread_mutex_lock(&state->mutex);
+    state->matmul_sec += sec;
+    pthread_mutex_unlock(&state->mutex);
+}
+double coli_v4_expert_store_matmul_sec(ColiExpertStore *store) {
+    V4ExpertStoreState *state;
+    if (!store || !store->state) return 0.0;
+    state = store->state;
+    double value;
+    pthread_mutex_lock(&state->mutex);
+    value = state->matmul_sec;
+    pthread_mutex_unlock(&state->mutex);
+    return value;
 }
 #endif /* COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16 */
 
@@ -7043,12 +7202,31 @@ static int final_hidden(float *output, const float *state,
         coli_tensor_load_f32(&norm, index, "norm.weight", error, error_size))
         return -1;
     int d = config->hidden_size, hc = config->hc_mult;
+    /* SEC (GHSA-9gjf): these global tensors are loaded by their declared numel
+     * with no shape reconciliation (unlike the per-layer tensors, which
+     * coli_v4_layer_validate checks against config). final_hidden then indexes
+     * hc_head_fn at [copy*hc*d + i], hc_head_base at [copy], hc_head_scale at
+     * [0], and norm over d — a truncated global tensor turns each into a heap
+     * OOB read whose stale bytes leak into the logits. Require enough elements
+     * before use; `hc` also bounds the pre[16] stack array below. Free-closed on
+     * mismatch (the old hc>16 early-return leaked all four tensors). */
+    if (hc < 1 || hc > 16 ||
+        function.count < (uint64_t)hc * hc * d ||
+        base.count < (uint64_t)hc ||
+        scale.count < 1 ||
+        norm.count < (uint64_t)d) {
+        coli_float_tensor_free(&norm);
+        coli_float_tensor_free(&scale);
+        coli_float_tensor_free(&base);
+        coli_float_tensor_free(&function);
+        if (error && error_size) snprintf(error, error_size, "global tensor shape mismatch");
+        return -1;
+    }
     int flattened = hc * d;
     float square = 0.0f;
     for (int i = 0; i < flattened; i++) square += state[i] * state[i];
     float inverse_rms = 1.0f / sqrtf(square / flattened + config->rms_norm_eps);
     float pre[16];
-    if (hc > 16) return -1;
     for (int copy = 0; copy < hc; copy++) {
         float mix = 0.0f;
         for (int i = 0; i < flattened; i++)
@@ -8633,6 +8811,67 @@ static double v4_serve_rss_gb(void) {
 #endif
 }
 
+/* Dashboard telemetry: the per-expert state lives in the expert-store unit
+ * (COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16), so the emitters are exported from
+ * there and called at turn boundaries from this unit. */
+extern void coli_v4_expert_store_emit_tiers(ColiExpertStore *store);
+extern void coli_v4_expert_store_emit_emap(ColiExpertStore *store);
+extern void coli_v4_expert_store_emit_hits(ColiExpertStore *store);
+extern double coli_v4_expert_store_disk_sec(ColiExpertStore *store);
+extern double coli_v4_expert_store_matmul_sec(ColiExpertStore *store);   /* #890 */
+
+static void v4_hwinfo_emit(void) {
+    char cpu[256] = "";
+    int cores = 0;
+    double ram_total = 0.0, ram_avail = 0.0;
+#ifdef _SC_NPROCESSORS_ONLN
+    cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    FILE *ci = fopen("/proc/cpuinfo", "r");
+    if (ci) {
+        char line[256];
+        while (fgets(line, sizeof(line), ci))
+            if (!strncmp(line, "model name", 10)) {
+                char *p = strchr(line, ':');
+                if (p) {
+                    p++;
+                    while (*p == ' ') p++;
+                    int n = (int)strlen(p);
+                    if (n > 0 && p[n - 1] == '\n') p[--n] = 0;
+                    snprintf(cpu, sizeof(cpu), "%s", p);
+                }
+                break;
+            }
+        fclose(ci);
+    }
+    FILE *mi = fopen("/proc/meminfo", "r");
+    if (mi) {
+        char line[256];
+        double mt = 0.0, ma = 0.0;
+        while (fgets(line, sizeof(line), mi)) {
+            if (sscanf(line, "MemTotal: %lf", &mt) == 1) ram_total = mt / 1e6;
+            if (sscanf(line, "MemAvailable: %lf", &ma) == 1) ram_avail = ma / 1e6;
+        }
+        fclose(mi);
+    }
+    printf("HWINFO %d %.1f %.1f 0 0.0 %s|v4-cpu\n", cores, ram_total,
+           ram_avail, cpu[0] ? cpu : "unknown");
+    fflush(stdout);
+}
+
+/* PROF wall_s prompt_tokens completion_tokens expert_disk_s expert_wait_s
+ * expert_matmul_s attention_s lm_head_s forwards — disk (I/O) and matmul
+ * (expert-forward compute) are the two phases the runtime tracks per turn
+ * (#890); the frontend folds the remainder — attention, head, framing — into
+ * "other". Before this the matmul field was hardcoded 0 and every turn read as
+ * 100% other whenever the model sat warm in page cache. */
+static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
+                         double expert_disk_s, double expert_matmul_s) {
+    printf("PROF %.3f %d %d %.3f 0.000 %.3f 0.000 0.000 0\n",
+           wall_s, prompt_tokens, completion, expert_disk_s, expert_matmul_s);
+    fflush(stdout);
+}
+
 static int v4_serve_read_request(V4ServeRequest *request,
                                  const char *active_id) {
     char line[512], command[16], id[64];
@@ -8780,6 +9019,10 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
     ColiExpertStoreStats before = {0}, after = {0};
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
         engine->experts->ops->stats(engine->experts, &before);
+    double disk_before =
+        engine->experts ? coli_v4_expert_store_disk_sec(engine->experts) : 0.0;
+    double matmul_before =
+        engine->experts ? coli_v4_expert_store_matmul_sec(engine->experts) : 0.0;
     V4ServeStream stream = {session, request->id, 0};
     ColiV4SessionGenerateStats stats = {0};
     char error[512] = {0};
@@ -8817,6 +9060,17 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
            hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
            session->prefix_reused);
     fflush(stdout);
+    double expert_disk_s = engine->experts
+        ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
+        : 0.0;
+    double expert_matmul_s = engine->experts
+        ? coli_v4_expert_store_matmul_sec(engine->experts) - matmul_before
+        : 0.0;
+    v4_prof_emit(elapsed, stats.prompt_tokens, completion,
+                 expert_disk_s, expert_matmul_s);
+    coli_v4_expert_store_emit_hits(engine->experts);
+    coli_v4_expert_store_emit_emap(engine->experts);
+    coli_v4_expert_store_emit_tiers(engine->experts);
 }
 
 static int v4_serve_main(void) {
@@ -8864,6 +9118,9 @@ static int v4_serve_main(void) {
     fputs("\x01\x01READY\x01\x01\n", stdout);
     printf("STAT 0 0.0 0.0 %.2f 0 0\n", v4_serve_rss_gb());
     fflush(stdout);
+    v4_hwinfo_emit();
+    coli_v4_expert_store_emit_tiers(engine->experts);
+    coli_v4_expert_store_emit_emap(engine->experts);
     for (;;) {
         V4ServeRequest request = {0};
         int result;
@@ -9547,6 +9804,12 @@ typedef struct {
     unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
+    double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
+    double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
+                        * dashboard needs alongside disk_sec so it stops folding
+                        * everything into "other". One shared instance per store. */
+    uint8_t *ehit;     /* layers*experts_per_layer: experts routed in the current turn */
+    uint8_t *eheat;    /* layers*experts_per_layer: cumulative routing selections, capped 63 */
 } V4ExpertStoreState;
 
 static int set_error(char *error, size_t size, const char *format, ...) {
@@ -9698,6 +9961,8 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
         }
         /* A short read must never expose a partially overwritten old slot. */
         slot->expert = -1;
+        struct timespec disk_t0;
+        clock_gettime(CLOCK_MONOTONIC, &disk_t0);
         if (coli_st_read_at_streaming(
                 state->index, record->shard, record->scale_offset,
                 (size_t)record->scale_bytes, slot->slab) != 0 ||
@@ -9705,9 +9970,21 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 state->index, record->shard, record->weight_offset,
                 (size_t)record->weight_bytes,
                 slot->slab + record->scale_bytes) != 0) {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
             return -1;
+        }
+        {
+            struct timespec disk_t1;
+            clock_gettime(CLOCK_MONOTONIC, &disk_t1);
+            state->disk_sec +=
+                (double)(disk_t1.tv_sec - disk_t0.tv_sec) +
+                (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
         }
         slot->expert = key.expert;
         state->stats.misses++;
@@ -9716,6 +9993,13 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
+    if (state->ehit) {
+        size_t expert_index =
+            (size_t)key.layer * state->experts_per_layer + key.expert;
+        state->ehit[expert_index] = 1;
+        if (state->eheat && state->eheat[expert_index] < 63)
+            state->eheat[expert_index]++;
+    }
     memset(view, 0, sizeof(*view));
     view->key = key;
     fill_tensor_view(&view->gate, record, slot, V4_W1);
@@ -9817,6 +10101,8 @@ static void destroy(ColiExpertStore *store) {
         coli_st_index_close(state->index);
         free(state->records);
         free(state->slots);
+        free(state->ehit);
+        free(state->eheat);
         free(state);
     }
     free(store);
@@ -9886,6 +10172,14 @@ int coli_deepseek_v4_expert_store_open(
     }
     for (int i = 0; i < state->layers * state->slots_per_layer; i++)
         state->slots[i].expert = -1;
+    size_t telemetry_cells =
+        (size_t)state->layers * state->experts_per_layer;
+    state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
+    state->eheat = calloc(telemetry_cells, sizeof(*state->eheat));
+    if (!state->ehit || !state->eheat) {
+        set_error(error, error_size, "out of memory creating expert telemetry");
+        goto fail;
+    }
     state->stats.capacity_bytes = (uint64_t)state->layers *
                                   state->slots_per_layer * state->record_bytes;
     store->ops = &operations;
@@ -9896,6 +10190,8 @@ int coli_deepseek_v4_expert_store_open(
 fail:
     if (state->slots) free(state->slots);
     free(state->records);
+    free(state->ehit);
+    free(state->eheat);
     coli_st_index_close(state->index);
     pthread_mutex_destroy(&state->mutex);
     free(state);
@@ -10316,6 +10612,21 @@ int coli_v4_config_parse(ColiDeepSeekV4Config *config, const char *json,
         json_free(root);
         free(arena);
         return set_error(error, error_size, "inconsistent DeepSeek-V4 config dimensions");
+    }
+    /* SEC (GHSA-7654): rope vs head/index-head cross relationship. The per-field
+     * checks above never compared qk_rope_head_dim against index_head_dim; when
+     * qk_rope_head_dim > index_head_dim the indexer/compressor computed the RoPE
+     * sub-vector pointer as `output + index_head_dim - qk_rope_head_dim` — a
+     * negative offset — and rotated/rounded bf16 to the left of the heap block.
+     * No weight tensor carries the rope dim, so a benign snapshot + a tampered
+     * config.json alone reaches this. */
+    if (config->head_dim < 1 || config->index_head_dim < 1 ||
+        config->qk_rope_head_dim < 2 || (config->qk_rope_head_dim % 2) != 0 ||
+        config->qk_rope_head_dim > config->head_dim ||
+        config->qk_rope_head_dim > config->index_head_dim) {
+        json_free(root);
+        free(arena);
+        return set_error(error, error_size, "inconsistent DeepSeek-V4 rope/index head dims");
     }
     json_free(root);
     free(arena);
