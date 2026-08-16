@@ -9,7 +9,9 @@ Carica `coli` come modulo (ha la guardia __main__) e verifica il contratto:
 import importlib.machinery
 import importlib.util
 import os
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -23,9 +25,14 @@ _spec = importlib.util.spec_from_loader("coli_cli", _loader)
 coli = importlib.util.module_from_spec(_spec)
 _loader.exec_module(coli)
 
+_MODEL_DIR = tempfile.TemporaryDirectory()
+_MODEL = Path(_MODEL_DIR.name)
+(_MODEL / "config.json").write_text(
+    json.dumps({"model_type": "glm_moe_dsa"}), encoding="utf-8")
+
 
 def args(**over):
-    base = dict(model="X", policy="quality", ram=0, ngen=0, topp=0, topk=0,
+    base = dict(model=str(_MODEL), policy="quality", ram=0, ngen=0, topp=0, topk=0,
                 temp=None, repin=0, ctx=0, auto_tier=False, gpu=None, vram=0)
     base.update(over)
     return types.SimpleNamespace(**base)

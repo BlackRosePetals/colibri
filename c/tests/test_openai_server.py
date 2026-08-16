@@ -733,14 +733,14 @@ class CapSentinelShimTest(unittest.TestCase):
                     [executable, want],
                     f"arch={model_type} exe={executable} kwargs={kwargs}")
 
-    def test_missing_or_unreadable_config_is_glm(self):
-        # historic default: anything that cannot be classified is glm
+    def test_synthetic_engine_without_config_uses_explicit_arch(self):
         self.assertEqual(self._spawn_argv("engine", "/nonexistent/model"),
                          ["engine", "0"])
         model = Path(self.tmp.name) / "model-broken"
         model.mkdir()
         (model / "config.json").write_text("{not json")
-        self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
+        with self.assertRaisesRegex(ValueError, "invalid config.json"):
+            self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
         self.assertEqual(cap_for_arch("glm", None), 0)
@@ -758,7 +758,8 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
-        self.assertEqual(model_arch("/nonexistent"), "glm")
+        with self.assertRaisesRegex(ValueError, "cannot read config.json"):
+            model_arch("/nonexistent")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}

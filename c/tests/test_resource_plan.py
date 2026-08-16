@@ -40,6 +40,7 @@ class ResourcePlanTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.model = Path(self.tmp.name)
         (self.model / "config.json").write_text(json.dumps({
+            "model_type": "glm_moe_dsa",
             "num_hidden_layers": 2,
             "n_routed_experts": 2,
             "kv_lora_rank": 4,
@@ -202,6 +203,36 @@ class ResourcePlanTest(unittest.TestCase):
         self.assertLessEqual(plan["tiers"]["vram"]["budget_bytes"], 8 * GB)
         self.assertIn("clamped", plan["warnings"][0])
         self.assertIn("0:test-gpu", format_plan(plan))
+
+    def test_glm_kv_slots_scale_the_planned_state_pool(self):
+        one = build_plan(self.model, context=32, kv_slots=1,
+                         available_memory=32 * GB, available_disk=1, gpus=[])
+        four = build_plan(self.model, context=32, kv_slots=4,
+                          available_memory=32 * GB, available_disk=1, gpus=[])
+        self.assertEqual(four["tiers"]["ram"]["sequence_state_bytes"],
+                         one["tiers"]["ram"]["sequence_state_bytes"])
+        delta = (four["tiers"]["ram"]["runtime_bytes"] -
+                 one["tiers"]["ram"]["runtime_bytes"])
+        per_slot = (one["tiers"]["ram"]["sequence_state_bytes"] +
+                    one["tiers"]["ram"]["fixed_state_bytes"])
+        self.assertEqual(delta, 3 * per_slot)
+
+    def test_glm_dsa_state_is_charged_only_when_every_indexer_weight_exists(self):
+        config = json.loads((self.model / "config.json").read_text())
+        config.update({"index_head_dim": 16,
+                       "indexer_types": ["full", "shared"]})
+        (self.model / "config.json").write_text(json.dumps(config))
+        absent = build_plan(self.model, context=32, available_memory=32 * GB,
+                            available_disk=1, gpus=[])
+        write_shard(self.model / "indexer.safetensors", [
+            ("model.layers.0.self_attn.indexer.wq_b.weight", 4),
+        ])
+        present = build_plan(self.model, context=32, available_memory=32 * GB,
+                             available_disk=1, gpus=[])
+        self.assertEqual(
+            present["tiers"]["ram"]["sequence_state_bytes"] -
+            absent["tiers"]["ram"]["sequence_state_bytes"],
+            1 * 32 * 16 * 4)
 
     def test_unified_memory_uses_one_shared_pool(self):
         gpus = [{"index": 0, "name": "NVIDIA GB10", "total_bytes": 130 * GB,
@@ -643,6 +674,7 @@ memInfo.free:                     23.50 GB (97%)
         big = tempfile.TemporaryDirectory()
         bigmodel = Path(big.name)
         (bigmodel / "config.json").write_text(json.dumps({
+            "model_type": "glm_moe_dsa",
             "num_hidden_layers": 2, "n_routed_experts": 4,
             "kv_lora_rank": 4, "qk_rope_head_dim": 2,
             "qk_nope_head_dim": 3, "v_head_dim": 5, "num_attention_heads": 2,

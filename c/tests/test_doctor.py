@@ -32,6 +32,7 @@ class DoctorTest(unittest.TestCase):
         self.model = self.root / "model"
         self.model.mkdir()
         (self.model / "config.json").write_text(json.dumps({
+            "model_type": "glm_moe_dsa",
             "num_hidden_layers": 2,
             "n_routed_experts": 2,
             "kv_lora_rank": 4,

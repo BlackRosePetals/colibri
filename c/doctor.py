@@ -8,6 +8,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from family_registry import (FamilyConfigError, PlannerUnsupportedError, UnknownFamilyError,
+                             public_metadata, resolve_model)
 from resource_plan import (GB, SSD_PROBE_PENDING, build_plan, discover_gpus, format_plan,
                            memory_available)
 
@@ -423,11 +425,13 @@ def missing_shared_libraries(engine_path):
 
 def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
                engine_path, available_memory=None, available_disk=None, gpus=None,
-               linkage=None, deep=False, mirror_dir=None):
+               linkage=None, deep=False, mirror_dir=None, kv_slots=1,
+               engine_error=None):
     """Collect a complete report. No model payload, engine, or CUDA context is loaded."""
     model = Path(model).expanduser().resolve()
     checks = []
     plan = None
+    resolved = None
 
     if model.is_dir() and os.access(model, os.R_OK):
         checks.append(_check("model.path", "pass", "model directory is readable", path=str(model)))
@@ -443,6 +447,18 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         valid_config = False
     checks.append(_check("model.config", "pass" if valid_config else "fail",
                          "config.json is valid" if valid_config else "config.json is missing or invalid"))
+    if valid_config:
+        try:
+            resolved = resolve_model(model)
+            checks.append(_check("model.family", "pass",
+                                 f"{resolved.descriptor.display_name} family is registered",
+                                 family_id=resolved.descriptor.id,
+                                 model_type=resolved.model_type,
+                                 descriptor=public_metadata(resolved.descriptor)))
+        except (FamilyConfigError, UnknownFamilyError) as error:
+            checks.append(_check("model.family", "fail", str(error)))
+    else:
+        checks.append(_check("model.family", "skip", "family detection requires a valid config"))
     tokenizer = model / "tokenizer.json"
     checks.append(_check("model.tokenizer", "pass" if tokenizer.is_file() else "fail",
                          "tokenizer.json found" if tokenizer.is_file() else "tokenizer.json is missing"))
@@ -463,7 +479,9 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         engine_ok = engine.is_file()
     else:
         engine_ok = engine.is_file() and os.access(engine, os.X_OK)
-    if engine_ok:
+    if engine_error:
+        checks.append(_check("engine.binary", "fail", str(engine_error), path=str(engine)))
+    elif engine_ok:
         unresolved = missing_shared_libraries(engine)
         if unresolved:
             checks.append(_check("engine.binary", "fail",
@@ -504,9 +522,11 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         checks.append(_check("accelerator.gpu", "skip", "no supported GPU detected; CPU path is available"))
 
     try:
+        if resolved is None:
+            raise ValueError("placement requires a registered model family")
         plan = build_plan(model, ram_gb, context, gpu_indices, vram_gb,
                           available_memory=available_memory, available_disk=available_disk,
-                          gpus=detected_gpus)
+                          gpus=detected_gpus, kv_slots=kv_slots)
         model_info = plan["model"]
         checks.append(_check("model.shards", "pass", "safetensors headers are valid",
                              shards=model_info["shards"], model_bytes=model_info["model_bytes"]))
@@ -547,6 +567,16 @@ def run_doctor(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0, *,
         else:
             checks.append(_check("storage.ssd_probe", "skip",
                                  "no cached probe yet; measured on the first Metal+darwin engine start"))
+    except PlannerUnsupportedError as error:
+        checks.append(_check("model.shards", "pass", "safetensors headers are readable",
+                             shards=len(list(model.glob("*.safetensors")))))
+        checks.append(_check("storage.disk", "skip",
+                             "storage projection requires a family planner"))
+        checks.append(_check("memory.ram", "skip",
+                             "RAM projection requires a family planner"))
+        checks.append(_check("placement.plan", "skip", str(error)))
+        checks.append(_check("storage.ssd_probe", "skip",
+                             "probe surfacing requires a family planner"))
     except (OSError, ValueError, KeyError, TypeError) as error:
         checks.append(_check("model.shards", "fail", str(error)))
         checks.append(_check("storage.disk", "skip", "storage check requires a valid model"))
