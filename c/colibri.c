@@ -1228,6 +1228,27 @@ static void softmax(float *x,int n){ float m=-1e30f; for(int i=0;i<n;i++) if(x[i
 static inline float sigmoidf(float x){ return 1.f/(1.f+expf(-x)); }
 static inline float siluf(float x){ return x/(1.f+expf(-x)); }
 
+/* FFN di un expert MoE (routed): gate+up -> silu(gate)*up -> down. Un solo helper per
+ * i ~6 siti inline di moe() e (piu' avanti) il worker distribuito, che la chiama con i
+ * propri buffer e i tensori dell'expert — nessun locale di moe(). xg arriva GIA' ruotata
+ * (Q^T x) dal chiamante via E8_XE (#452: una copia ruotata per chiamata, MAI per expert).
+ * La rotazione dell'input del down e' per-expert e vive qui: `d->fmt==6` la applica
+ * SEMPRE — e' la forma CANONICA, pura funzione del fmt del down-tensor. Perche' resta
+ * byte-identica al vecchio inline: (a) i fallback device-lost Vulkan ricaricano solo
+ * expert che erano in registry (vk_reg_at), e vk_registry_fill ammette solo fmt 2/4/5 —
+ * li' d->fmt!=6 e la rotazione e' un no-op; (b) l'oracolo e ogni modello single-format
+ * (l'output di una conversione normale) non hanno mai un expert fmt=6 accanto a fmt 2/4/5.
+ * Le DUE copie che saltavano la rotazione e potevano davvero vedere fmt=6 — la CPU-share
+ * del blocco Vulkan e il fallback CUDA — ora seguono il canonico: su un container
+ * mixed-format (fmt per-tensor da qt_resolve_fmt, nessuna uniformita' tra expert, vedi il
+ * commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
+static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, QT *u, QT *d, int nr, int I){
+    expert_gate_up(gg,uu,xg,g,u,nr);
+    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
+    if(d->fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
+    matmul_qt(hh, gg, d, nr);
+}
+
 /* RoPE interleaved su un vettore di dimensione qk_rope a posizione pos */
 static void rope_interleave(float *v, int pos, const Cfg *c){
     int half = c->qk_rope/2;
@@ -4804,9 +4825,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(!e->slab) expert_load(m,layer,e->eid,e,1,1);   /* demand=1: moe miss path (FASE A snapshot valid) */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)crmap[c2*S+r]*D, D*sizeof(float));
                     double te0=now_s();
-                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                    matmul_qt(hh, gg, &e->d, nr);
+                    expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)crmap[c2*S+r]*D, wgt=cwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                     if(g_prof){ m->t_ecpu+=now_s()-te0;
@@ -4825,9 +4844,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     ESlot *e=&m->ws[nmiss<63?nmiss:63];
                     if(e->eid!=veid[c2] || !e->slab) expert_load(m,layer,veid[c2],e,1,0);   /* device-lost recovery: DISK-CLASS leaves it unclassified */
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap[c2*S+r]*D, D*sizeof(float));
-                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                    matmul_qt(hh, gg, &e->d, nr);
+                    expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap[c2*S+r]*D, wgt=vwmap[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
@@ -4845,9 +4862,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     ESlot *e=&m->ws[nmiss<63?nmiss:63];
                     if(e->eid!=veid2[c2] || !e->slab) expert_load(m,layer,veid2[c2],e,1,0);
                     for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D, x+(int64_t)vrmap2[c2*S+r]*D, D*sizeof(float));
-                    expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                    for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                    matmul_qt(hh, gg, &e->d, nr);
+                    expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                     for(int r=0;r<nr;r++){ float *os=out+(int64_t)vrmap2[c2*S+r]*D, wgt=vwmap2[c2*S+r], *hr=hh+(int64_t)r*D;
                         for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
                 }
@@ -4903,10 +4918,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
-            expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-            for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-            if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
-            matmul_qt(hh, gg, &e->d, nr);
+            expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             double dt=now_s()-t0;m->t_emm+=dt;if(g_prof){m->t_ecpu+=dt;
@@ -4934,9 +4946,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                         ESlot *e=eg_e[gi];
                         for(int r=0;r<nr;r++) memcpy(xg+(int64_t)r*D,x+(int64_t)eg_row[gi][r]*D,D*sizeof(float));
                         expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        matmul_qt(hh,gg,&e->d,nr);
+                        expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                         for(int r=0;r<nr;r++){ float *os=out+(int64_t)eg_row[gi][r]*D; float wgt=eg_w[gi][r];
                             for(int d=0;d<D;d++) os[d]+=wgt*hh[(int64_t)r*D+d]; }
                     }
@@ -5047,10 +5057,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     double tc=g_prof?now_s():0;
                     if(!coli_cuda_expert_mlp(e->g.cuda,e->u.cuda,e->d.cuda,hh,xg,nr)){
                         expert_host_ensure(m,layer,e);
-                        expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
-                        for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
-                        if(e->d.fmt==6) e8_rot_rows(gg,nr,I);   /* down input, as on the main CPU path */
-                        matmul_qt(hh,gg,&e->d,nr);
+                        expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
                         if(g_prof){m->cpu_expert_bytes+=qt_bytes(&e->g)+qt_bytes(&e->u)+qt_bytes(&e->d);
                             m->cpu_expert_rows+=(uint64_t)nr;}
                     }
