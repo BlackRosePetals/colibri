@@ -20,6 +20,15 @@ SAFETENSORS_DTYPES = {
     "F32": 4,
     "U8": 1,
     "I8": 1,
+    # dtypes st.h's st_dtype_code accepts beyond the classic set (DeepSeek V4 /
+    # Kimi-style checkpoints); sizes mirror st_dtype_esz exactly.
+    "I64": 8,
+    "U64": 8,
+    "F8_E4M3": 1,
+    "F8_E4M3FN": 1,
+    "float8_e4m3fn": 1,
+    "F8_E8M0": 1,
+    "F8_E8M0FNU": 1,
 }
 REQUIRED_CORE_TENSORS = (
     "model.embed_tokens.weight",

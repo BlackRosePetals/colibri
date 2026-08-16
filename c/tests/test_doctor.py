@@ -8,7 +8,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from doctor import cuda_linkage, exit_code, format_doctor, run_doctor
+from doctor import (
+    _tensor_layout,
+    cuda_linkage,
+    exit_code,
+    format_doctor,
+    run_doctor,
+)
 from resource_plan import GB
 
 
@@ -310,6 +316,27 @@ class DoctorTest(unittest.TestCase):
         self.assertEqual(checks["model.required"]["status"], "pass")
         self.assertEqual(checks["model.index"]["status"], "skip")
         self.assertEqual(checks["storage.mirror"]["status"], "skip")
+
+    def test_tensor_layout_accepts_engine_supported_dtypes(self):
+        # I64 (Hash-MoE tid2eid) and F8 dtypes are read by the engine (st.h
+        # st_dtype_code) but were absent from the validator's table; --deep must
+        # accept them at the byte sizes st_dtype_esz reports (I64/U64 -> 8, F8 -> 1).
+        cases = {
+            "I64": (8, 4),
+            "U64": (8, 4),
+            "F8_E4M3": (1, 4),
+            "F8_E4M3FN": (1, 4),
+            "float8_e4m3fn": (1, 4),
+            "F8_E8M0": (1, 4),
+            "F8_E8M0FNU": (1, 4),
+        }
+        for dtype, (size, elements) in cases.items():
+            span = size * elements
+            meta = {"dtype": dtype, "shape": [elements], "data_offsets": [0, span]}
+            self.assertEqual(_tensor_layout(meta, span), (0, span))
+            bad = {"dtype": dtype, "shape": [elements], "data_offsets": [0, span - 1]}
+            with self.assertRaises(ValueError):
+                _tensor_layout(bad, span)
 
     def test_deep_check_rejects_overlapping_tensor_ranges(self):
         header = {
