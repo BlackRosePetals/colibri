@@ -6,7 +6,7 @@ Reference for the environment variables read by the colibrì engine.
 
 ## Which program reads these?
 
-**There are four engine binaries, and they do not share a knob set.** The main
+**There are five engine binaries, and they do not share a knob set.** The main
 engine `c/colibri` (built from `c/colibri.c`, formerly `glm.c`) reads most of
 what follows, but the sister engines read their own:
 
@@ -16,7 +16,7 @@ what follows, but the sister engines read their own:
 | `kimi_k3` | `c/kimi_k3.c` | the `K3_*` family — see [Kimi K3 engine](#kimi-k3-engine-kimi_k3) |
 | `inkling` | `c/inkling.c` | `INK_*`, plus `CTX_MAX`, `PIN_N`, `REP_PEN`, `GPU_DEV`, `NOGPU` — see [Inkling engine](#inkling-engine-inkling) |
 | `olmoe` | `c/olmoe.c` | `HOT`, `WIDE`, `SMOOTH`, `CONF_LIMIT`, `MAX_NEW`, `CHAT`, `EXPERT_DROP`, `WARMUP` — see [OLMoE engine](#olmoe-engine-olmoe) |
-| `deepseek_v4` | `c/deepseek_v4.c` | `CTX` — context window in tokens (default 4096), honored by both the CLI and `SERVE` mode; prefill segments/chunks and prefix checkpoints (`V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, …) are listed in [deepseek-v4.md](deepseek-v4.md#prefill-segments-chunks-checkpoints) |
+| `deepseek_v4` | `c/deepseek_v4.c` | `CTX`, the `V4_*` / `DSV4_*` families and the two `COLI_CUDA_*_BATCH` gates — see [DeepSeek V4 engine](#deepseek-v4-engine-deepseek_v4); note that the CUDA section below describes `colibri.c` knobs (`COLI_CUDA`, `CUDA_DENSE`, ...) which the V4 engine does not read — its GPU switch is `DSV4_CUDA` |
 
 Setting an `INK_*` variable while running `colibri` does nothing, and vice
 versa; nothing warns you about it. A few variables are genuinely shared because
@@ -349,6 +349,16 @@ Read **only** by `c/inkling.c`.
 | `INK_PREFIX_LOG` | unset | Log the KV-prefix reuse decision and its reason, as `K3_PREFIX_LOG` does for K3. |
 | `GPU_DEV` | `0` | CUDA device index for the inkling CUDA backend. |
 | `NOGPU` | unset | If set, skip GPU init entirely (both CUDA and Metal), regardless of the other GPU variables. |
+
+## DeepSeek V4 engine (`deepseek_v4`)
+
+The V4 engine has its own knob set (~70 variables: GPU tier, prefill segments/
+chunks, prefix checkpoints, expert I/O, speculative decoding, profilers). It is
+documented with defaults in
+[deepseek-v4.md — Environment reference](deepseek-v4.md#environment-reference-v4-engine);
+the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
+`COLI_CUDA_ATTN_BATCH=1`, `COLI_CUDA_MOE_BATCH=1`, `DSV4_CUDA_EXPERT_MIRRORS`,
+`V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
 
 ## OLMoE engine (`olmoe`)
 
