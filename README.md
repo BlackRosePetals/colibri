@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://justvugg.github.io/colibri"><b>Website</b></a> ·
-  <a href="https://discord.gg/fpQxKnRb"><b>Discord</b></a> ·
+  <a href="https://discord.gg/MAaKtQRc"><b>Discord</b></a> ·
   English · <a href="README.zh-CN.md">简体中文</a> · <a href="README.zh-TW.md">繁體中文</a> · <a href="README.it.md">Italiano</a>
 </p>
 
@@ -474,7 +474,9 @@ python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
 # also: coli run / coli serve / coli web
 ```
 
-Greedy decode, one KV slot; tools and grammar are not wired up yet.
+Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
+with V4's native prompt and DSML call blocks; grammar is not supported. See the
+[per-engine API matrix](docs/api.md#tool-calling-support).
 
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`
@@ -513,7 +515,7 @@ today its numbers come from a community of real machines. If it's useful to you:
 - ⭐ star the repo and share it;
 - 🐛 open issues with benchmark numbers from your hardware — datapoints move
   this project more than anything else;
-- 💬 join the [Discord community](https://discord.gg/fpQxKnRb) to discuss
+- 💬 join the [Discord community](https://discord.gg/MAaKtQRc) to discuss
   experiments, hardware results, and research directions;
 - 💬 reach out via GitHub issues to sponsor development or donate hardware.
 
