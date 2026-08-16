@@ -188,7 +188,14 @@ static void matmul_i4_grouped(float *y, const float *x, const uint8_t *q4, const
                     __m256 w1=_mm256_cvtepi32_ps(_mm256_sub_epi32(_mm256_cvtepu8_epi32(_mm_srli_si128(nib,8)),b8));
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i),   w0, acc);
                     acc=_mm256_fmadd_ps(_mm256_loadu_ps(xs+i+8), w1, acc); }
-                a+=hsum256(acc)*sc;
+                /* Pinned as an fma in the SOURCE. With the default
+                 * -ffp-contract=fast the compiler may fuse this multiply-add
+                 * (one rounding) or not (two), so the same source produced
+                 * different bits depending on the flag -- see the PR for a
+                 * reproduction. That made every bit-exactness gate, including
+                 * the glm_tiny token oracle, depend on build flags rather than
+                 * on the code. */
+                a=fmaf(hsum256(acc),sc,a);
 #endif
                 for(; i<base+glen; i+=2){
                     if(i+1<base+glen){ uint8_t byte=w[i>>1];
