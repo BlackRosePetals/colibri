@@ -1202,7 +1202,7 @@ def cmd_chat(a):
     sp=Spinner("waking the giant (744B)…"); sp.start()
     # Keep the pre-READY stdout preamble instead of discarding it: the engine's
     # "loaded in Xs | resident dense: Y MB" line is a printf, i.e. STDOUT
-    # (colibri.c:9209 — same in inkling.c/olmoe.c), so it arrives HERE and never
+    # (colibri.c:9595 — same in inkling.c/olmoe.c), so it arrives HERE and never
     # in errlog. The ready-line regex below used to scan stderr for it and could
     # never match. A few hundred bytes of banner; nothing else reads them.
     _preamble=bytearray()
