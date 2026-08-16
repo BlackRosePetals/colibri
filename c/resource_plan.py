@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 GB = 1_000_000_000
-EXPERT_RE = re.compile(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.")
+EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\.")
 
 
 def _tensor_sizes(path):
