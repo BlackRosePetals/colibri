@@ -121,6 +121,13 @@ sudo docker build -t colibri-i .
 
 Wait for it to finish (a few minutes). If everything goes well, you will see: `Successfully tagged colibri-i:latest`
 
+> **This builds the code on GitHub, not the code on your disk.** The Dockerfile
+> clones the repository inside the image — that is what makes this path work
+> with a single downloaded file and no checkout. If you are *developing* and
+> want your local changes in the image, use `Dockerfile.slim` instead (see
+> [Slim image](#slim-image-developers--production) below); it copies `c/` from the build
+> context.
+
 > **If you want to receive repository updates**: First delete the old image with `docker rmi colibri-i` and rebuild.
 
 ---
@@ -512,6 +519,24 @@ docker run --rm -it -v /nvme/glm52_i4:/model colibri chat --ram 24
 docker run --rm -p 5000:5000 -v /nvme/glm52_i4:/model colibri \
     serve --host 0.0.0.0 --model-id glm-5.2 --ram 24
 ```
+
+**Reaching it from another machine (or `coli web`).** Binding `--host 0.0.0.0`
+is not enough: the server has a DNS-rebinding guard that only trusts the Host
+header for loopback and its own bind address, so a browser pointed at
+`http://<server-ip>:<port>` gets `403 Host header not allowed`. Behind Docker's
+port mapping the container cannot know the address the browser will send, so
+tell it what to accept — the exact name/IP, or `*` when the bind is already
+deliberately public:
+
+```bash
+docker run --rm -p 36873:8000 -e COLI_ALLOW_INSECURE_BIND=1 \
+    -v /nvme/glm52_i4:/model colibri \
+    web --host 0.0.0.0 --allowed-host '*'
+```
+
+`--allowed-host '*'` disables the guard (it warns at startup); prefer an
+explicit `--allowed-host my-server.lan` when you know the name. This is a
+LAN-exposure decision, hence opt-in alongside `COLI_ALLOW_INSECURE_BIND=1`.
 
 The entrypoint is `coli`, so the first argument is the subcommand (`info`,
 `chat`, `serve`, `run`, `plan`, `doctor`) — no `./coli` prefix. The container

@@ -4,6 +4,7 @@
 // reference (cpu_ref_grouped) and harness (run_grouped) below -- unlike fmt 1-3 the
 // group scale is per-GROUP, not per-row, so it can't share cpu_ref's [O] scale layout.
 #include "../backend_metal.h"
+#include <Metal/Metal.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -96,9 +97,13 @@ static float ref_e4m3(uint8_t b) {
                        : (1.0f+(float)mant*(1.0f/8.0f))*powf(2.0f,(float)exp-7.0f);
   return sign ? -val : val;
 }
-// Local to this section's self-contained reference; deliberately NOT quant.h's
-// fp8_nblk (which this TU also pulls in further down, with a different return type).
-static int ref_fp8_nblk(int n){ return (n+127)/128; }
+/* Renamed from fp8_nblk: quant.h, included further down this same
+ * translation unit, now declares `static inline int64_t fp8_nblk`.
+ * Matching the return type alone still collides (inline vs non-inline),
+ * and this file keeps its own reference implementations on purpose --
+ * see the E4M3 note above -- so it takes the ref_ prefix the other
+ * independent helpers here already use. (#838) */
+static int64_t ref_fp8_nblk(int n){ return (n+127)/128; }
 
 static void cpu_ref_fp8(const uint8_t *q8, const float *bscale, const float *x,
                         double *y, double *mag, int S, int I, int O) {
@@ -252,9 +257,10 @@ static int run_fp8_gemm_gate(const char *name) {
 // up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
 // (q4, NULL/stale for an fmt=8 tensor whose weights live in q8) tagged as fmt=8.
 // This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
-// on its fmt allowlist ({1,2,4,6}) as its very FIRST statement, before any of
+// on its fmt allowlist ({1,2,4,5,6}) as its very FIRST statement, before any of
 // g/u/d/gs/us/ds is dereferenced or even resolve()'d -- so an fmt=8 submission is
-// refused before the bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
+// refused before the bad pointer would ever be read, no matter what garbage
+// MB_BUILD packed into it. This
 // test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
 // holds) to prove the fence BY TEST rather than leaving it an artifact of moe_submit's
 // fmt allowlist happening not to include 8 (yet) -- same discipline
@@ -275,66 +281,26 @@ static float deq4(const uint8_t* w,int i){ uint8_t b=w[i>>1]; int v=(i&1)?(b>>4)
 static size_t roundpg(size_t n){ size_t p=16384; return ((n+p-1)/p)*p; }
 
 // Validate coli_metal_moe_block against a CPU reference (gate/up/silu/down + weighted scatter-add).
-static int run_moe(const std::vector<int>& nrv, const char* name) {
-  const int D=6144, I=2048, fmt=2; int rbG=(D+1)/2, rbD=(I+1)/2, nb=(int)nrv.size();
+// qgs==0 -> fmt=2 (per-row scale). qgs>0 -> fmt=4 grouped int4: per-expert scale slab is
+// [O][ng] (ng=ceil(K/qgs)) for each of gate/up (K=D) and down (K=Iinter).
+static int run_moe(const std::vector<int>& nrv, int qgs, const char* name) {
+  const int D=6144, I=2048; int fmt = qgs>0 ? 4 : 2;
+  int rbG=(D+1)/2, rbD=(I+1)/2, nb=(int)nrv.size();
+  int ngG = qgs>0 ? (D+qgs-1)/qgs : 1, ngD = qgs>0 ? (I+qgs-1)/qgs : 1;  // scales/row for gate-up / down
   int R=0; std::vector<int> xoff(nb),nr(nrv); for(int e=0;e<nb;e++){ xoff[e]=R; R+=nrv[e]; }
-  srand(2024+nb);
+  srand(2024+nb+qgs);
+  // per-column scale accessor: grouped picks s[o*ng + k/qgs], per-row picks s[o].
+  auto scaG=[&](const float* s,int o,int k){ return qgs>0 ? s[(size_t)o*ngG + k/qgs] : s[o]; };
+  auto scaD=[&](const float* s,int o,int k){ return qgs>0 ? s[(size_t)o*ngD + k/qgs] : s[o]; };
   // per-expert page-aligned slab [Wg|Wu|Wd] and fslab [Sg|Su|Sd]; register both.
   std::vector<void*> slab(nb), fslab(nb);
   std::vector<const void*> g(nb),u(nb),d(nb); std::vector<const float*> gs(nb),us(nb),ds(nb);
-  size_t wlen=roundpg((size_t)I*rbG*2 + (size_t)D*rbD), flen=roundpg(((size_t)I*2+D)*sizeof(float));
+  size_t nsc=(size_t)I*ngG*2 + (size_t)D*ngD;   // gate + up + down scale counts
+  size_t wlen=roundpg((size_t)I*rbG*2 + (size_t)D*rbD), flen=roundpg(nsc*sizeof(float));
   for(int e=0;e<nb;e++){
     posix_memalign(&slab[e],16384,wlen); posix_memalign(&fslab[e],16384,flen);
     uint8_t* sp=(uint8_t*)slab[e]; for(size_t i=0;i<(size_t)I*rbG*2+(size_t)D*rbD;i++) sp[i]=(uint8_t)(rand()&0xFF);
-    float* fp=(float*)fslab[e]; for(size_t i=0;i<(size_t)I*2+D;i++) fp[i]=0.01f+(rand()%50)/50000.f;
-    g[e]=sp; u[e]=sp+(size_t)I*rbG; d[e]=sp+(size_t)I*rbG*2;
-    gs[e]=fp; us[e]=fp+I; ds[e]=fp+2*I;
-    coli_metal_register(slab[e],wlen); coli_metal_register(fslab[e],flen);
-  }
-  std::vector<float> xg((size_t)R*D); for(auto&v:xg) v=((rand()%2000)-1000)/1000.f;
-  std::vector<int> rows(R); std::vector<float> rw(R);
-  for(int gr=0;gr<R;gr++){ rows[gr]=0; rw[gr]=0.1f+(rand()%100)/100.f; }   // decode: all -> position 0
-  int S=1;
-  // CPU reference
-  std::vector<float> refout((size_t)S*D,0.f), gg(I),uu(I),hh(D);
-  for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++){ int gr=xoff[e]+r; const float* xr=&xg[(size_t)gr*D];
-    const uint8_t* wg=(const uint8_t*)g[e]; const uint8_t* wu=(const uint8_t*)u[e]; const uint8_t* wd=(const uint8_t*)d[e];
-    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++) a+=deq4(wg+(size_t)o*rbG,k)*xr[k]; gg[o]=a*gs[e][o]; }
-    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++) a+=deq4(wu+(size_t)o*rbG,k)*xr[k]; uu[o]=a*us[e][o]; }
-    for(int o=0;o<I;o++){ float v=gg[o]; gg[o]=(v/(1.f+expf(-v)))*uu[o]; }
-    for(int o=0;o<D;o++){ float a=0; for(int k=0;k<I;k++) a+=deq4(wd+(size_t)o*rbD,k)*gg[k]; hh[o]=a*ds[e][o]; }
-    float* os=&refout[(size_t)rows[gr]*D]; for(int o=0;o<D;o++) os[o]+=rw[gr]*hh[o];
-  }
-  std::vector<float> gout((size_t)S*D,0.f);
-  int ok = coli_metal_moe_block(nb,D,I,fmt,0,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
-                                xg.data(),xoff.data(),nr.data(),rows.data(),rw.data(),gout.data(),S);
-  double maxabs=0,ymax=0; for(size_t i=0;i<gout.size();i++){ maxabs=fmax(maxabs,fabs(gout[i]-refout[i])); ymax=fmax(ymax,fabs(refout[i])); }
-  double nerr=maxabs/(ymax+1e-9); int pass = ok && nerr<1e-4;
-  printf("  %-22s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
-  for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
-  return pass?0:1;
-}
-
-// ---- fmt=4 (grouped int4) moe_block: run_moe's harness with per-group scales -------
-// Same shapes/flow as run_moe, but the scale slab holds [O,ceil(K/gs)] floats per matrix
-// (gate/up: K=D groups along hidden; down: K=I) and the reference folds scl[i/gs] into
-// the MAC instead of a post-scale -- the same semantics as matmul_i4_grouped and the
-// mm_gemv fmt==4 branch this kernel path mirrors. gs=64 matches the i4-g64 snapshots
-// (GLM-5.2-i4) that hit this path in the engine.
-static int run_moe_g4(const std::vector<int>& nrv, const char* name) {
-  const int D=6144, I=2048, fmt=4, GSZ=64;
-  int rbG=(D+1)/2, rbD=(I+1)/2, ngG=(D+GSZ-1)/GSZ, ngD=(I+GSZ-1)/GSZ, nb=(int)nrv.size();
-  int R=0; std::vector<int> xoff(nb),nr(nrv); for(int e=0;e<nb;e++){ xoff[e]=R; R+=nrv[e]; }
-  srand(4096+nb);
-  std::vector<void*> slab(nb), fslab(nb);
-  std::vector<const void*> g(nb),u(nb),d(nb); std::vector<const float*> gs(nb),us(nb),ds(nb);
-  size_t wlen=roundpg((size_t)I*rbG*2 + (size_t)D*rbD);
-  size_t nsc=(size_t)I*ngG*2 + (size_t)D*ngD, flen=roundpg(nsc*sizeof(float));
-  for(int e=0;e<nb;e++){
-    posix_memalign(&slab[e],16384,wlen); posix_memalign(&fslab[e],16384,flen);
-    uint8_t* sp=(uint8_t*)slab[e]; for(size_t i=0;i<(size_t)I*rbG*2+(size_t)D*rbD;i++) sp[i]=(uint8_t)(rand()&0xFF);
-    float* fp=(float*)fslab[e];
-    for(size_t i=0;i<nsc;i++) fp[i]=(0.001f+(rand()%500)/50000.f)*((rand()&1)?1.f:-1.f);
+    float* fp=(float*)fslab[e]; for(size_t i=0;i<nsc;i++) fp[i]=0.01f+(rand()%50)/50000.f;
     g[e]=sp; u[e]=sp+(size_t)I*rbG; d[e]=sp+(size_t)I*rbG*2;
     gs[e]=fp; us[e]=fp+(size_t)I*ngG; ds[e]=fp+(size_t)I*ngG*2;
     coli_metal_register(slab[e],wlen); coli_metal_register(fslab[e],flen);
@@ -343,25 +309,22 @@ static int run_moe_g4(const std::vector<int>& nrv, const char* name) {
   std::vector<int> rows(R); std::vector<float> rw(R);
   for(int gr=0;gr<R;gr++){ rows[gr]=0; rw[gr]=0.1f+(rand()%100)/100.f; }   // decode: all -> position 0
   int S=1;
-  // CPU reference: per-group scale folded into the MAC, no post-scale
+  // CPU reference (grouped scale folded per-term; for fmt=2 that reduces to a*s[o])
   std::vector<float> refout((size_t)S*D,0.f), gg(I),uu(I),hh(D);
   for(int e=0;e<nb;e++) for(int r=0;r<nr[e];r++){ int gr=xoff[e]+r; const float* xr=&xg[(size_t)gr*D];
     const uint8_t* wg=(const uint8_t*)g[e]; const uint8_t* wu=(const uint8_t*)u[e]; const uint8_t* wd=(const uint8_t*)d[e];
-    for(int o=0;o<I;o++){ const float* scl=gs[e]+(size_t)o*ngG; float a=0;
-      for(int k=0;k<D;k++) a+=deq4(wg+(size_t)o*rbG,k)*xr[k]*scl[k/GSZ]; gg[o]=a; }
-    for(int o=0;o<I;o++){ const float* scl=us[e]+(size_t)o*ngG; float a=0;
-      for(int k=0;k<D;k++) a+=deq4(wu+(size_t)o*rbG,k)*xr[k]*scl[k/GSZ]; uu[o]=a; }
+    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++) a+=deq4(wg+(size_t)o*rbG,k)*xr[k]*scaG(gs[e],o,k); gg[o]=a; }
+    for(int o=0;o<I;o++){ float a=0; for(int k=0;k<D;k++) a+=deq4(wu+(size_t)o*rbG,k)*xr[k]*scaG(us[e],o,k); uu[o]=a; }
     for(int o=0;o<I;o++){ float v=gg[o]; gg[o]=(v/(1.f+expf(-v)))*uu[o]; }
-    for(int o=0;o<D;o++){ const float* scl=ds[e]+(size_t)o*ngD; float a=0;
-      for(int k=0;k<I;k++) a+=deq4(wd+(size_t)o*rbD,k)*gg[k]*scl[k/GSZ]; hh[o]=a; }
+    for(int o=0;o<D;o++){ float a=0; for(int k=0;k<I;k++) a+=deq4(wd+(size_t)o*rbD,k)*gg[k]*scaD(ds[e],o,k); hh[o]=a; }
     float* os=&refout[(size_t)rows[gr]*D]; for(int o=0;o<D;o++) os[o]+=rw[gr]*hh[o];
   }
   std::vector<float> gout((size_t)S*D,0.f);
-  int ok = coli_metal_moe_block(nb,D,I,fmt,GSZ,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
+  int ok = coli_metal_moe_block(nb,D,I,fmt,qgs,g.data(),u.data(),d.data(),gs.data(),us.data(),ds.data(),
                                 xg.data(),xoff.data(),nr.data(),rows.data(),rw.data(),gout.data(),S);
   double maxabs=0,ymax=0; for(size_t i=0;i<gout.size();i++){ maxabs=fmax(maxabs,fabs(gout[i]-refout[i])); ymax=fmax(ymax,fabs(refout[i])); }
   double nerr=maxabs/(ymax+1e-9); int pass = ok && nerr<1e-4;
-  printf("  %-22s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
+  printf("  %-30s R=%d nerr=%.2e  %s\n", name, R, nerr, pass?"ok":"*** MISMATCH");
   for(int e=0;e<nb;e++){ coli_metal_unregister(slab[e]); coli_metal_unregister(fslab[e]); free(slab[e]); free(fslab[e]); }
   return pass?0:1;
 }
@@ -455,14 +418,17 @@ static void t_gemv4g(float*y,const float*x,const uint8_t*w,const float*sc,int O,
   for(int o=0;o<O;o++){ const uint8_t*r=w+(size_t)o*rb; const float* scl=sc+(size_t)o*ng; float a=0;
     for(int i=0;i<I;i++){ uint8_t b=r[i>>1]; int v=(i&1)?(b>>4):(b&0xF); a+=(float)(v-8)*x[i]*scl[i/gs]; }
     y[o]=a; } }
-// kvb_g4=1 swaps kv_b to fmt=4 (grouped int4, gs=64 like the i4-g64 snapshots): proves
-// the a_qabs/a_ctx in-kernel dequant handles per-group scales, not just per-row.
-static int run_attn(int S, int pos_base, const char* name, int kvb_g4=0){
+// kvb_gs==0 -> kv_b as fmt=2 (per-row scale); kvb_gs>0 -> kv_b as fmt=4 grouped int4
+// (exercises a_deqrow's grouped-scale path in a_qabs/a_ctx, #587's kv_b addition).
+static int run_attn(int S, int pos_base, int kvb_gs, const char* name){
   const float eps=1e-5f, theta=10000.f, ascale=1.f/16.f;
-  const int KGS=64, ng=(TKVL+KGS-1)/KGS;
   srand(4242+S+pos_base);
-  TW qa=t_mkw(TQL,TH), qb=t_mkw(THH*TQH,TQL), kva=t_mkw(TKVL+TROPE,TH), o=t_mkw(TH,THH*TVH);
-  TW kvb = kvb_g4 ? t_mkw_g(THH*TROWSH,TKVL,KGS) : t_mkw(THH*TROWSH,TKVL);
+  int kvb_fmt = kvb_gs>0 ? 4 : 2, kvng = kvb_gs>0 ? (TKVL+kvb_gs-1)/kvb_gs : 1;
+  TW qa=t_mkw(TQL,TH), qb=t_mkw(THH*TQH,TQL), kva=t_mkw(TKVL+TROPE,TH);
+  TW kvb = kvb_gs>0 ? t_mkw_g(THH*TROWSH,TKVL,kvb_gs) : t_mkw(THH*TROWSH,TKVL);
+  TW o=t_mkw(TH,THH*TVH);
+  // per-column kv_b scale: grouped (fmt=4) picks scale[row*ng + i/gs], else per-row.
+  auto kvb_sc=[&](int row,int i)->float{ return kvb_gs>0 ? kvb.s[(size_t)row*kvng + i/kvb_gs] : kvb.s[row]; };
   std::vector<float> qaln(TQL), kvaln(TKVL);
   for(auto&v:qaln) v=0.5f+(rand()%1000)/1000.f; for(auto&v:kvaln) v=0.5f+(rand()%1000)/1000.f;
   int T=pos_base+S; size_t lcb=(((size_t)T*TKVL*4)+16383)&~(size_t)16383, rcb=(((size_t)T*TROPE*4)+16383)&~(size_t)16383;
@@ -491,9 +457,7 @@ static int run_attn(int S, int pos_base, const char* name, int kvb_g4=0){
       const float* qp=&Q[(size_t)s*THH*TQH+(size_t)h*TQH]; const float* qro=qp+TNOPE;
       std::vector<float> qabs(TKVL,0);
       for(int d=0;d<TNOPE;d++){ const uint8_t*r=kvb.w+(size_t)(rbase+d)*rb;
-        const float* scl=kvb.s+(kvb_g4?(size_t)(rbase+d)*ng:(size_t)(rbase+d));
-        for(int i=0;i<TKVL;i++){ uint8_t b=r[i>>1]; int v=(i&1)?(b>>4):(b&0xF);
-          qabs[i]+=qp[d]*(float)(v-8)*(kvb_g4?scl[i/KGS]:scl[0]); } }
+        for(int i=0;i<TKVL;i++){ uint8_t b=r[i>>1]; int v=(i&1)?(b>>4):(b&0xF); qabs[i]+=qp[d]*(float)(v-8)*kvb_sc(rbase+d,i); } }
       std::vector<float> a(pos+1);
       for(int t=0;t<=pos;t++){ const float*Lt=&Lr[(size_t)t*TKVL]; const float*Rt=&Rr[(size_t)t*TROPE];
         float v=0; for(int i=0;i<TKVL;i++) v+=qabs[i]*Lt[i]; for(int d=0;d<TROPE;d++) v+=qro[d]*Rt[d]; a[t]=v*ascale; }
@@ -501,15 +465,13 @@ static int run_attn(int S, int pos_base, const char* name, int kvb_g4=0){
       std::vector<float> cl(TKVL,0);
       for(int t=0;t<=pos;t++){ const float*Lt=&Lr[(size_t)t*TKVL]; for(int i=0;i<TKVL;i++) cl[i]+=a[t]*Lt[i]; }
       for(int j=0;j<TVH;j++){ const uint8_t*r=kvb.w+(size_t)(rbase+TNOPE+j)*rb;
-        const float* scl=kvb.s+(kvb_g4?(size_t)(rbase+TNOPE+j)*ng:(size_t)(rbase+TNOPE+j));
-        float v=0; for(int i=0;i<TKVL;i++){ uint8_t b=r[i>>1]; int vv=(i&1)?(b>>4):(b&0xF);
-          v+=cl[i]*(float)(vv-8)*(kvb_g4?scl[i/KGS]:scl[0]); }
+        float v=0; for(int i=0;i<TKVL;i++){ uint8_t b=r[i>>1]; int vv=(i&1)?(b>>4):(b&0xF); v+=cl[i]*(float)(vv-8)*kvb_sc(rbase+TNOPE+j,i); }
         ctx[(size_t)h*TVH+j]=v; } }
     t_gemv4(&ref[(size_t)s*TH],ctx.data(),o.w,o.s,TH,THH*TVH);
   }
   std::vector<float> got((size_t)S*TH);
   int ok=coli_metal_attn_decode(x.data(), qa.w,qa.s,2,0,qaln.data(), qb.w,qb.s,2,0,
-        kva.w,kva.s,2,0,kvaln.data(), kvb.w,kvb.s,kvb_g4?4:2,kvb_g4?KGS:0, o.w,o.s,2,0,
+        kva.w,kva.s,2,0,kvaln.data(), kvb.w,kvb.s,kvb_fmt,kvb_gs, o.w,o.s,2,0,
         Lc,Rc,S,pos_base,0,eps,theta,ascale,got.data());
   double ma=0,ym=0; for(size_t i=0;i<ref.size();i++){ ma=fmax(ma,fabs(got[i]-ref[i])); ym=fmax(ym,fabs(ref[i])); }
   // also verify the cache write-back (Lc/Rc for the new positions)
@@ -592,9 +554,10 @@ static int run_rtop8(int mode, int S, int E, float topp, int normk, float rscale
 // plumbing (qa_gs threaded through encode_attention) is wired correctly end-to-end
 // through the SAME fused command buffer real decode uses (attention_rows in colibri.c),
 // not just the standalone coli_metal_matmul entry point run_grouped() above exercises.
-// kv_b is deliberately left fmt=2: it never flows through bind_gemv (a_qabs/a_ctx
-// dequantize it with a per-row-only helper) -- a fmt=4 kv_b is out of scope for this
-// stage (see PR_BODY.md UNCERTAINTIES).
+// kv_b is deliberately left fmt=2 HERE: this test isolates the qa_gs plumbing through
+// bind_gemv specifically. kv_b never flows through bind_gemv at all (a_qabs/a_ctx
+// dequantize it inline via a_deqrow, which is itself fmt/gs-aware) -- its own grouped
+// (fmt=4) coverage lives in run_attn's kvb_gs>0 cases below, not here.
 //
 // Two blind spots closed here (review round 1 -- see PR_BODY.md sec 10):
 //  (a) pos_base must be >0 for any S=1 case. At pos_base=0, T=pos_base+S=1: softmax
@@ -689,6 +652,17 @@ static int run_attn_grouped(int S, int pos_base, int gs, const char* name){
 
 int main(void) {
   if (!coli_metal_init()) { printf("Metal unavailable (skipping)\n"); return 0; }
+  /* GitHub Actions Apple Silicon runners expose Metal through the Apple
+   * Paravirtual device, where Metal submissions never complete (hangs -- the
+   * #947 CI observation). The shader compile above (coli_metal_init) still
+   * runs, keeping this suite's compile coverage -- the class of bug #940
+   * shipped -- while GPU execution is honestly skipped here. (#947 review) */
+  id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+  if (dev && [[dev name] containsString:@"Apple Paravirtual device"]) {
+    printf("SKIPPED: paravirtual device (%s) -- compile-only\n",
+           [[dev name] UTF8String]);
+    return 0;
+  }
   printf("Metal backend kernel tests:\n");
   int fail=0;
   fail |= run(I8, 2048,6144,1, "int8 gate/up S=1");
@@ -731,10 +705,11 @@ int main(void) {
   fail |= run_fp8_gemm_gate("fp8 GEMM entry explicitly gated off (coli_metal_gemm refuses)");
   fail |= run_fp8_moe_gate("fp8 MB_BUILD/moe_submit entry gated off (shared-expert fmt=8 hazard)");
   printf("Metal batched moe_block tests:\n");
-  fail |= run_moe({1,1,1,1,1,1,1,1}, "moe decode nb=8");
-  fail |= run_moe({3,1,4,2,1,5},     "moe ragged nb=6");
-  fail |= run_moe_g4({1,1,1,1,1,1,1,1}, "moe i4-g64 decode nb=8");
-  fail |= run_moe_g4({3,1,4,2,1,5},     "moe i4-g64 ragged nb=6");
+  fail |= run_moe({1,1,1,1,1,1,1,1}, 0,   "moe decode nb=8");
+  fail |= run_moe({3,1,4,2,1,5},     0,   "moe ragged nb=6");
+  fail |= run_moe({1,1,1,1,1,1,1,1}, 128, "moe decode nb=8  fmt4-g128");
+  fail |= run_moe({3,1,4,2,1,5},     128, "moe ragged nb=6  fmt4-g128");
+  fail |= run_moe({3,1,4,2,1,5},     64,  "moe ragged nb=6  fmt4-g64");
   printf("Metal fmt=6 (E8/IQ3) moe_block tests:\n");
   fail |= run_moe_e8({1,1,1,1,1,1,1,1}, "e8 decode nb=8");
   fail |= run_moe_e8({3,1,4,2,1,5},     "e8 ragged nb=6");
@@ -777,14 +752,18 @@ int main(void) {
     coli_metal_unregister(W); coli_metal_unregister(Sc); free(W); free(Sc);
   }
   printf("Metal fused attention tests:\n");
-  fail |= run_attn(1, 0,   "attn S=1 pos=0");
-  fail |= run_attn(1, 37,  "attn S=1 pos=37");
-  fail |= run_attn(4, 12,  "attn S=4 pos=12 (MTP)");
-  fail |= run_attn(3, 0,   "attn S=3 pos=0");
-  printf("Metal fused attention tests (fmt=4 grouped kv_b, proves a_qabs/a_ctx gs dequant):\n");
-  fail |= run_attn(1, 0,   "attn kvb-g64 S=1 pos=0",  1);
-  fail |= run_attn(1, 37,  "attn kvb-g64 S=1 pos=37", 1);
-  fail |= run_attn(4, 12,  "attn kvb-g64 S=4 (MTP)",  1);
+  fail |= run_attn(1, 0,   0,   "attn S=1 pos=0");
+  fail |= run_attn(1, 37,  0,   "attn S=1 pos=37");
+  fail |= run_attn(4, 12,  0,   "attn S=4 pos=12 (MTP)");
+  fail |= run_attn(3, 0,   0,   "attn S=3 pos=0");
+  // fmt=4 grouped-int4 kv_b (g128/g64): exercises a_deqrow's grouped-scale path in
+  // a_qabs/a_ctx (#587's kv_b addition). S=3/S=4 batches carry rows with T>1 (non-
+  // degenerate softmax), so the qabs (NOPE-side) dequant is exercised too, not just
+  // the always-live a_ctx (VH-side) dequant that a T=1 row alone would cover.
+  fail |= run_attn(1, 0,   128, "attn S=1 pos=0   kvb-fmt4-g128");
+  fail |= run_attn(1, 37,  128, "attn S=1 pos=37  kvb-fmt4-g128");
+  fail |= run_attn(4, 12,  128, "attn S=4 pos=12  kvb-fmt4-g128 (MTP)");
+  fail |= run_attn(3, 0,   64,  "attn S=3 pos=0   kvb-fmt4-g64");
   printf("Metal fused attention tests (fmt=4 grouped q_a, proves bind_gemv gs plumbing):\n");
   // pos_base=37 (not 0): at T=1 softmax is identically 1.0 regardless of q_a's output,
   // so an S=1 pos=0 case cannot catch ANY q_a defect (review round 1, auditor -- see

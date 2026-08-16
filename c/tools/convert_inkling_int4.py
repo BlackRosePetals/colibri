@@ -83,6 +83,17 @@ def interleave(t: torch.Tensor, dim: int) -> torch.Tensor:
 
 SKIP_PREFIXES = ("model.audio.", "model.visual.", "model.mtp.")
 
+# --keep-audio: the audio tower is one embedding table + one norm (~10 MB bf16
+# on Inkling-Small) and inkling.c consumes it under its original model.audio.*
+# names, so keeping it costs nothing. Vision and MTP stay skipped.
+KEEP_AUDIO = False
+
+
+def skip_name(name):
+    if KEEP_AUDIO and name.startswith("model.audio."):
+        return False
+    return name.startswith(SKIP_PREFIXES)
+
 RENAMES = [
     (r"^model\.llm\.embed\.weight$",      "model.embed_tokens.weight"),
     (r"^model\.llm\.embed_norm\.weight$", "model.embed_norm.weight"),
@@ -120,8 +131,9 @@ F32_RE = re.compile(
 
 def map_name(name):
     """Simple renames only (fused w13 tensors are handled by the shard loop).
-    Returns the mapped name, or None to skip."""
-    if name.startswith(SKIP_PREFIXES):
+    Returns the mapped name, or None to skip. model.audio.* (when kept) maps
+    to itself — the engine loads those names directly."""
+    if skip_name(name):
         return None
     for pat, rep in RENAMES:
         name = re.sub(pat, rep, name)
@@ -168,7 +180,7 @@ def quantize_expert_tensor(f, name, xbits, out, out_name):
 def convert_shard(path, out, xbits):
     with safe_open(path, framework="pt") as f:
         for name in f.keys():
-            if name.startswith(SKIP_PREFIXES):
+            if skip_name(name):
                 continue
             base = map_name(name)
             if name.endswith(".mlp.experts.w13_weight"):
@@ -209,6 +221,29 @@ def convert_shard(path, out, xbits):
 
 AUX_FILES = ["config.json", "tokenizer.json", "tokenizer_config.json",
              "special_tokens_map.json", "chat_template.jinja"]
+
+
+def acquire_output_lock(outdir):
+    lock = open(os.path.join(outdir, ".convert.lock"), "w")
+    try:
+        import fcntl
+    except ImportError:
+        try:
+            import msvcrt
+        except ImportError:
+            return lock
+        try:
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            lock.close()
+            sys.exit("ERROR: another converter is already using this output directory.")
+    else:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            sys.exit("ERROR: another converter is already using this output directory.")
+    return lock
 
 
 def shard_out_name(src):
@@ -391,9 +426,14 @@ def main():
     ap.add_argument("--watch", action="store_true",
                     help="poll --indir while the download is still running")
     ap.add_argument("--delete-src", action="store_true")
+    ap.add_argument("--keep-audio", action="store_true",
+                    help="keep model.audio.* (DMel embedding table + norm, ~10 MB) "
+                         "so the engine can take audio input")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-e2e", nargs=2, metavar=("HFDIR", "OUTBASE"))
     a = ap.parse_args()
+    global KEEP_AUDIO
+    KEEP_AUDIO = a.keep_audio
     if a.selftest:
         selftest(); return
     if a.selftest_e2e:
@@ -401,12 +441,7 @@ def main():
     if not a.indir or not a.outdir:
         ap.error("--indir and --outdir required")
     os.makedirs(a.outdir, exist_ok=True)
-    lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
-    import fcntl
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        sys.exit("ERROR: another converter is already using this output directory.")
+    lock = acquire_output_lock(a.outdir)
     convert_dir(a.indir, a.outdir, a.xbits, watch=a.watch, delete_src=a.delete_src)
 
 

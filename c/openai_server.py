@@ -19,6 +19,8 @@ import sys
 import threading
 import time
 import uuid
+
+import v4_dsml                      # vendored DeepSeek V4 DSML reference primitives
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -374,7 +376,106 @@ def parse_tool_calls(reply, tools=None):
     return text.strip(), calls
 
 
-ARCH = "glm"   # set in main(): "glm" | "inkling" | "kimi" (auto-detected)
+# ---- DeepSeek V4 tool calling (DSML) -------------------------------------------------------
+# V4 expresses tool calls as DSML blocks (see encoding/encoding_dsv4.py):
+#   <｜DSML｜tool_calls>\n<｜DSML｜invoke name="fn">\n
+#   <｜DSML｜parameter name="k" string="true">v</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>
+# preceded by "\n\n". There is no standalone "tool" role: results are <tool_result>{content}
+# </tool_result> blocks merged into the following user turn. DSML = U+FF5C (｜) + ASCII.
+DSV4_DSML = v4_dsml.dsml_token
+DSV4_EOS = v4_dsml.eos_token
+
+# OpenAI-style reasoning_effort levels -> the V4 vocabulary (encoding_dsv4.py has only
+# low/high/max; `low` adds nothing). In thinking mode the level's prompt is prepended at the
+# very start of the conversation, byte-matching REASONING_EFFORT_PROMPTS.
+DSV4_REASONING_EFFORT = {"minimal": "low", "low": "low", "medium": "high",
+                         "high": "high", "xhigh": "max", "max": "max"}
+DSV4_REASONING_EFFORT_PROMPTS = {
+    "high": ("Reasoning Effort: High.\n"
+             "Reason thoroughly, decompose the problem, and verify the relevant edge cases before acting. "
+             "Avoid repeating settled points or narrating redundant alternatives. "
+             "Keep the analysis proportional to the task. HARD LIMIT: finish reasoning within about "
+             "1,500 tokens, close the thinking section, and then emit the next tool call or a complete "
+             "final response. Never consume the whole output budget with reasoning.\n\n"),
+    "max": ("Reasoning Effort: Maximum.\n"
+            "Analyze the problem with maximum depth, trace root causes, and independently verify the "
+            "solution from multiple relevant angles. Do not repeat settled reasoning or pursue "
+            "irrelevant branches. Reserve sufficient tokens for the required tool call or final "
+            "response, and always terminate reasoning before the token budget is exhausted.\n\n"),
+}
+
+
+def _dsv4_tools_block(tools):
+    """V4 tool-declaration block, rendered by the vendored reference template."""
+    schemas = []
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        # Gateway-side scrub: OpenAI clients attach routing hints the model
+        # schema must not carry.
+        schemas.append({k: v for k, v in fn.items() if k not in ("defer_loading", "strict")})
+    return v4_dsml.render_tools(schemas)
+
+
+def _dsv4_tool_calls(tool_calls):
+    """Render OpenAI-format tool_calls into a V4 DSML block (incl. the leading 
+
+)."""
+    return v4_dsml.render_tool_calls(tool_calls)
+
+
+def parse_dsv4_tool_calls(reply):
+    """Parse DeepSeek V4 DSML tool calls out of one assistant reply.
+
+    The block itself is decoded by the vendored reference parser (strict, so a
+    malformed block degrades to no calls instead of half-parsed arguments).
+    Gateway hardening on top: an incomplete block (e.g. length-truncated
+    output) is cut from the visible content so raw DSML syntax never leaks,
+    and any thinking/eos markers around the block are scrubbed.
+    """
+    content, calls = v4_dsml.parse_completion_text(reply)
+    if not calls:
+        cut = len(content)
+        for marker in ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke"):
+            pos = content.find(marker)
+            if 0 <= pos < cut:
+                cut = pos
+        if cut < len(content):
+            content = content[:cut]
+    for marker in (DSV4_EOS, THINK_OPEN, THINK_CLOSE):
+        content = content.replace(marker, "")
+    return content.strip(), calls
+
+
+def parse_arch_tool_calls(reply, tools):
+    """Architecture-appropriate tool-call parser. Returns (content, tool_calls)."""
+    if ARCH == "deepseek_v4":
+        return parse_dsv4_tool_calls(reply)
+    return parse_tool_calls(reply, tools)
+
+
+def _tool_stream_markers():
+    """Marker(s) that open a model tool-call block, in match order (arch-specific)."""
+    if ARCH == "deepseek_v4":
+        return ("<" + DSV4_DSML + "tool_calls", "<" + DSV4_DSML + "invoke")
+    return (BOX_START,)
+
+
+def _tool_cut(buf):
+    """Earliest position of a tool-call marker in buf, or -1."""
+    found = -1
+    for marker in _tool_stream_markers():
+        pos = buf.find(marker)
+        if pos >= 0 and (found < 0 or pos < found):
+            found = pos
+    return found
+
+
+def _tool_hold():
+    """Bytes to hold back while scanning for a tool-call marker split across chunks."""
+    return max(len(m) for m in _tool_stream_markers()) - 1
+
+
+ARCH = "glm"   # set in main(): glm | inkling | kimi | deepseek_v4
 
 INK_THINK, INK_TEXT = "<|content_thinking|>", "<|content_text|>"
 
@@ -385,9 +486,10 @@ class InklingStreamSplit:
     answer). Buffers partial markers across chunk boundaries so a marker split
     between two DATA frames never leaks."""
 
-    def __init__(self, on_content, on_reasoning=None):
+    def __init__(self, on_content, on_reasoning=None, on_reasoning_end=None):
         self.on_content = on_content
         self.on_reasoning = on_reasoning
+        self.on_reasoning_end = on_reasoning_end
         self.mode = "content"
         self.buf = ""
 
@@ -404,6 +506,8 @@ class InklingStreamSplit:
                 return
             i, m = min(hits)
             self._emit(self.buf[:i])
+            if m == INK_TEXT and self.mode == "reasoning" and self.on_reasoning_end:
+                self.on_reasoning_end()
             self.mode = "reasoning" if m == INK_THINK else "content"
             self.buf = self.buf[i + len(m):]
 
@@ -457,6 +561,170 @@ def split_inkling(text):
     return _INK_MARKER.sub("", text), _INK_MARKER.sub("", "".join(reasoning))
 
 
+# ---- Inkling DMel audio input ------------------------------------------------------------
+# Inkling takes audio as discretized log-mel frames ("DMel"): 80 slaney mel
+# bands per 50 ms hop, quantized to 16 levels in log10 [-7, 2]. One frame = one
+# <|audio|> placeholder token; the engine swaps in the frame's embedding at that
+# position. The DSP below matches tml-renderers 0.1.0 (via tinkernel-audio,
+# which is byte-golden against the official wheel): 100 ms periodic-Hann window
+# centered on i*hop with zero edge padding, magnitude-domain mel projection,
+# and a turn-level RMS boost for quiet audio (rms < 0.01).
+
+AUDIO_SAMPLE_RATE = 16_000
+AUDIO_HOP = 800
+AUDIO_WINDOW = 1_600
+AUDIO_MEL_BANDS = 80
+AUDIO_DMEL_LEVELS = 16
+AUDIO_DMEL_MIN, AUDIO_DMEL_MAX = -7.0, 2.0
+AUDIO_RMS_FLOOR = 0.01
+AUDIO_LOG_FLOOR = 1.0e-10
+
+_MEL_FILTERS = None
+
+
+def _np():
+    try:
+        import numpy
+    except ImportError:
+        raise APIError(400, "Audio input needs numpy on the gateway (pip install numpy).",
+                       None, "unsupported_content_type")
+    return numpy
+
+
+def _mel_filters(np):
+    """Slaney mel filter bank, [80, 801], normalization 2/(upper-lower)."""
+    global _MEL_FILTERS
+    if _MEL_FILTERS is not None:
+        return _MEL_FILTERS
+    fft_freqs = np.arange(AUDIO_WINDOW // 2 + 1, dtype=np.float64) * AUDIO_SAMPLE_RATE / AUDIO_WINDOW
+
+    def hz_to_mel(hz):
+        hz = np.asarray(hz, dtype=np.float64)
+        return np.where(hz >= 1000.0, 15.0 + np.log(np.maximum(hz, 1e-30) / 1000.0) / 0.06875177742094912,
+                        hz / 66.66666666666667)
+
+    def mel_to_hz(mel):
+        mel = np.asarray(mel, dtype=np.float64)
+        return np.where(mel >= 15.0, 1000.0 * np.exp(0.06875177742094912 * (mel - 15.0)),
+                        66.66666666666667 * mel)
+
+    max_mel = hz_to_mel(AUDIO_SAMPLE_RATE / 2.0)
+    mel_points = mel_to_hz(np.linspace(0.0, float(max_mel), AUDIO_MEL_BANDS + 2))
+    lower, center, upper = mel_points[:-2], mel_points[1:-1], mel_points[2:]
+    rising = (fft_freqs[None, :] - lower[:, None]) / (center - lower)[:, None]
+    falling = (upper[:, None] - fft_freqs[None, :]) / (upper - center)[:, None]
+    weights = np.maximum(np.minimum(rising, falling), 0.0) * (2.0 / (upper - lower))[:, None]
+    _MEL_FILTERS = weights.astype(np.float32)
+    return _MEL_FILTERS
+
+
+def dmel_encode(samples):
+    """Mono 16 kHz f32 PCM -> u8 DMel bytes, [ceil(n/800), 80] row-major."""
+    np = _np()
+    samples = np.asarray(samples, dtype=np.float32)
+    n = samples.shape[0]
+    if n == 0:
+        raise APIError(400, "Audio clip is empty.", None, "invalid_value")
+    frames = -(-n // AUDIO_HOP)
+    half = AUDIO_WINDOW // 2
+    padded = np.zeros(half + frames * AUDIO_HOP + half, dtype=np.float32)
+    padded[half:half + n] = samples
+    idx = (np.arange(frames)[:, None] * AUDIO_HOP) + np.arange(AUDIO_WINDOW)[None, :]
+    hann = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(AUDIO_WINDOW, dtype=np.float64)
+                               / AUDIO_WINDOW)).astype(np.float32)
+    windows = padded[idx] * hann[None, :]
+    sqmag = np.abs(np.fft.rfft(windows, axis=1)) ** 2                   # [frames, 801]
+    rms = math.sqrt(float(np.sum(samples.astype(np.float64) ** 2)) / n)
+    scale = AUDIO_RMS_FLOOR / rms if 0.0 < rms < AUDIO_RMS_FLOOR else 1.0
+    mag = np.sqrt(np.maximum(sqmag * (scale * scale), AUDIO_LOG_FLOOR)).astype(np.float32)
+    energy = mag @ _mel_filters(np).T                                   # [frames, 80]
+    logmel = np.log10(np.maximum(energy, AUDIO_LOG_FLOOR))
+    norm = np.clip((np.clip(logmel, AUDIO_DMEL_MIN, AUDIO_DMEL_MAX) - AUDIO_DMEL_MIN)
+                   / (AUDIO_DMEL_MAX - AUDIO_DMEL_MIN), 0.0, 1.0)
+    q = np.clip(np.ceil(norm * (AUDIO_DMEL_LEVELS - 1) - 0.5), 0, AUDIO_DMEL_LEVELS - 1)
+    return q.astype(np.uint8).tobytes()
+
+
+def decode_wav_mono16k(data, param):
+    """Minimal RIFF/WAVE reader: PCM16 or float32, any channel count (mixed
+    down), sample rate must already be 16 kHz — resampling belongs at the
+    capture edge, not in the gateway."""
+    import struct as _struct
+    np = _np()
+    if len(data) < 44 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise APIError(400, "Audio must be a RIFF/WAVE file.", param, "invalid_value")
+    pos, fmt, raw = 12, None, None
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fmt ":
+            fmt = _struct.unpack_from("<HHIIHH", body, 0)
+        elif cid == b"data":
+            raw = body
+        pos += 8 + size + (size & 1)
+    if fmt is None or raw is None:
+        raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
+    audio_format, channels, rate, _, _, bits = fmt
+    if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
+        audio_format = 3 if bits == 32 else 1
+    if rate != AUDIO_SAMPLE_RATE:
+        raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
+                            "Resample at the capture edge.", param, "invalid_value")
+    if audio_format == 1 and bits == 16:
+        samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
+    elif audio_format == 3 and bits == 32:
+        samples = np.frombuffer(raw, dtype="<f4").astype(np.float32)
+    else:
+        raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
+                            "use PCM16 or float32.", param, "invalid_value")
+    if channels > 1:
+        samples = samples[:len(samples) - len(samples) % channels]
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples
+
+
+def inkling_content_segments(content, param, audio_out):
+    """Split OpenAI message content into ordered TMLv0 segments:
+    ("text", str) for merged text runs, ("audio", n_frames) per input_audio
+    part (its DMel bytes appended to audio_out in prompt order)."""
+    if isinstance(content, str):
+        return [("text", content)]
+    if not isinstance(content, list):
+        raise APIError(400, "Message content must be a string or an array of parts.", param)
+    segments = []
+    for index, part in enumerate(content):
+        ptype = part.get("type") if isinstance(part, dict) else None
+        if ptype in ("text", "input_text"):
+            if not isinstance(part.get("text"), str):
+                raise APIError(400, "Text content parts require a string `text` field.",
+                               f"{param}.{index}.text")
+            if segments and segments[-1][0] == "text":
+                segments[-1] = ("text", segments[-1][1] + part["text"])
+            else:
+                segments.append(("text", part["text"]))
+        elif ptype == "input_audio":
+            spec = part.get("input_audio")
+            if not isinstance(spec, dict) or not isinstance(spec.get("data"), str):
+                raise APIError(400, "`input_audio` parts need base64 `data`.",
+                               f"{param}.{index}.input_audio")
+            if spec.get("format", "wav") != "wav":
+                raise APIError(400, "Only WAV audio is supported (mono, 16 kHz, PCM16/float32).",
+                               f"{param}.{index}.input_audio.format", "unsupported_content_type")
+            import base64
+            try:
+                wav = base64.b64decode(spec["data"], validate=True)
+            except Exception:
+                raise APIError(400, "`input_audio.data` is not valid base64.",
+                               f"{param}.{index}.input_audio.data")
+            dmel = dmel_encode(decode_wav_mono16k(wav, f"{param}.{index}.input_audio.data"))
+            audio_out.append(dmel)
+            segments.append(("audio", len(dmel) // AUDIO_MEL_BANDS))
+        else:
+            raise APIError(400, "Unsupported content part type for the Inkling engine.",
+                           f"{param}.{index}", "unsupported_content_type")
+    return segments
+
+
 def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                      tool_choice=None):
     """Validated multi-turn K3 payload for the C engine.
@@ -493,8 +761,155 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                   tool_choice=None):
+    """DeepSeek V4's native multi-turn chat template.
+
+    The target engine receives this as a raw prompt. Prior assistant turns end
+    with the checkpoint's EOS marker; the final assistant marker selects the
+    thinking or direct-answer prefix for the new turn.
+
+    Tool use follows the official DSML format (encoding/encoding_dsv4.py): tool
+    schemas are declared on the first system/developer message, assistant tool
+    calls are DSML blocks, and tool results are <tool_result> blocks merged into
+    user turns (V4 has no standalone "tool" role).
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # the client forbade tools: do not offer them
+    # Merge tool messages into <tool_result> blocks on the following user turn (V4 has no
+    # tool role); validate every message on the original list for accurate field-level errors.
+    merged = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant", "tool"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        if role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            raw = message.get("content")
+            content = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            merged.append({"role": role, "content": content,
+                           "reasoning_content": message.get("reasoning_content"),
+                           "tool_calls": message.get("tool_calls")})
+            continue
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role == "tool":
+            block = "<tool_result>" + text + "</tool_result>"
+            if merged and merged[-1].get("_parts") is not None:
+                merged[-1]["_parts"].append(block)
+            else:
+                merged.append({"role": "user", "_parts": [block]})
+        elif role == "user":
+            if merged and merged[-1].get("_parts") is not None:
+                merged[-1]["_parts"].append(text)
+            else:
+                merged.append({"role": "user", "content": text})
+        else:                                     # system / developer
+            merged.append({"role": role, "content": text})
+    if tools:
+        tools_text = _dsv4_tools_block(tools)
+        if forced:
+            tools_text += f"\n\nYou must call the function `{forced}`. Do not answer directly."
+        elif tool_choice == "required":
+            tools_text += "\n\nYou must call one of the functions above. Do not answer directly."
+        for msg in merged:
+            if msg["role"] in ("system", "developer"):
+                msg["content"] += "\n\n" + tools_text
+                break
+        else:
+            # No system/developer message: the official encoder renders tools on an empty
+            # system message, i.e. "bos" + "\n\n" + tools. Keep that exact byte layout.
+            merged.insert(0, {"role": "system", "content": "\n\n" + tools_text})
+    bos = "<\uff5cbegin\u2581of\u2581sentence\uff5c>"
+    user = "<\uff5cUser\uff5c>"
+    assistant = "<\uff5cAssistant\uff5c>"
+    eos = "<\uff5cend\u2581of\u2581sentence\uff5c>"
+    parts = [bos]
+    if enable_thinking:
+        effort = DSV4_REASONING_EFFORT.get(reasoning_effort, "low")
+        if effort != "low":
+            parts.append(DSV4_REASONING_EFFORT_PROMPTS[effort])
+    for message in merged:
+        role = message["role"]
+        if role in ("system", "developer"):
+            if role == "developer":
+                parts.append(user)            # V4 wraps developer messages like user turns
+            parts.append(message["content"])
+        elif role == "user":
+            parts.append(user)
+            if message.get("_parts") is not None:
+                parts.append("\n\n".join(message["_parts"]))
+            else:
+                parts.append(message["content"])
+        else:
+            reasoning = message.get("reasoning_content")
+            parts.append(assistant)
+            if reasoning:
+                parts.extend(("<think>", reasoning, "</think>"))
+            else:
+                parts.append("</think>")
+            parts.append(message["content"])
+            if message.get("tool_calls"):
+                parts.append(_dsv4_tool_calls(message["tool_calls"]))
+            parts.append(eos)
+    parts.extend((assistant, "<think>" if enable_thinking else "</think>"))
+    return "".join(parts)
+
+
+def render_chat_olmoe(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """OLMoE-Instruct's native chat_template (tokenizer_config.json): one
+    bos_token, then per-message <|system|>/<|user|>/<|assistant|> turns each
+    closed by a newline, prior assistant turns also closed by eos_token
+    (bos_token == eos_token == "|||IP_ADDRESS|||", a PII-scrubbing artifact
+    repurposed as this tokenizer's BOS/EOS marker), and a trailing
+    "<|assistant|>\\n" generation prompt. No tool-call syntax and no thinking
+    mode exist in this template, so both parameters are accepted but unused.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools or tool_choice not in (None, "none"):
+        raise APIError(400, "Tool use is not wired up for the OLMoE engine yet.",
+                       "tools", "unsupported_parameter")
+    boundary = "|||IP_ADDRESS|||"   # bos_token == eos_token in this tokenizer
+    parts = [boundary]
+    last = len(messages) - 1
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise APIError(400, "Each message must be an object.", f"messages.{index}")
+        role = message.get("role")
+        if role not in ("system", "developer", "user", "assistant"):
+            raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
+        raw = message.get("content")
+        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+        if role in ("system", "developer"):
+            parts.append(f"<|system|>\n{text}\n")
+        elif role == "user":
+            parts.append(f"<|user|>\n{text}\n")
+        else:
+            parts.append(f"<|assistant|>\n{text}{boundary}")
+            if index != last:
+                parts.append("\n")
+    parts.append("<|assistant|>\n")
+    return "".join(parts)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
-                        tool_choice=None):
+                        tool_choice=None, audio_out=None):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
     <|content_text|> parts and <|end_message|> terminators, an assistant
     <|content_model_end_sampling|> after each prior model turn, the
@@ -536,8 +951,20 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
             prompt.append(effort_str)
             effort_emitted = True
         raw = message.get("content")
-        text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
-        prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
+        if audio_out is not None and role == "user" and isinstance(raw, list):
+            # multipart user content: text runs and audio clips become separate
+            # TMLv0 messages, in part order (a message carries ONE content type).
+            # Each DMel frame is one <|audio|> placeholder; the engine replaces
+            # those embeddings with the frames appended to audio_out.
+            for kind, val in inkling_content_segments(raw, f"messages.{index}.content", audio_out):
+                if kind == "text":
+                    prompt.append(f"{rtok}<|content_text|>{val}<|end_message|>")
+                else:
+                    prompt.append(f"{rtok}<|content_audio_input|>"
+                                  + "<|audio|>" * val + "<|audio_end|><|end_message|>")
+        else:
+            text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            prompt.append(f"{rtok}<|content_text|>{text}<|end_message|>")
         if role == "assistant":
             prompt.append("<|content_model_end_sampling|>")
     if not effort_emitted:                       # all-system edge case: fallback
@@ -561,7 +988,18 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     prompt = ["[gMASK]<sop>"]
     if enable_thinking:
-        effort = "High" if reasoning_effort == "high" else "Max"
+        # The endpoint accepts none/minimal/low/medium/high/xhigh, and this used
+        # to render every one of them except "high" as Max -- so a client asking
+        # for `minimal` got more reasoning than one asking for `high`, and the
+        # mapping was not even monotonic (#809). On a single machine that is not
+        # a cosmetic mismatch: unrequested reasoning spends the token budget
+        # before the answer starts.
+        #
+        # GLM-5.2's template takes a word here, not a number, so the levels map
+        # onto the ones it understands, in order. `none` cannot appear: it turns
+        # thinking off upstream and never reaches this branch.
+        effort = {"minimal": "Low", "low": "Low", "medium": "Medium",
+                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "High")
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
@@ -636,6 +1074,18 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     prompt.append("<|assistant|><think>" if enable_thinking else
                   "<|assistant|><think></think>")
     return "".join(prompt)
+
+
+def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                         tool_choice=None, audio_out=None):
+    """Render a chat request with the active engine's native prompt contract."""
+    if ARCH == "inkling":
+        return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
+                                    tool_choice, audio_out=audio_out)
+    renderer = (render_chat_kimi if ARCH == "kimi" else
+                render_chat_v4 if ARCH == "deepseek_v4" else
+                render_chat_olmoe if ARCH == "olmoe" else render_chat)
+    return renderer(messages, enable_thinking, reasoning_effort, tools, tool_choice)
 
 
 # ---- Anthropic Messages API (#343) --------------------------------------------------------
@@ -1106,7 +1556,16 @@ def generation_options(body, limit):
         maximum = limit
     temperature = body.get("temperature")
     top_p = body.get("top_p")
-    temperature = 0.7 if temperature is None else temperature
+    if temperature is None:
+        # The launcher publishes --temp through COLI_TEMP (#509, #968). The
+        # gateway must use that value as its request default or the SERVE frame
+        # replaces it with 0.7 before any engine can honor the setting.
+        try:
+            temperature = float(os.environ.get("COLI_TEMP", "0.7"))
+            if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                temperature = 0.7
+        except ValueError:
+            temperature = 0.7
     top_p = 0.9 if top_p is None else top_p
     if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 1:
         raise APIError(400, f"`{maximum_param}` must be a positive integer.", maximum_param)
@@ -1153,8 +1612,8 @@ def read_engine_turn(stream, sentinel, on_bytes):
 
 def model_arch(model):
     """The model's engine family from its config.json model_type -- the same
-    rule as coli's model_arch(): "inkling"/"kimi" substring, everything else
-    (including an unreadable config) is glm."""
+    rule as coli's model_arch(): "inkling"/"kimi"/"olmoe" substring, everything
+    else (including an unreadable config) is glm."""
     try:
         with open(Path(model) / "config.json", encoding="utf-8") as fh:
             model_type = (json.load(fh).get("model_type") or "").lower()
@@ -1164,6 +1623,10 @@ def model_arch(model):
         return "inkling"
     if "kimi" in model_type:
         return "kimi"
+    if "deepseek_v4" in model_type or ("deepseek" in model_type and "v4" in model_type):
+        return "deepseek_v4"
+    if "olmoe" in model_type:
+        return "olmoe"
     return "glm"
 
 
@@ -1192,6 +1655,36 @@ def cap_for_arch(arch, cap):
     return 0 if arch == "glm" else 8
 
 
+def tune_child_env(env, arch):
+    """Apply the engine-local defaults that a direct server launch otherwise misses.
+
+    ``coli chat`` already supplies these values, but users also launch this file
+    directly.  Keep setdefault semantics so every explicit operator setting wins.
+    """
+    if arch != "deepseek_v4":
+        return env
+    if not env.get("COLI_NO_OMP_TUNE"):
+        # The V4 runtime owns OMP_NUM_THREADS: it reserves logical CPUs for its
+        # expert-loader workers. Supplying a physical-core default here makes
+        # that runtime policy treat the launcher value as a user override.
+        env.setdefault("OMP_WAIT_POLICY", "active")
+        env.setdefault("GOMP_SPINCOUNT", "200000")
+        env.setdefault("OMP_DYNAMIC", "FALSE")
+        if sys.platform != "win32":
+            env.setdefault("OMP_PROC_BIND", "close")
+            env.setdefault("OMP_PLACES", "cores")
+    # All speculative paths stay opt-in: partial acceptance requires expensive
+    # recurrent-attention replay on this engine.
+    env.setdefault("V4_DRAFT", "0")
+    env.setdefault("V4_MTP", "0")
+    env.setdefault("V4_MTP_DRAFT", "3")
+    env.setdefault("V4_MTP_GB", "0.45")
+    env.setdefault("V4_MTP_MISS", "96")
+    env.setdefault("V4_MTP_MIN", "3")
+    env.setdefault("V4_MTP_CONF", "0.55")
+    return env
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -1200,10 +1693,12 @@ class Engine:
     # main() below, so programmatic callers that never pass cap get the same
     # auto behavior as the CLI; an explicit int (0 included) is verbatim.
     def __init__(self, executable, model, cap=None, max_tokens=1024, env=None, kv_slots=1):
+        arch = model_arch(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
+        tune_child_env(child_env, arch)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(model_arch(model), cap))], env=child_env,
+            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         self.write_lock = threading.Lock()
@@ -1339,7 +1834,7 @@ class Engine:
                 self._fail_pending(error)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
-                 cancelled=None, grammar=None, stopped=None, on_accept=None):
+                 cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -1348,6 +1843,12 @@ class Engine:
         gpayload = grammar.encode("utf-8") if grammar else b""
         if b"\0" in gpayload:
             raise APIError(400, "NUL bytes are not supported in grammars.", "response_format")
+        # audio (inkling only): the optional 7th SUBMIT field is grammar bytes
+        # for glm and DMel bytes for inkling — the two engines never see the
+        # other's extension, and inkling rejects grammars upstream.
+        apayload = audio or b""
+        if gpayload and apayload:
+            raise APIError(400, "Grammar and audio cannot be combined.", "response_format")
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
         def decode(data):
@@ -1366,14 +1867,15 @@ class Engine:
             request_id = str(self.next_request_id)
             self.next_request_id += 1
             self.pending[request_id] = events
+        xpayload = gpayload or apayload
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
-                  + (f" {len(gpayload)}" if gpayload else "") + "\n").encode()
+                  + (f" {len(xpayload)}" if xpayload else "") + "\n").encode()
         try:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
-                self.process.stdin.write(header + payload + gpayload + b"\n")
+                self.process.stdin.write(header + payload + xpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
             with self.pending_lock:
@@ -1396,7 +1898,21 @@ class Engine:
                     on_accept(info)
 
         while True:
-            kind, value = events.get()
+            try:
+                kind, value = events.get(timeout=0.05)
+            except queue.Empty:
+                # #908: cancelled() is only polled in the "data" branch, so a
+                # client that disconnects before the engine's first DATA frame
+                # (it is still prefilling) never cancels: the CANCEL never went
+                # out, the turn ran to its token limit, and this thread stayed
+                # blocked until the engine emitted something. Poll the callback
+                # while idle so a pre-first-frame disconnect cancels too.
+                if not cancel_sent and not stop_sent and cancelled and cancelled():
+                    cancel_sent = True
+                    with self.write_lock:
+                        self.process.stdin.write(f"CANCEL {request_id}\n".encode())
+                        self.process.stdin.flush()
+                continue
             if kind == "accept":
                 if accepted:
                     raise RuntimeError("engine sent a duplicate ACCEPT frame")
@@ -1447,8 +1963,37 @@ def model_object(model_id, created):
     return {"id": model_id, "object": "model", "created": created, "owned_by": "colibri"}
 
 
+def _positive_env(name, default):
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class APIServer(ThreadingHTTPServer):
     daemon_threads = True
+
+    # SEC: ThreadingHTTPServer spawns one thread per TCP connection with no
+    # ceiling, and each carries a default 8 MiB stack. Opening connections and
+    # never completing a request therefore grows thread count -- and memory --
+    # without bound, before any Host check or auth runs. max_queue bounds the
+    # inference queue, not the accept loop.
+    #
+    # 64 is deliberately small: the engine serves one request at a time
+    # (kv_slots) behind a queue of 8, so hundreds of concurrent connections buy
+    # nothing a dashboard plus a handful of clients does not already have. Over
+    # the cap we close immediately rather than queue, so the cost of a flood is
+    # paid by the attacker's socket and not by our address space.
+    MAX_CONNECTIONS = _positive_env("COLI_MAX_CONNECTIONS", 64)
+
+    # A global cap alone turns memory exhaustion into connection starvation: one
+    # attacker holding all 64 slots still locks every real client out. Measured
+    # exactly that while testing the cap. So also bound what a single source may
+    # hold, and keep it well under the global cap: a browser opens a handful of
+    # parallel connections, an SDK fewer, so 8 is generous for any one client and
+    # leaves 56 slots that one address cannot touch.
+    MAX_CONNECTIONS_PER_IP = _positive_env("COLI_MAX_CONNECTIONS_PER_IP", 8)
 
     def __init__(self, address, engine, model_id, api_key=None, max_tokens=1024,
                  cors_origins=DEFAULT_CORS_ORIGINS, max_queue=8, queue_timeout=300,
@@ -1467,15 +2012,105 @@ class APIServer(ThreadingHTTPServer):
         self.allowed_hosts = tuple(
             h.strip().lower() for h in allowed_hosts if h and h.strip())
         self.created = int(time.time())
+        self._conn_lock = threading.Lock()
+        self._conn_live = 0
+        self._conn_by_ip = {}
+        self._conn_owner = {}
+
+    def process_request(self, request, client_address):
+        """Refuse past the caps instead of spawning an unbounded thread."""
+        peer = client_address[0] if client_address else "?"
+        with self._conn_lock:
+            mine = self._conn_by_ip.get(peer, 0)
+            if self._conn_live >= self.MAX_CONNECTIONS:
+                reason = "server cap %d" % self.MAX_CONNECTIONS
+            elif mine >= self.MAX_CONNECTIONS_PER_IP:
+                reason = "per-address cap %d" % self.MAX_CONNECTIONS_PER_IP
+            else:
+                reason = None
+                self._conn_live += 1
+                self._conn_by_ip[peer] = mine + 1
+                self._conn_owner[id(request)] = peer
+        if reason:
+            sys.stderr.write("[api] %s - refused: %s\n" % (peer, reason))
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._release(request)
+            raise
+
+    def _release(self, request):
+        with self._conn_lock:
+            peer = self._conn_owner.pop(id(request), None)
+            if peer is None:
+                return                      # never counted, or already released
+            if self._conn_live > 0:
+                self._conn_live -= 1
+            left = self._conn_by_ip.get(peer, 1) - 1
+            if left > 0:
+                self._conn_by_ip[peer] = left
+            else:
+                self._conn_by_ip.pop(peer, None)   # do not grow a map per peer
+
+    def close_request(self, request):
+        self._release(request)
+        super().close_request(request)
+
+
+class _DeadlineReader:
+    """rfile wrapper enforcing a CUMULATIVE deadline on reading one request.
+
+    SEC: `timeout` below is per socket operation, so it restarts on every byte.
+    A client dripping one byte every 29 s renews it forever and holds a thread
+    and a connection slot indefinitely -- the code's own comment claimed the
+    opposite. The deadline here is absolute: every read shrinks the socket
+    timeout to the time left, so a drip runs the clock down instead of resetting
+    it.
+
+    It covers the request-read phase only. Generation is not on this clock: a
+    600-second answer is normal and must not be cut off, so send_response()
+    hands the socket back to the ordinary timeout once the status line is out.
+    """
+
+    def __init__(self, raw, sock, per_read, budget):
+        self._raw, self._sock, self._per_read = raw, sock, per_read
+        self._expires = time.monotonic() + budget
+
+    def _arm(self):
+        left = self._expires - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request read deadline exceeded")
+        self._sock.settimeout(min(self._per_read, left))
+
+    def readline(self, *args):
+        self._arm()
+        return self._raw.readline(*args)
+
+    def read(self, *args):
+        self._arm()
+        return self._raw.read(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
 
 
 class APIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    timeout = 30   # per-request socket timeout: a slowloris client that dribbles its
-                   # request line/body can't pin a worker thread (and a slot) forever
+    timeout = 30   # per socket OPERATION. On its own this does not stop a slowloris:
+                   # it restarts on every byte received, so a drip renews it forever.
+                   # READ_DEADLINE below is the cumulative bound that actually does.
+    READ_DEADLINE = _positive_env("COLI_READ_DEADLINE", 30)  # accept -> request read
     server_version = "colibri"
     _committed = False    # status line already on the wire; reset per request below
     _body_read = False    # request body fully consumed, so nothing is left to drain
+
+    def setup(self):
+        super().setup()
+        # Keep the socket-backed reader; handle_one_request re-wraps it with a
+        # fresh deadline per request rather than wrapping a wrapper each time.
+        self._raw_rfile = self.rfile
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[api] %s - %s\n" % (self.address_string(), fmt % args))
@@ -1492,7 +2127,40 @@ class APIHandler(BaseHTTPRequestHandler):
         instead of asking each early return to remember."""
         self._committed = False
         self._body_read = False
-        super().handle_one_request()
+        # Fresh budget per request: a keep-alive connection may serve many, and
+        # each is entitled to its own read window -- but none may drip forever.
+        self.rfile = _DeadlineReader(self._raw_rfile, self.connection,
+                                     self.timeout, self.READ_DEADLINE)
+        try:
+            super().handle_one_request()
+        except TimeoutError:
+            # The read budget ran out. Say so and close; do not answer, because
+            # we never received a complete request to answer.
+            sys.stderr.write("[api] %s - request read deadline exceeded\n"
+                             % self.address_string())
+            self.close_connection = True
+            return
+        except ConnectionError:
+            # ConnectionError, not (BrokenPipeError, ConnectionResetError): those two
+            # are SIBLINGS of ConnectionAbortedError under it, so the pair caught the
+            # POSIX spellings and let the Windows one through. #854's log is pages of
+            # `ConnectionAbortedError: [WinError 10053] An established connection was
+            # aborted by the software in your host machine` escaping to socketserver,
+            # from a `coli web` start that was otherwise healthy.
+            #
+            # The client hung up mid-response. That is not an error here, it is
+            # how HTTP clients behave: `coli chat` polls /health while the model
+            # loads and drops each connection as soon as it has its answer, and
+            # Ctrl-C during a stream closes the socket by design -- the banner
+            # tells the user to do exactly that. Without this, socketserver's
+            # handler prints a full traceback per occurrence, so a normal start
+            # buried the loading spinner under BrokenPipeError stack traces and
+            # every cancelled answer looked like a crash.
+            #
+            # Caught here rather than in send_json() so it also covers the SSE
+            # writes in the streaming path, which is where Ctrl-C lands.
+            self.close_connection = True
+            return
         if not self.close_connection:
             self._drain_request_body()
 
@@ -1500,6 +2168,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """Single choke point for "the status line is out". Overriding here rather than
         tracking it at each call site means no responder can forget (#597 item 3)."""
         self._committed = True
+        # The request is fully read by the time anything answers, so the read
+        # deadline has done its job. Restore the plain per-operation timeout:
+        # generation legitimately takes minutes and must not inherit a clock
+        # sized for reading a request header.
+        try:
+            self.connection.settimeout(self.timeout)
+        except OSError:
+            pass
         super().send_response(code, message)
 
     def _drain_request_body(self):
@@ -1586,12 +2262,25 @@ class APIHandler(BaseHTTPRequestHandler):
         name = name.strip().lower()
         allowed = set(self.LOOPBACK_HOSTS)
         allowed.update(self.server.allowed_hosts)          # #597: operator-trusted reverse-proxy names
+        # A wildcard is an explicit operator opt-out of the guard, for the case
+        # the guard cannot serve: a container/LAN bind reached by an IP or DNS
+        # name the server cannot predict (#990 -- Docker port-map, the browser
+        # sends the host's address, which the container never knows). The guard
+        # protects a LOOPBACK bind from a malicious page; once bound to 0.0.0.0
+        # the exposure is already chosen, so `*` adds no risk that bind did not.
+        if "*" in allowed:
+            return
         try:
             allowed.add(str(self.server.server_address[0]).strip("[]").lower())
         except Exception:
             pass
         if name not in allowed:
-            raise APIError(403, "Host header not allowed.", None, "forbidden")
+            raise APIError(
+                403,
+                "Host header %r not allowed. Add it with --allowed-host %s "
+                "(or COLI_ALLOWED_HOSTS), or --allowed-host '*' to accept any "
+                "host when the bind is already public." % (name or "(empty)", name or "<host>"),
+                None, "forbidden")
 
     def read_json(self):
         try:
@@ -1688,9 +2377,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_json(200, payload, request_id)
                 return
             if path == "/profile":
+                # (#SEC-8) same gate as /health and /experts above: this endpoint
+                # is served before require_auth(), so an unauthenticated caller
+                # reached it even with --api-key set. It carries per-turn
+                # telemetry -- prompt and completion token counts, per-phase
+                # timings, up to 120 turns -- which describes what the operator
+                # is running and how much. The pass that added _is_authed() to
+                # the two endpoints above did not reach this one.
                 eng = self.server.engine
-                payload = {"seq": getattr(eng, "profile_seq", 0) if eng else 0,
-                           "turns": list(getattr(eng, "profile", ()) or ()) if eng else []}
+                payload = {"seq": 0, "turns": []}
+                if self._is_authed() and eng:
+                    payload["seq"] = getattr(eng, "profile_seq", 0)
+                    payload["turns"] = list(getattr(eng, "profile", ()) or ())
                 self.send_json(200, payload, request_id)
                 return
             if self.serve_static(path):
@@ -1739,8 +2437,8 @@ class APIHandler(BaseHTTPRequestHandler):
             self._fail(error, request_id)
         except ClientCancelled:
             pass
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except ConnectionError:
+            pass                      # same widening as handle_one_request, same reason
         except Exception as error:
             self.log_error("request failed: %s", error)
             try:
@@ -1766,7 +2464,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False):
+                   enable_thinking=False, audio=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -1779,7 +2477,7 @@ class APIHandler(BaseHTTPRequestHandler):
             sys.stderr.flush()
         maximum, temperature, top_p, grammar, _requested_stop_sequences = generation_options(
             body, self.server.max_tokens)
-        if grammar is not None and ARCH in ("inkling", "kimi"):
+        if grammar is not None and ARCH in ("inkling", "kimi", "olmoe"):
             # sibling engines speak the 6-field SUBMIT header only; sending the
             # grammar payload extension would desync its stdin framing.
             raise APIError(400, f"`response_format` grammars are not supported by the {ARCH} "
@@ -1821,7 +2519,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped)
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
+                    **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 text = "".join(output)
                 reasoning = ""
@@ -1834,7 +2533,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     reasoning, text = split_thinking_reply(text, enable_thinking)
                 length_finish = "length" if stats["length_limited"] else "stop"
                 if chat and tools:
-                    content, calls = parse_tool_calls(text, tools)
+                    content, calls = parse_arch_tool_calls(text, tools)
                     message = {"role": "assistant", "content": content or None, "refusal": None}
                     if reasoning:
                         message["reasoning_content"] = reasoning
@@ -1957,16 +2656,16 @@ class APIHandler(BaseHTTPRequestHandler):
             if chat and tools:
                 # Suppress tool-call markers from the streamed content and parse the authoritative
                 # calls from the FULL reply after generation. Hold back a marker-length tail so a
-                # <tool_call> split across engine chunks is still caught.
+                # tool-call marker split across engine chunks is still caught.
                 sp = {"buf": "", "tool": False}
-                hold = len(BOX_START) - 1
+                hold = _tool_hold()
                 raw = []
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
                     if sp["tool"]:
                         return
                     sp["buf"] += chunk
-                    cut = sp["buf"].find(BOX_START)
+                    cut = _tool_cut(sp["buf"])
                     if cut >= 0:
                         if cut:
                             emit(sp["buf"][:cut])
@@ -1990,13 +2689,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream)
+                    on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 if think:
                     think.finish()
                 if not sp["tool"] and sp["buf"]:
                     emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_tool_calls("".join(raw), tools)
+                _content, calls = parse_arch_tool_calls("".join(raw), tools)
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -2019,7 +2718,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream)
+                    on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -2076,14 +2775,23 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = body.get("enable_thinking", reasoning_effort not in (None, "none"))
         if not isinstance(enable_thinking, bool):
             raise APIError(400, "`enable_thinking` must be a boolean.", "enable_thinking")
+        if ARCH == "olmoe" and enable_thinking:
+            # OLMoE's template has no thinking mode (render_chat_olmoe: "accepted
+            # but unused"), so the engine never emits <think>/</think>. Left on,
+            # the reasoning splitter files the ENTIRE answer as reasoning_content
+            # and streams an empty `content` -- the drop reported in #984, which
+            # bit streaming (ThinkingStreamSplit stays in thinking mode forever)
+            # while non-streaming happened to survive. Make the template's "unused"
+            # true end-to-end instead of trusting every path to opt out.
+            enable_thinking = False
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
-        renderer = (render_chat_inkling if ARCH == "inkling" else
-                    render_chat_kimi if ARCH == "kimi" else render_chat)
-        prompt = renderer(body.get("messages"), enable_thinking, reasoning_effort, tools,
-                          tool_choice)
+        audio_clips = [] if ARCH == "inkling" else None
+        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+                                      tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
-                        enable_thinking=enable_thinking)
+                        enable_thinking=enable_thinking,
+                        audio=b"".join(audio_clips) if audio_clips else None)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
@@ -2102,6 +2810,8 @@ class APIHandler(BaseHTTPRequestHandler):
         enable_thinking = bool(thinking and thinking.get("type") == "enabled")
         if not enable_thinking and thinking is None and os.environ.get("COLI_THINK", "0") == "1":
             enable_thinking = True
+        if ARCH == "olmoe":
+            enable_thinking = False   # #984: OLMoE has no thinking mode (see the OpenAI path)
         if body.get("max_tokens") is None:
             raise APIError(400, "`max_tokens` is required.", "max_tokens")
         # Reuse the OpenAI path's own validation by handing it an equivalent body.
@@ -2114,8 +2824,9 @@ class APIHandler(BaseHTTPRequestHandler):
             translated["tool_choice"] = tool_choice
         if tool_choice == "none":
             tools = None
-        prompt = render_chat(messages, enable_thinking, "high" if enable_thinking else None,
-                             tools, tool_choice)
+        prompt = render_chat_for_arch(messages, enable_thinking,
+                                      "high" if enable_thinking else None,
+                                      tools, tool_choice)
         self.anthropic_generation(translated, prompt, request_id, tools, enable_thinking)
 
     def anthropic_generation(self, body, prompt, request_id, tools, enable_thinking):
@@ -2146,13 +2857,17 @@ class APIHandler(BaseHTTPRequestHandler):
         def blocks_and_stop(text, stats):
             """Split a finished reply into Anthropic content blocks + stop_reason."""
             content = []
-            if enable_thinking:
+            reasoning = ""
+            if ARCH == "inkling":
+                text, reasoning = split_inkling(text)
+            elif enable_thinking:
                 reasoning, text = split_thinking_reply(text)
+            if enable_thinking:
                 content.append({"type": "thinking", "thinking": reasoning,
                                 "signature": ANTHROPIC_LOCAL_SIGNATURE})
             calls = []
             if tools:
-                text, calls = parse_tool_calls(text, tools)
+                text, calls = parse_arch_tool_calls(text, tools)
             if text:
                 content.append({"type": "text", "text": text})
             for call in calls:
@@ -2241,7 +2956,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
             raw = []
             state = {"buf": "", "in_tool": False}
-            hold = len(BOX_START) - 1
+            hold = _tool_hold()
 
             def emit_text(chunk):
                 if not chunk:
@@ -2260,7 +2975,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if state["in_tool"]:
                     return                       # tool markers never reach the client as text
                 state["buf"] += chunk
-                cut = state["buf"].find(BOX_START)
+                cut = _tool_cut(state["buf"])
                 if cut >= 0:
                     if cut:
                         emit_text(state["buf"][:cut])
@@ -2285,8 +3000,13 @@ class APIHandler(BaseHTTPRequestHandler):
                               "signature": ANTHROPIC_LOCAL_SIGNATURE}})
                 send_event("content_block_stop", {"type": "content_block_stop", "index": 0})
 
-            split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                     if enable_thinking else None)
+            if ARCH == "inkling":
+                split = InklingStreamSplit(emit_answer,
+                                           emit_thinking if enable_thinking else None,
+                                           close_thinking if enable_thinking else None)
+            else:
+                split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
+                         if enable_thinking else None)
 
             def on_text(chunk):
                 raw.append(chunk)
@@ -2298,7 +3018,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 lambda: not connected[0], grammar=grammar, stopped=stop_filter.stopped)
             stop_filter.finish()
             if split:
-                split.finish()
+                split.close()
                 close_thinking()               # budget exhaustion before </think>
             if tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
@@ -2351,7 +3071,7 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         raise ValueError("queue_timeout must be positive")
     if not 1 <= kv_slots <= 16:
         raise ValueError("kv_slots must be between 1 and 16")
-    if ARCH in ("inkling", "kimi") and kv_slots != 1:
+    if ARCH in ("inkling", "kimi", "deepseek_v4", "olmoe") and kv_slots != 1:
         raise ValueError(f"{ARCH} engine currently supports exactly one KV slot")
     if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
         # (#SEC-6) Fail closed: an unauthenticated engine on a non-loopback bind exposes
@@ -2363,6 +3083,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
             print("refusing to bind %s beyond localhost without COLI_API_KEY set "
                   "(set COLI_ALLOW_INSECURE_BIND=1 to override)" % host, file=sys.stderr)
             sys.exit(1)
+    if allowed_hosts and "*" in allowed_hosts:
+        print("WARNING: --allowed-host '*' accepts ANY Host header "
+              "(DNS-rebinding guard disabled)", file=sys.stderr)
     origins = DEFAULT_CORS_ORIGINS if cors_origins is None else tuple(cors_origins)
     # Bind before starting the 744B engine. A stale/occupied port must fail in
     # milliseconds rather than loading hundreds of GB and leaking a child.
@@ -2388,7 +3111,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=os.environ.get("COLI_MODEL"), required=not os.environ.get("COLI_MODEL"))
     parser.add_argument("--engine", default=str(default_engine()))
-    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi"), default="auto",
+    parser.add_argument("--arch", choices=("auto", "glm", "inkling", "kimi", "deepseek_v4", "olmoe"), default="auto",
                         help="chat-template family; auto reads model_type from the model's config.json")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -2417,7 +3140,10 @@ def main():
         ARCH = model_arch(args.model)
     if args.model_id is None:
         args.model_id = ("inkling-colibri" if ARCH == "inkling" else
-                         "kimi-k3-colibri" if ARCH == "kimi" else "glm-5.2-colibri")
+                         "kimi-k3-colibri" if ARCH == "kimi" else
+                         "deepseek-v4-colibri" if ARCH == "deepseek_v4" else
+                         "olmoe-colibri" if ARCH == "olmoe" else
+                         "glm-5.2-colibri")
     serve(args.model, args.host, args.port, args.model_id, args.api_key,
           args.cap,args.max_tokens,args.engine,cors_origins=args.cors_origin,
           max_queue=args.max_queue,queue_timeout=args.queue_timeout,kv_slots=args.kv_slots,

@@ -5,6 +5,9 @@ import math
 import socket
 import tempfile
 import threading
+import sys
+import time
+import struct
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -15,9 +18,10 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            DEFAULT_CHAT_STOP_SEQUENCES, END, GenerationScheduler,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
-                           generation_options, parse_tool_calls, read_engine_turn,
-                           render_chat, render_chat_kimi, serve,
-                           split_thinking_reply, stop_policy)
+                           generation_options, parse_tool_calls, parse_dsv4_tool_calls,
+                           read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
+                           render_chat_v4, _dsv4_tool_calls, serve, split_thinking_reply,
+                           stop_policy, tune_child_env)
 
 
 class FakeEngine:
@@ -111,6 +115,37 @@ class TemplateTest(unittest.TestCase):
             "K3CHAT1\nA 3 6\nwhyanswerG 1\n",
         )
 
+    def test_olmoe_renders_native_chat_template(self):
+        # Matches allenai/OLMoE-1B-7B-0125-Instruct's tokenizer_config.json
+        # chat_template exactly: one leading bos_token, per-role turns closed
+        # by a trailing newline, a prior (non-final) assistant turn also closed
+        # by eos_token before that newline (bos_token == eos_token ==
+        # "|||IP_ADDRESS|||" in this tokenizer), and a trailing
+        # "<|assistant|>\n" generation prompt.
+        prompt = render_chat_olmoe([
+            {"role": "system", "content": "Be terse."},
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Continue"},
+        ])
+        self.assertEqual(
+            prompt,
+            "|||IP_ADDRESS|||<|system|>\nBe terse.\n<|user|>\nHi\n"
+            "<|assistant|>\nHello|||IP_ADDRESS|||\n<|user|>\nContinue\n"
+            "<|assistant|>\n",
+        )
+
+    def test_olmoe_rejects_tools_and_unknown_roles(self):
+        with self.assertRaisesRegex(APIError, "Tool use"):
+            render_chat_olmoe([{"role": "user", "content": "Hi"}],
+                              tools=[{"type": "function"}])
+        with self.assertRaisesRegex(APIError, "Unsupported role"):
+            render_chat_olmoe([{"role": "tool", "content": "result"}])
+
+    def test_olmoe_rejects_empty_messages(self):
+        with self.assertRaisesRegex(APIError, "non-empty array"):
+            render_chat_olmoe([])
+
     def test_validates_generation_limits(self):
         self.assertEqual(generation_options({"max_tokens": 4, "temperature": 0, "top_p": 1}, 8),
                          (4, 0.0, 1.0, None, ()))
@@ -151,6 +186,15 @@ class TemplateTest(unittest.TestCase):
         # (draft source only — bad grammar costs the speedup, never the request)
         opts = generation_options({"response_format": {"type": "gbnf", "grammar": "not a grammar ::="}}, 8)
         self.assertEqual(opts[3], "not a grammar ::=")
+
+    def test_coli_temp_is_the_default_for_requests_that_omit_temperature(self):
+        with patch.dict("openai_server.os.environ", {"COLI_TEMP": "0.25"}):
+            self.assertEqual(generation_options({}, 8)[1], 0.25)
+            self.assertEqual(generation_options({"temperature": 0}, 8)[1], 0.0)
+        for invalid in ("malformed", "5", "-1", "nan", "1e999"):
+            with self.subTest(invalid=invalid):
+                with patch.dict("openai_server.os.environ", {"COLI_TEMP": invalid}):
+                    self.assertEqual(generation_options({}, 8)[1], 0.7)
 
     def test_validates_stop_sequences(self):
         self.assertEqual(generation_options({"stop": "END"}, 8)[4], ("END",))
@@ -567,6 +611,50 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(output, ["x"])
         self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
 
+    def test_cancels_generation_before_first_frame(self):
+        # #908: a client that disconnects while the engine is still prefilling
+        # (no DATA frame has arrived) must cancel too. cancelled() used to be
+        # polled only in the "data" branch, so the CANCEL never went out and
+        # the turn ran to its token limit while this thread stayed blocked.
+        # The fake engine emits nothing until it sees CANCEL -- exactly the
+        # pre-first-frame regime -- and must still get one.
+        request_id = None
+
+        def respond(process, frame):
+            nonlocal request_id
+            fields = frame.split()
+            if fields[0] == b"SUBMIT":
+                request_id = fields[1]
+            elif fields[0] == b"CANCEL":
+                self.assertEqual(fields[1], request_id)
+                process.stdout.feed(b"ERROR " + request_id + b" CANCELLED\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        flag = {"cancelled": False}
+        outcome = []
+
+        def generate():
+            try:
+                engine.generate("hello", 8, 0.7, 0.9, lambda _: None,
+                                cancelled=lambda: flag["cancelled"])
+            except ClientCancelled:
+                outcome.append("cancelled")
+
+        thread = threading.Thread(target=generate)
+        thread.start()
+        for _ in range(200):
+            if any(frame.startswith(b"SUBMIT") for frame in process.writes):
+                break
+            time.sleep(0.01)
+        flag["cancelled"] = True
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        engine.close()
+        self.assertEqual(outcome, ["cancelled"])
+        self.assertEqual(process.writes[-1].split(), [b"CANCEL", request_id])
+
     def test_stops_generation_through_successful_done_path(self):
         request_id = None
 
@@ -658,6 +746,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(cap_for_arch("glm", None), 0)
         self.assertEqual(cap_for_arch("inkling", None), 8)
         self.assertEqual(cap_for_arch("kimi", None), 8)
+        self.assertEqual(cap_for_arch("olmoe", None), 8)
         self.assertEqual(cap_for_arch("glm", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 3), 3)
         self.assertEqual(cap_for_arch("inkling", 0), 0)   # explicit 0 is explicit
@@ -667,7 +756,35 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("glm_moe_dsa")), "glm")
         self.assertEqual(model_arch(self._model("inkling")), "inkling")
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
+        self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
+        self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
         self.assertEqual(model_arch("/nonexistent"), "glm")
+
+    def test_direct_v4_server_gets_bounded_dspark_defaults(self):
+        env = {"V4_MTP_CONF": "0.7"}
+        with patch("resource_plan.physical_cpu_count",
+                   side_effect=AssertionError("V4 server sized the team")), \
+             patch("openai_server.sys.platform", "linux"):
+            tune_child_env(env, "deepseek_v4")
+        self.assertNotIn("OMP_NUM_THREADS", env)
+        self.assertEqual(env["OMP_PROC_BIND"], "close")
+        self.assertEqual(env["V4_DRAFT"], "0")
+        self.assertEqual(env["V4_MTP"], "0")
+        self.assertEqual(env["V4_MTP_DRAFT"], "3")
+        self.assertEqual(env["V4_MTP_GB"], "0.45")
+        self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+
+    def test_direct_v4_server_preserves_explicit_omp_threads(self):
+        env = {"OMP_NUM_THREADS": "3"}
+        tune_child_env(env, "deepseek_v4")
+        self.assertEqual(env["OMP_NUM_THREADS"], "3")
+
+    def test_direct_v4_server_honours_omp_kill_switch(self):
+        env = {"COLI_NO_OMP_TUNE": "1"}
+        tune_child_env(env, "deepseek_v4")
+        for key in ("OMP_NUM_THREADS", "OMP_WAIT_POLICY", "GOMP_SPINCOUNT",
+                    "OMP_DYNAMIC", "OMP_PROC_BIND", "OMP_PLACES"):
+            self.assertNotIn(key, env)
 
 
 class HTTPTest(unittest.TestCase):
@@ -709,9 +826,17 @@ class HTTPTest(unittest.TestCase):
         self.assertIn("queued", scheduler)
         self.assertEqual(health["kv_slots"], 2)
 
-    def test_profile_reports_recent_turns_without_auth(self):
-        with urlopen(self.base + "/profile", timeout=2) as response:
-            self.assertEqual(json.load(response), {"seq": 0, "turns": []})
+    def test_profile_requires_auth(self):
+        """/profile is served before require_auth(), so it needs its own gate.
+
+        This test previously asserted the opposite -- that the telemetry was
+        readable without a key. That was not a client requirement: the web
+        dashboard sends `Authorization: Bearer` to /profile exactly as it does
+        to /health and /experts (web/src/lib/api.ts). The turns carry prompt and
+        completion token counts and per-phase timings for the last 120 requests,
+        which describes what the operator is running and how much of it, so an
+        anonymous caller now gets the same empty shape those two endpoints give.
+        """
         turn = {"wall_s": 2.5, "prompt_tokens": 7, "completion_tokens": 12,
                 "expert_disk_s": 0.4, "expert_wait_s": 0.1, "expert_matmul_s": 0.9,
                 "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15}
@@ -719,7 +844,11 @@ class HTTPTest(unittest.TestCase):
         self.engine.profile_seq = 1
         try:
             with urlopen(self.base + "/profile", timeout=2) as response:
-                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]})
+                self.assertEqual(json.load(response), {"seq": 0, "turns": []},
+                                 "unauthenticated caller received telemetry")
+            with self.request("/profile") as response:
+                self.assertEqual(json.load(response), {"seq": 1, "turns": [turn]},
+                                 "authenticated caller lost access")
         finally:
             del self.engine.profile, self.engine.profile_seq
 
@@ -807,6 +936,36 @@ class HTTPTest(unittest.TestCase):
             })
         self.assertEqual(caught.exception.code, 400)
 
+    def test_olmoe_never_files_the_answer_as_reasoning(self):
+        # #984: OLMoE has no thinking mode, so its engine never emits </think>.
+        # With thinking left on, the reasoning splitter kept the whole answer in
+        # reasoning_content and streamed an empty `content` -- content dropped.
+        # Forcing thinking off for olmoe must return the answer as content
+        # whether or not the client asked for reasoning, streaming or not.
+        for streaming in (False, True):
+            with self.subTest(stream=streaming), \
+                 patch("openai_server.ARCH", "olmoe"):
+                with self.request("/v1/chat/completions", {
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "reasoning_effort": "high",   # a client asking to think
+                    "stream": streaming,
+                }) as response:
+                    raw = response.read().decode()
+                if streaming:
+                    payloads = [json.loads(line[6:]) for line in raw.splitlines()
+                                if line.startswith("data: ") and line != "data: [DONE]"]
+                    content = "".join((c.get("delta") or {}).get("content", "")
+                                      for p in payloads for c in p["choices"])
+                    reasoning = "".join((c.get("delta") or {}).get("reasoning_content", "")
+                                        for p in payloads for c in p["choices"])
+                else:
+                    msg = json.loads(raw)["choices"][0]["message"]
+                    content = msg.get("content") or ""
+                    reasoning = msg.get("reasoning_content") or ""
+                self.assertIn("Hé", content, "the answer must arrive as content")
+                self.assertEqual(reasoning, "", "olmoe must not produce reasoning")
+
     def test_streaming_chat_completion(self):
         with self.request("/v1/chat/completions", {
             "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
@@ -856,6 +1015,99 @@ class HTTPTest(unittest.TestCase):
                 "stream": True, "stream_options": "usage",
             })
         self.assertEqual(caught.exception.code, 400)
+
+
+class ClientHangupTest(unittest.TestCase):
+    """A client that disconnects mid-response must not print a traceback.
+
+    `coli chat` polls /health on a 2 s timeout while the model loads and drops
+    each connection the moment it has an answer; Ctrl-C during a stream closes
+    the socket by design -- the banner tells the user to do exactly that. Both
+    reach the handler as BrokenPipeError, and socketserver logs an unhandled
+    exception per occurrence, so a normal DeepSeek V4 start buried the loading
+    spinner under stack traces and every cancelled answer looked like a crash.
+    """
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "test-model",
+                                None, 16, kv_slots=1)
+        self.errors = []
+        # socketserver routes an escaped exception here; the base class prints
+        # it to stderr. Recording instead of printing is what lets the test
+        # assert on it rather than on captured output.
+        self.server.handle_error = lambda request, address: self.errors.append(
+            sys.exc_info()[1])
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.thread.join, 2)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.scheduler.close)
+
+    def _hang_up_after_request(self, path):
+        """Send a request, then close without reading the response."""
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port), 2)
+        sock.sendall(f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     f"Connection: close\r\n\r\n".encode())
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER,
+                        struct.pack("ii", 1, 0))   # RST rather than a clean FIN
+        sock.close()
+        time.sleep(0.3)
+
+    def test_hangup_on_health_is_not_an_error(self):
+        for _ in range(5):
+            self._hang_up_after_request("/health")
+        self.assertEqual(self.errors, [],
+                         "client disconnect surfaced as a server error")
+
+    def test_the_server_still_answers_afterwards(self):
+        """The real damage would be a handler thread lost to the exception."""
+        self._hang_up_after_request("/health")
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
+
+    def _abort(self, *args):
+        """Windows' spelling of the same disconnect, raised where it really lands.
+
+        In #854's log the traceback runs do_GET -> send_json -> end_headers ->
+        flush_headers -> wfile.write -> sendall, so raising from end_headers
+        reproduces the exact shape on any platform.
+        """
+        raise ConnectionAbortedError(
+            10053, "An established connection was aborted by the software in your "
+                   "host machine")
+
+    def test_windows_aborted_connection_is_not_an_error(self):
+        """ConnectionAbortedError is a SIBLING of BrokenPipeError and
+        ConnectionResetError under ConnectionError, not a subclass of either --
+        so catching the pair caught the POSIX spellings and let the Windows one
+        escape. #854 is pages of WinError 10053 tracebacks from a healthy start.
+        """
+        self.assertFalse(
+            issubclass(ConnectionAbortedError, (BrokenPipeError, ConnectionResetError)),
+            "the old except clause would have covered this; the test proves nothing")
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass                      # the client sees a broken response; that is fine
+            time.sleep(0.3)
+        self.assertEqual(self.errors, [],
+                         "WinError 10053 surfaced as a server error (#854)")
+
+    def test_the_server_survives_an_aborted_connection(self):
+        """Same as the hangup case: the damage is a lost handler, not the log."""
+        with patch.object(APIHandler, "end_headers", self._abort):
+            try:
+                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+            except Exception:
+                pass
+            time.sleep(0.3)
+        with urlopen(f"http://127.0.0.1:{self.server.server_port}/health",
+                     timeout=2) as response:
+            self.assertEqual(json.load(response)["status"], "ok")
 
 
 class StaticServingTest(unittest.TestCase):
@@ -969,6 +1221,101 @@ class ToolArgumentTypeTest(unittest.TestCase):
         args = self._args("<tool_call>lookup_order"
                           "<arg_key>extra</arg_key><arg_value>7</arg_value></tool_call>")
         self.assertEqual(args["extra"], 7)
+
+
+class DeepSeekV4ToolCallTest(unittest.TestCase):
+    """DeepSeek V4 (#916): DSML tool blocks. Schemas render into the first system/developer
+    message, assistant tool_calls render as <｜DSML｜invoke> blocks, tool results merge into
+    user turns as <tool_result>, and model output parses back into OpenAI tool_calls."""
+
+    DSML = "｜DSML｜"
+    WEATHER = [{"type": "function", "function": {
+        "name": "get_weather", "description": "current weather",
+        "parameters": {"type": "object", "properties": {
+            "city": {"type": "string"}, "days": {"type": "integer"}},
+            "required": ["city"]}}}]
+    CALL = [{"id": "call_1", "type": "function", "function": {
+        "name": "get_weather",
+        "arguments": json.dumps({"city": "Paris", "days": 3})}}]
+
+    def test_tools_declared_on_first_system_message(self):
+        prompt = render_chat_v4([{"role": "system", "content": "Be brief."},
+                                 {"role": "user", "content": "Weather?"}], tools=self.WEATHER)
+        self.assertLess(prompt.index("Be brief."), prompt.index("## Tools"))
+        self.assertIn(f'"{self.WEATHER[0]["function"]["name"]}"', prompt)
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>"))
+
+    def test_tools_prepended_when_no_system_message(self):
+        prompt = render_chat_v4([{"role": "user", "content": "hi"}], tools=self.WEATHER)
+        # The official encoder renders tools on an empty system message: bos + "\n\n" + tools.
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>\n\n## Tools"))
+
+    def test_tool_choice_none_suppresses_declaration(self):
+        prompt = render_chat_v4([{"role": "user", "content": "hi"}],
+                                tools=self.WEATHER, tool_choice="none")
+        self.assertNotIn("## Tools", prompt)
+
+    def test_developer_message_is_wrapped_in_user_token(self):
+        # encoding_dsv4.py wraps developer content in <｜User｜>; system stays bare.
+        prompt = render_chat_v4([{"role": "developer", "content": "Be terse."},
+                                 {"role": "user", "content": "hi"}], tools=self.WEATHER)
+        self.assertIn("<｜User｜>Be terse.", prompt)
+        self.assertNotIn("<｜User｜>## Tools", prompt)
+
+    def test_thinking_mode_prepends_effort_prompt(self):
+        # encoding_dsv4.py prepends the level prompt after BOS in thinking mode.
+        prompt = render_chat_v4([{"role": "user", "content": "hi"}], enable_thinking=True,
+                                reasoning_effort="high")
+        self.assertTrue(prompt.startswith("<｜begin▁of▁sentence｜>Reasoning Effort: High."))
+        self.assertTrue(prompt.endswith("<｜Assistant｜><think>"))
+        # V4-native level names work too; low adds nothing.
+        self.assertTrue(render_chat_v4([{"role": "user", "content": "hi"}],
+                                       enable_thinking=True, reasoning_effort="max").startswith(
+            "<｜begin▁of▁sentence｜>Reasoning Effort: Maximum."))
+        self.assertFalse(render_chat_v4([{"role": "user", "content": "hi"}],
+                                        enable_thinking=True, reasoning_effort="low").startswith(
+            "<｜begin▁of▁sentence｜>Reasoning Effort:"))
+
+    def test_assistant_tool_calls_render_as_dsml(self):
+        prompt = render_chat_v4([{"role": "user", "content": "Paris?"},
+                                 {"role": "assistant", "content": None,
+                                  "tool_calls": self.CALL}])
+        self.assertIn(f'<{self.DSML}invoke name="get_weather">', prompt)
+        self.assertIn(f'<{self.DSML}parameter name="city" string="true">Paris</{self.DSML}parameter>',
+                      prompt)
+        self.assertIn(f'<{self.DSML}parameter name="days" string="false">3</{self.DSML}parameter>',
+                      prompt)
+        self.assertTrue(prompt.endswith("</think>"))
+
+    def test_tool_results_merge_into_one_user_turn(self):
+        prompt = render_chat_v4([{"role": "user", "content": "Paris?"},
+                                 {"role": "assistant", "content": None, "tool_calls": self.CALL},
+                                 {"role": "tool", "tool_call_id": "call_1", "content": "21c"},
+                                 {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+                                 {"role": "user", "content": "And London?"}])
+        self.assertEqual(prompt.count("<｜User｜>"), 2)
+        self.assertIn("<tool_result>21c</tool_result>", prompt)
+        self.assertIn("<tool_result>sunny</tool_result>", prompt)
+        self.assertIn("And London?", prompt)
+
+    def test_parse_dsml_reply_to_openai_tool_calls(self):
+        raw = (f"Here you go.\n\n<{self.DSML}tool_calls>\n"
+               f"<{self.DSML}invoke name=\"get_weather\">\n"
+               f"<{self.DSML}parameter name=\"city\" string=\"true\">Paris</{self.DSML}parameter>\n"
+               f"<{self.DSML}parameter name=\"days\" string=\"false\">3</{self.DSML}parameter>\n"
+               f"</{self.DSML}invoke>\n</{self.DSML}tool_calls><｜end▁of▁sentence｜>")
+        content, calls = parse_dsv4_tool_calls(raw)
+        self.assertEqual(content, "Here you go.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Paris", "days": 3})
+
+    def test_parse_truncated_block_leaks_no_markers(self):
+        content, calls = parse_dsv4_tool_calls("Almost.\n\n<｜DSML｜tool_calls><｜DSML｜invoke na")
+        self.assertEqual(calls, [])
+        self.assertEqual(content, "Almost.")
+        self.assertNotIn("DSML", content)
 
 
 class EngineErrorFrameTest(unittest.TestCase):
@@ -1138,6 +1485,31 @@ class AllowedHostsTest(unittest.TestCase):
     def test_untrusted_host_still_rejected_with_allowlist(self):
         server = self._make_server(allowed_hosts=("proxy.example.ts.net",))
         self.assertEqual(self._get_models(server.server_port, "evil.example.com"), 403)
+
+    def test_wildcard_accepts_any_host(self):
+        # #990: a Docker/LAN bind reached by an unpredictable IP. The wildcard is
+        # an explicit operator opt-out, so ANY host passes -- but loopback and a
+        # real name still work, i.e. it widens rather than replaces.
+        server = self._make_server(allowed_hosts=("*",))
+        port = server.server_port
+        self.assertEqual(self._get_models(port, "10.20.30.40:36873"), 200)
+        self.assertEqual(self._get_models(port, "colibri.example.com"), 200)
+        self.assertEqual(self._get_models(port, "localhost"), 200)
+
+    def test_rejection_message_names_the_host_and_the_fix(self):
+        server = self._make_server()
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            conn.putrequest("GET", "/v1/models", skip_host=True)
+            conn.putheader("Host", "myserver.lan:36873")
+            conn.endheaders()
+            resp = conn.getresponse()
+            body = resp.read().decode()
+        finally:
+            conn.close()
+        self.assertEqual(resp.status, 403)
+        self.assertIn("myserver.lan", body)          # the offending host, so the user can copy it
+        self.assertIn("--allowed-host", body)        # and how to fix it
 
 
 class ThinkingSplitUnitTest(unittest.TestCase):
@@ -1598,6 +1970,112 @@ class ConversationCacheSlotTest(unittest.TestCase):
     def test_deterministic(self):
         conv = self._conv("same question", "same answer", "again")
         self.assertEqual(conversation_cache_slot(conv, 8), conversation_cache_slot(conv, 8))
+
+
+class ConnectionLimitTest(unittest.TestCase):
+    """Bounds on the accept loop, which nothing bounded before.
+
+    ThreadingHTTPServer spawns a thread per connection with no ceiling, and
+    `timeout` is per socket operation, so it restarts on every byte: a client
+    dripping one byte kept a thread and a slot forever. Threads at 8 MiB of
+    stack each made that a memory-exhaustion DoS, reachable before any Host
+    check or auth.
+    """
+
+    def setUp(self):
+        self.engine = FakeEngine()
+        APIServer.MAX_CONNECTIONS = 6
+        APIServer.MAX_CONNECTIONS_PER_IP = 3
+        APIHandler.READ_DEADLINE = 2
+        self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS", 64)
+        self.addCleanup(setattr, APIServer, "MAX_CONNECTIONS_PER_IP", 8)
+        self.addCleanup(setattr, APIHandler, "READ_DEADLINE", 30)
+        self.server = APIServer(("127.0.0.1", 0), self.engine, "m", None, 16, kv_slots=1)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.addCleanup(self.server.scheduler.close)
+        self.port = self.server.server_port
+        self.held = []
+        self.addCleanup(self._drop_all)
+
+    def _drop_all(self):
+        for sock in self.held:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _dribble(self, count):
+        """Open connections that send a partial request line and never finish."""
+        for _ in range(count):
+            try:
+                sock = socket.create_connection(("127.0.0.1", self.port), 2)
+                sock.settimeout(2)
+                sock.sendall(b"GET /health HTTP/1.1\r\n")
+                self.held.append(sock)
+            except OSError:
+                pass
+        time.sleep(0.4)
+
+    def test_slowloris_cannot_grow_threads_without_bound(self):
+        self._dribble(40)
+        self.assertLessEqual(self.server._conn_live, APIServer.MAX_CONNECTIONS)
+
+    def test_one_address_cannot_take_every_slot(self):
+        """A global cap alone only turns exhaustion into starvation."""
+        self._dribble(40)
+        self.assertLessEqual(self.server._conn_live,
+                             APIServer.MAX_CONNECTIONS_PER_IP)
+        self.assertLess(self.server._conn_live, APIServer.MAX_CONNECTIONS,
+                        "one source filled the server cap")
+
+    def test_dripping_connections_are_reclaimed(self):
+        """The cumulative deadline, which the per-operation timeout is not."""
+        self._dribble(10)
+        self.assertGreater(self.server._conn_live, 0)
+        time.sleep(APIHandler.READ_DEADLINE + 1.5)
+        self.assertEqual(self.server._conn_live, 0,
+                         "dripping connections were never reclaimed")
+
+
+class ReasoningEffortTest(unittest.TestCase):
+    """render_chat mapped every level except "high" onto Max (#809).
+
+    The endpoint accepts none/minimal/low/medium/high/xhigh. Four of the five
+    that enable thinking rendered Max, so a client asking for `minimal` got
+    more reasoning than one asking for `high` -- and on a single machine
+    unrequested reasoning spends the token budget before the answer starts.
+    """
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def effort(self, level):
+        import re
+        text = render_chat(self.MESSAGES, enable_thinking=True,
+                           reasoning_effort=level)
+        found = re.search(r"Reasoning Effort: (\w+)", text)
+        return found.group(1) if found else None
+
+    def test_levels_are_distinct_and_ordered(self):
+        rendered = [self.effort(l) for l in
+                    ("minimal", "low", "medium", "high", "xhigh")]
+        rank = {"Low": 0, "Medium": 1, "High": 2, "Max": 3}
+        scores = [rank[r] for r in rendered]
+        self.assertEqual(scores, sorted(scores), rendered)
+        self.assertLess(scores[0], scores[-1],
+                        "minimal and xhigh render the same effort")
+
+    def test_minimal_is_not_max(self):
+        """The reported symptom, pinned on its own."""
+        self.assertNotEqual(self.effort("minimal"), "Max")
+        self.assertNotEqual(self.effort("low"), "Max")
+        self.assertNotEqual(self.effort("medium"), "Max")
+
+    def test_thinking_off_emits_no_effort_line(self):
+        text = render_chat(self.MESSAGES, enable_thinking=False,
+                           reasoning_effort="xhigh")
+        self.assertNotIn("Reasoning Effort", text)
 
 
 if __name__ == "__main__":
