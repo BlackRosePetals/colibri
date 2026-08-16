@@ -1682,10 +1682,6 @@ def tune_child_env(env, arch):
     env.setdefault("V4_MTP_MISS", "96")
     env.setdefault("V4_MTP_MIN", "3")
     env.setdefault("V4_MTP_CONF", "0.55")
-    # CUDA-driven MTP drafting stays opt-in (mirrors GLM's COLI_CUDA_MTP): the
-    # GPU fp4 kernels accumulate fp32 differently from the CPU refs, and a
-    # speculative draft must match the target bit-for-bit to be accepted.
-    env.setdefault("V4_MTP_GPU", "0")
     return env
 
 
@@ -2553,16 +2549,10 @@ class APIHandler(BaseHTTPRequestHandler):
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop)
-                _t0 = time.time()
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     **({"audio": audio} if audio else {}))
-                _dt = time.time() - _t0
-                sys.stderr.write(f"[v4_generate done in {_dt:.1f}s"
-                                 f" prompt={stats.get('prompt_tokens',0)}"
-                                 f" completion={stats.get('completion_tokens',0)}"
-                                 f" tok/s={stats.get('tokens_per_second',0):.2f}]\n")
                 stop_filter.finish()
                 text = "".join(output)
                 reasoning = ""
@@ -2728,16 +2718,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         sys.stderr.write(chunk); sys.stderr.flush()
                     (think.feed if think else feed_content)(chunk)
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
-                _t0 = time.time()
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
-                _dt = time.time() - _t0
-                sys.stderr.write(f"[v4_generate done in {_dt:.1f}s"
-                                 f" prompt={stats.get('prompt_tokens',0)}"
-                                 f" completion={stats.get('completion_tokens',0)}"
-                                 f" tok/s={stats.get('tokens_per_second',0):.2f}]\n")
                 stop_filter.finish()
                 if think:
                     think.finish()
@@ -2761,22 +2745,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 def emit_plain(chunk):
                     if dbg_echo:
                         sys.stderr.write(chunk); sys.stderr.flush()
-                    t0 = time.time()
                     (content_split.feed if content_split else emit)(chunk)
-                    dt = time.time() - t0
-                    if dt > 0.01:
-                        sys.stderr.write(f"[v4_emit {dt*1000:.0f}ms len={len(chunk)}]\n")
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
-                _t0 = time.time()
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
-                _dt = time.time() - _t0
-                sys.stderr.write(f"[v4_generate done in {_dt:.1f}s"
-                                 f" prompt={stats.get('prompt_tokens',0)}"
-                                 f" completion={stats.get('completion_tokens',0)}"
-                                 f" tok/s={stats.get('tokens_per_second',0):.2f}]\n")
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -2803,11 +2777,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def client_disconnected(self):
         try:
-            readable, _, _ = select.select([self.connection], [], [], 0.001)
+            readable, _, _ = select.select([self.connection], [], [], 0)
             if not readable:
                 return False
-            return self.connection.recv(1, socket.MSG_PEEK) == b""
-        except (socket.timeout, OSError, ValueError):
+            flags = socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)
+            return self.connection.recv(1, flags) == b""
+        except (OSError, ValueError):
             return True
 
     @staticmethod
