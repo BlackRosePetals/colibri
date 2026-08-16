@@ -198,6 +198,10 @@ endif
 # For a portable/release DLL that runs on any Ampere..Blackwell card AND JITs on
 # newer archs, build with CUDA_ARCH=portable: it emits SASS for sm_80/86/89/90/120
 # plus a compute_120 PTX fallback (sm_120 / RTX 50-series needs CUDA >= 12.8).
+# sm_121 (GB10 Spark) needs CUDA >= 12.9, so its gencode joins only when the
+# detected toolkit supports it — the portable floor stays 12.8. The version
+# probe fails closed: no or unparsable nvcc means no compute_121 (the
+# compute_120 PTX still JITs on sm_121).
 CUDA_ARCH ?= native
 ifeq ($(CUDA_ARCH),portable)
 CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
@@ -206,6 +210,14 @@ CUDA_GENCODE = -gencode arch=compute_80,code=sm_80 \
                -gencode arch=compute_90,code=sm_90 \
                -gencode arch=compute_120,code=sm_120 \
                -gencode arch=compute_120,code=compute_120
+NVCC_RELEASE := $(shell "$(NVCC)" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')
+# The empty-check makes the fail-closed promise real: with no parsable
+# version the sort below would compare 12.9 against itself and pass.
+ifneq ($(strip $(NVCC_RELEASE)),)
+ifeq ($(shell printf '%s\n' 12.9 $(NVCC_RELEASE) | sort -V 2>/dev/null | head -1),12.9)
+CUDA_GENCODE += -gencode arch=compute_121,code=sm_121
+endif
+endif
 else
 CUDA_GENCODE = -arch=$(CUDA_ARCH)
 endif
@@ -215,9 +227,13 @@ ifneq ($(IS_WIN),)
 # '/Wextra'"), which made `make cuda-dll` unbuildable as shipped. -W3 is
 # the MSVC warning level (dash form, NOT /W3: MSYS make would mangle the
 # slash-form into a filesystem path).
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-W3
+NVCCFLAGS ?= -O3 -std=c++17 -ftz=false $(CUDA_GENCODE) -Xcompiler=-W3
 else
-NVCCFLAGS ?= -O3 -std=c++17 $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
+# -ftz=false is nvcc's default, pinned explicitly: the fmt=8 kernels are
+# cross-tier parity instruments and a flushed scale*subnormal contribution
+# silently diverges from the CPU reference (backend_cuda.cu also #errors on
+# fast-math builds, but -ftz alone defines no macro to guard on).
+NVCCFLAGS ?= -O3 -std=c++17 -ftz=false $(CUDA_GENCODE) -Xcompiler=-Wall,-Wextra
 # glibc >= 2.41 declares the C23 math additions (rsqrt/rsqrtf, sinpi/cospi, ...)
 # with __THROW -> noexcept(true), clashing with CUDA's crt/math_functions.h
 # under C++17 (noexcept is part of the function type since C++17). Force-include
@@ -683,12 +699,19 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
 	./ragged_attention_test$(EXE)
+	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
+	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
+	# itself (kernel-level oracle), so only the test file is compiled.
+	# Runs BEFORE the MXFP4 test: that one has a pre-existing exponent-255
+	# failure on some hosts and would otherwise abort the recipe first.
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
+	./fp8_warp_test$(EXE)
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
@@ -705,11 +728,21 @@ hip-test:
 gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_bench$(EXE)
+
+# fmt=8 kernel bench: old vs COLI_CUDA_F8_WARP kernels per decode path, census
+# expert shapes, JSON on stdout (kernel time only). The build is a separate
+# file target so tools/run_f8_bench.sh can keep stdout pure JSON.
+fp8_bench$(EXE): backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_fp8_cuda.cu
+	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
+	"$(GPUCC)" $(GPUFLAGS) tests/bench_fp8_cuda.cu -o fp8_bench$(EXE) $(ANS_NVCC_LIBS)
+fp8-bench: fp8_bench$(EXE)
+	./fp8_bench$(EXE)
 
 # NOCUDA_*: olmoe.c has no COLI_CUDA code at all, so CUDA=1 would otherwise
 # hand it a define matching nothing and link a runtime it never calls -- a
@@ -1111,7 +1144,7 @@ bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
 .PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
-	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench cuda-dll hip-dll portable \
+	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench
 
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
