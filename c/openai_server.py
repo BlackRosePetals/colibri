@@ -1685,6 +1685,87 @@ def tune_child_env(env, arch):
     return env
 
 
+def _win_kill_on_close_job(pid):
+    """Tie an engine process to this server's lifetime, on Windows.
+
+    The engine re-execs itself for OMP tuning, and the re-exec's parent exits
+    immediately -- so the surviving engine is orphaned at birth. It is not a
+    descendant of anything the launcher can walk to, and it is not the pid the
+    server recorded, so neither the pidfile nor a parent-child scan can reach
+    it. #1049 measured the consequence on Windows 11: 2,617 MB still resident
+    after a shutdown that reported success, accumulating one ghost per
+    serve/stop cycle. (Same failure that OOM'd a box on 2026-07-16 with two
+    17+5 GB ghosts, where `pkill -x glm` matched nothing because the re-exec
+    renames itself.)
+
+    A Job Object with KILL_ON_JOB_CLOSE fixes it at the OS level rather than by
+    guessing pids: job membership is INHERITED by child processes, so the
+    re-exec stays inside the job, and when the last handle closes -- normal
+    exit, TerminateProcess, or a crash of this server -- Windows terminates
+    everything in it. Returns the handle, which the caller must keep alive for
+    as long as the engine should live; returns None on any failure, which
+    simply restores today's behaviour.
+    """
+    if sys.platform != "win32" or not pid:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class IO_COUNTERS(ctypes.Structure):
+            _fields_ = [("ReadOperationCount", ctypes.c_ulonglong),
+                        ("WriteOperationCount", ctypes.c_ulonglong),
+                        ("OtherOperationCount", ctypes.c_ulonglong),
+                        ("ReadTransferCount", ctypes.c_ulonglong),
+                        ("WriteTransferCount", ctypes.c_ulonglong),
+                        ("OtherTransferCount", ctypes.c_ulonglong)]
+
+        class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong),
+                        ("PerJobUserTimeLimit", ctypes.c_longlong),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                        ("IoInfo", IO_COUNTERS),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        JobObjectExtendedLimitInformation = 9
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+        PROCESS_SET_QUOTA, PROCESS_TERMINATE = 0x0100, 0x0001
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                           ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job); return None
+        handle = k32.OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, False, pid)
+        if not handle:
+            k32.CloseHandle(job); return None
+        ok = k32.AssignProcessToJobObject(job, handle)
+        k32.CloseHandle(handle)
+        if not ok:
+            k32.CloseHandle(job); return None
+        return job
+    except Exception:
+        return None   # never let process bookkeeping break starting the engine
+
+
 class Engine:
     # cap=None = "not explicitly set": a glm-arch model's engine resolves the
     # 0 sentinel (8 historically, 1 on Metal+darwin+fast SSD -- colibri.c
@@ -1701,6 +1782,14 @@ class Engine:
             [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
+        # Keep the job handle on the instance: KILL_ON_JOB_CLOSE fires when the
+        # LAST handle closes, so this reference is what ties the engine (and the
+        # OMP re-exec that orphans itself) to the server's lifetime (#1049).
+        # Guarded so the non-Windows path never touches .pid -- the test suite
+        # drives this class with a fake process object that has none.
+        self._win_job = None
+        if sys.platform == "win32":
+            self._win_job = _win_kill_on_close_job(getattr(self.process, "pid", None))
         self.write_lock = threading.Lock()
         self.pending_lock = threading.Lock()
         self.pending = {}

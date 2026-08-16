@@ -1370,6 +1370,36 @@ def cmd_serve(a):
         try: os.unlink(serve_pidfile(a.port))
         except OSError: pass
 
+def _pid_alive(pid):
+    """Is `pid` a live process?
+
+    `os.kill(pid, 0)` is the POSIX idiom, but on Windows os.kill() has no signal
+    semantics: for a pid this process did not spawn it raises
+    OSError [WinError 87] "The parameter is incorrect" instead of reporting
+    liveness. cmd_stop caught that as "not running", so `coli stop` printed
+    "nothing running" while the port was still LISTENING and ~5 GB of engines
+    were resident (#1049, reported with a reproduction on Windows 11 native).
+    On win32 ask the OS directly instead."""
+    if sys.platform != "win32":
+        try: os.kill(pid, 0); return True
+        except OSError: return False
+    import ctypes
+    from ctypes import wintypes
+    PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE = 0x1000, 259
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle: return False
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(handle, ctypes.byref(code)): return False
+        # STILL_ACTIVE is also a legal exit code; a process that exited with 259
+        # reads as alive here. SIGTERM on a dead pid is harmless, so the failure
+        # mode is a redundant kill, never a missed one.
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(handle)
+
 def cmd_stop(a):
     """Shut down a running `coli serve` AND its engine — one command, no pkill.
     The engine re-execs itself for OMP tuning, so its process is named `exe`,
@@ -1382,7 +1412,7 @@ def cmd_stop(a):
     pf=serve_pidfile(a.port)
     try:
         with open(pf) as f: pid=int(f.read().split()[0])
-        os.kill(pid,0); targets[pid]=f"coli serve (pidfile, port {a.port})"
+        if _pid_alive(pid): targets[pid]=f"coli serve (pidfile, port {a.port})"
     except (OSError,ValueError,IndexError): pass
     try: proc_entries=os.listdir("/proc")
     except OSError: proc_entries=[]       # native Windows has no /proc; the pidfile still works
@@ -1408,7 +1438,11 @@ def cmd_stop(a):
         except OSError: pass
     time.sleep(2.0)
     for pid in targets:
-        try: os.kill(pid, signal.SIGKILL); print(f"  {pid}: forced (SIGKILL)")
+        # signal.SIGKILL does not exist on win32 and AttributeError is not OSError,
+        # so the bare `except OSError` let it escape and abort the command AFTER
+        # the SIGTERMs above (#1049). Line 752 in this file already uses the
+        # getattr form; os.kill(SIGTERM) is TerminateProcess on Windows anyway.
+        try: os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM)); print(f"  {pid}: forced")
         except OSError: pass       # gia' morto: bene
     try: os.unlink(pf)
     except OSError: pass
