@@ -201,6 +201,12 @@ COLI_ANS  ?= 0
 DIETGPU_ROOT ?=
 DEEPGEMM  ?= 0
 NCCL      ?= 0
+# DeepGEMM sm120 headers for the DeepSeek V4 DeepGEMM flavour: a pinned
+# checkout made by tools/fetch_deepgemm.sh on first use (gitignored), see the
+# DeepSeek V4 CUDA kernels block and the cuda-dsv4-dg-dll target below.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
 ifneq ($(IS_WIN),)
 # the CUDA installer sets CUDA_PATH system-wide (e.g. C:\Program Files\NVIDIA
 # GPU Computing Toolkit\CUDA\v13.2); fall back to it before the POSIX default.
@@ -488,14 +494,19 @@ endif
 # objects are self-contained: backend_cuda_dsv4.* include only their own header
 # and the CUDA runtime, so they build and their tests run without the engine.
 #
-# DEEPGEMM is unsupported: CI cannot compile it without an external checkout,
-# and its kernels require Blackwell to run. It gates nothing and blocks nothing;
-# the default build is the supported configuration.
+# DEEPGEMM is an opt-in: its kernels require Blackwell (sm_120a) to run and CI
+# does not compile it. It gates nothing and blocks nothing; the default build
+# (generic kernels, any sm_80+) is the supported configuration and the one to
+# report bugs against. The sm120 headers it needs are NOT in this repository:
+# tools/fetch_deepgemm.sh checks out the community sm120 port at a pinned
+# commit into third_party/deepgemm (gitignored), verifies the pin, applies
+# patches-deepgemm-sm120-msvc.patch, and DEEPGEMM=1 / cuda-dsv4-dg-dll invoke
+# it on first build (deepgemm-fetch). DEEPGEMM_HOME points at an existing
+# checkout instead; DEEPGEMM_PIN bumps the commit. Attribution:
+# THIRD_PARTY_NOTICES.md.
 DSV4_CUDA_OBJ = backend_cuda_dsv4.o
 ifeq ($(DEEPGEMM),1)
-ifndef DEEPGEMM_HOME
-$(error DEEPGEMM_HOME must point to a DeepGEMM include tree)
-endif
+DSV4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
 CFLAGS += -DCOLI_DSV4_DEEPGEMM
 # Append, never replace. This was `:=` and discarded the whole inherited flag
 # set: $(CUDA_GENCODE), so any CUDA_ARCH the user chose was silently swapped for
@@ -718,9 +729,16 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 	"$(GPUCC)" $(GPUFLAGS) -c backend_cuda.cu -o $@
 
 
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config $(DSV4_DEEPGEMM_DEP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+# The pinned DeepGEMM sm120 checkout (see the DEEPGEMM block above). The stamp
+# is a header that only exists in the sm120 port, so an empty or wrong tree
+# refetches; the script itself is a no-op when the tree is already at the pin.
+deepgemm-fetch $(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+.PHONY: deepgemm-fetch
 
 # Windows DeepSeek V4 CUDA DLLs: the sibling of cuda-dll for the DeepSeek V4
 # engine. deepseek-v4.exe is built with MinGW gcc and cannot link MSVC/nvcc
@@ -742,9 +760,11 @@ cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
 		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
 		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
 
+# The DeepGEMM sm120 headers come from tools/fetch_deepgemm.sh (pinned
+# checkout into $(DEEPGEMM_HOME), see the DEEPGEMM block above); this target
+# fetches them on first use.
 DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
-cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
-	@test -n "$(DEEPGEMM_HOME)" || { echo "DEEPGEMM_HOME must point to the sm120 DeepGEMM checkout" >&2; exit 1; }
+cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def $(DEEPGEMM_STAMP)
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
 	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \

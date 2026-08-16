@@ -535,7 +535,30 @@ jobs:
           path-type: inherit
           install: >-
             make
+            git
             mingw-w64-ucrt-x86_64-gcc
+      # The DeepSeek V4 DeepGEMM flavour compiles against a pinned checkout
+      # that tools/fetch_deepgemm.sh makes on first use (nothing vendored).
+      # CI cannot compile it (sm_120a needs CUDA >= 12.8; this job pins 12.6)
+      # but it does exercise the fetch — pin verification + MSVC patch — and
+      # caches the tree keyed on the pin so a bump is the only cache miss.
+      - name: DeepGEMM pin (for the cache key)
+        id: deepgemm-pin
+        shell: bash
+        run: echo "pin=$(sed -n 's/^DEEPGEMM_PIN ?= //p' c/Makefile | head -1)" >> "$GITHUB_OUTPUT"
+      - name: Cache the pinned DeepGEMM checkout
+        uses: actions/cache@v4
+        with:
+          path: c/third_party/deepgemm
+          key: deepgemm-${{ steps.deepgemm-pin.outputs.pin }}-${{ hashFiles('c/patches-deepgemm-sm120-msvc.patch') }}
+      - name: make deepgemm-fetch (pinned checkout + MSVC patch, no compile)
+        shell: msys2 {0}
+        run: |
+          cd c
+          make deepgemm-fetch
+          test -f third_party/deepgemm/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh || { echo "fetch_deepgemm produced no sm120 headers" >&2; exit 1; }
+          # second run must be a no-op (idempotency)
+          make deepgemm-fetch | grep -q "already at" || { echo "fetch_deepgemm is not idempotent" >&2; exit 1; }
       - name: make cuda-dll (nvcc + MSVC host)
         shell: msys2 {0}
         run: |
