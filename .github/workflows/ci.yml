@@ -45,6 +45,11 @@ jobs:
         run: |
           docker run --rm colibri:ci --version
           docker run --rm colibri:ci --help > /dev/null
+          # The gateway has runtime modules that launcher-only commands do not
+          # import. Exercise that boundary so the advertised serve path cannot
+          # ship with a missing Python file.
+          docker run --rm --entrypoint python3 colibri:ci -c \
+            "import openai_server; print('gateway imports')"
       - name: The engine binary is in the image and is executable
         run: docker run --rm --entrypoint /app/colibri colibri:ci --help 2>&1 | head -5 || true
       - name: Lint both Dockerfiles
