@@ -1199,15 +1199,39 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     Cfg *c = &m->c; Slot *s;
     if (lc->n < lc->cap) { s = &lc->slots[lc->n++]; slot_ensure_allocated(m, s); }
     else {
+        /* LRU eviction — skip pinned and in-flight (eid==-1) slots */
         int lru = -1;
         for (int i = 0; i < lc->n; i++) {
             if (lc->slots[i].pinned || lc->slots[i].eid < 0) continue;
             if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
         }
         if (lru < 0) {
+            /* All slots are pinned or in-flight; find the oldest non-in-flight
+             * slot (may be pinned, but never one currently being loaded). */
             for (int i = 0; i < lc->n; i++) { if (lc->slots[i].eid < 0) continue; if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i; }
         }
-        if (lru < 0) lru = 0;
+        while (lru < 0) {
+            /* EVERY slot is in flight: each buffer is owned by an unlocked pread
+             * in the pilot worker (or a demand load) that will publish into it.
+             * The old last resort (lru=0) stole such a slot mid-load — two writers
+             * racing the same slab, then whichever published last decided the
+             * expert id the resident bytes answered to. Wait for a publish instead
+             * and rescan; in-flight always drains because a load either finishes
+             * or the process is already dead in the water.
+             *
+             * Taken verbatim from olmoe.c, which this cache derives from and
+             * where this exact fallback was deleted for exactly this reason.
+             * Reachable whenever cap is smaller than the number of candidates a
+             * layer has in flight — PILOT queues up to 128 per layer — i.e. on
+             * any small-RAM box, and it corrupts silently rather than crashing. */
+            pthread_mutex_unlock(&g_pilot_mx);
+            sleep_ms(1);
+            pthread_mutex_lock(&g_pilot_mx);
+            for (int i = 0; i < lc->n; i++) {
+                if (lc->slots[i].eid < 0) continue;
+                if (lru < 0 || lc->slots[i].used < lc->slots[lru].used) lru = i;
+            }
+        }
         s = &lc->slots[lru]; s->pinned = 0;
     }
     s->eid = -1; s->used = ++m->clock;
@@ -2095,6 +2119,10 @@ int main(int argc, char **argv) {
     int hot_n = getenv("HOT") ? atoi(getenv("HOT")) : 0;
     int cap   = argc > 1 ? atoi(argv[1]) : 16;
     int bits  = argc > 2 ? atoi(argv[2]) : 4;
+    /* cap < 1 leaves every layer cache empty, so expert_get finds no slot to
+     * evict and waits for a publish that can never come. The old lru=0 fallback
+     * turned that into a heap OOB instead; neither is a failure mode to ship. */
+    if (cap < 1) { fprintf(stderr, "cache/layer must be >= 1 (got %d)\n", cap); return 1; }
     if (bits < 2 || bits > 8) { fprintf(stderr, "quant_bits must be 2..8 (got %d)\n", bits); return 1; }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
