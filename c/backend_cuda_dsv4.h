@@ -19,10 +19,55 @@ int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scal
 int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t *w,const uint8_t *scale,int O,int I,int device);
 int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t *w,int O,int I,int device);
+/* Same-shape in-place refill of an fp4 mirror (no realloc); sync=1 drains. */
+int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t *w,const uint8_t *scale,int O,int I,int sync);
 int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float *w,int O,int I,int device);
 int dsv4_cuda_matvec(Dsv4CudaTensor *t,float *y,const float *x);
 int dsv4_cuda_matmul_batch(Dsv4CudaTensor *t,const Dsv4CudaActivation *input,
                            int tokens,Dsv4CudaActivation *output);
+int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor *t,const float *x,int tokens,float *y);
+/* Host-pointer batched sparse window attention (prefill). vals holds
+ * [0,comp_base) window rows in position order then the compressed rows;
+ * meta[3t]=window row offset, meta[3t+1]=window rows, meta[3t+2]=compressed
+ * prefix visible to token t. out receives [tokens][heads*dim]. */
+int dsv4_cuda_sparse_attn_batch(int device,const float *q,const float *vals,
+                                const float *sinks,const int *meta,int value_rows,
+                                int comp_base,int heads,int dim,int tokens,
+                                float scale,float *out);
+/* chunk holds the current chunk's kv rows (tokens x dim) starting at absolute
+ * position chunk_start; the engine appends them to the ring only AFTER the
+ * call (ring aliasing past window positions). */
+int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const float *q,
+                                       const float *chunk,int chunk_start,
+                                       const float *sinks,const int *meta,int abs_base,
+                                       int comp_limit,int heads,int dim,int tokens,
+                                       float scale,float *out);
+/* Indexed cached variant: meta[3t+2] is the SELECTED count and sel holds each
+ * token's compressed ordinals (tokens x selstride, score order). */
+int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const float *q,
+                                           const float *chunk,int chunk_start,
+                                           const float *sinks,const int *meta,
+                                           const int *sel,int selstride,int abs_base,
+                                           int comp_limit,int heads,int dim,int tokens,
+                                           float scale,float *out);
+/* Batched indexer scoring: scores[t][c] = sum_h relu(q_th . k_c) * w_th for
+ * c < counts[t] (else 0), sequential fp32 order identical to the CPU loop. */
+int dsv4_cuda_indexer_score_batch(int device,const float *queries,const float *keys,
+                                  const float *head_w,const int *counts,int tokens,
+                                  int heads,int dim,int count,float *scores);
+/* Bitwise replica of the CPU reference fp8 matmul (row-major e4m3 weights,
+ * 128x128 block f32 scales, host-quantized activations). y[tokens][rows]. */
+int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t *w,const float *bscale,
+                             int rows,int cols,int packed_rows8,const float *x,
+                             int tokens,float *y);
+/* Build/GPU compatibility (loader DLL selection). */
+int dsv4_cuda_backend_arch_ok(int device);
+const char *dsv4_cuda_backend_name(void);
+long long dsv4_cuda_mem_free_mb(int device);
+int dsv4_cuda_kv_ring_append(int device,int layer,const float *rows,int start_pos,
+                             int count,int window,int dim);
+int dsv4_cuda_kv_comp_append(int device,int layer,const float *rows,int start_idx,
+                             int count,int dim);
 int dsv4_cuda_head_argmax(Dsv4CudaTensor *t,const float *x,int *id,float *value);
 int dsv4_cuda_final_argmax(const Dsv4CudaActivation *residual,Dsv4CudaTensor *fn,Dsv4CudaTensor *scale,
                            Dsv4CudaTensor *base,Dsv4CudaTensor *norm,Dsv4CudaTensor *head,
@@ -43,6 +88,7 @@ int dsv4_cuda_wo(Dsv4CudaTensor *wo_a,Dsv4CudaTensor *wo_b,int groups,
                  float *out,const float *context);
 void dsv4_cuda_tensor_free(Dsv4CudaTensor *t);
 long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor *t);
+int dsv4_cuda_tensor_device(const Dsv4CudaTensor *t);
 Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements);
 void dsv4_cuda_activation_free(Dsv4CudaActivation *a);
 int dsv4_cuda_activation_upload(Dsv4CudaActivation *a,const float *x,long long elements);
@@ -145,6 +191,8 @@ int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet *set,int expert,
                                  const uint8_t *up_weight,const uint8_t *up_scale,
                                  const uint8_t *down_weight,const uint8_t *down_scale,
                                  Dsv4CudaTensor **gate,Dsv4CudaTensor **up,Dsv4CudaTensor **down);
+int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet *set,Dsv4CudaTensor *sg,
+                                     Dsv4CudaTensor *su,Dsv4CudaTensor *sd);
 int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet *set,int expert,int rank,
                                      const uint8_t *gate_weight,const uint8_t *gate_scale,
                                      const uint8_t *up_weight,const uint8_t *up_scale,
@@ -157,6 +205,15 @@ int dsv4_cuda_route_moe(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv
 int dsv4_cuda_route_moe_batch(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,
                               Dsv4CudaTensor *bias,const int *tokens,int count,float routed_scale,
                               Dsv4CudaExpertSet *experts,float limit,Dsv4CudaActivation *output);
+/* Batched top-6 routing only; ids[count*6] / weights[count*6] land on the host. */
+int dsv4_cuda_route_top6_batch(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,
+                               Dsv4CudaTensor *bias,int count,float routed_scale,
+                               int *ids,float *weights);
+/* Batched MoE over host-provided routes; every id's bank slot must already
+ * hold that expert (route-aware refill). */
+int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation *input,const int *ids,
+                                  const float *weights,int count,Dsv4CudaExpertSet *experts,
+                                  float limit,Dsv4CudaActivation *output);
 int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation *input,Dsv4CudaTensor *gate,Dsv4CudaTensor *bias,
                             const Dsv4CudaActivation *peer_input,Dsv4CudaTensor *peer_gate,Dsv4CudaTensor *peer_bias,
                             int token,float routed_scale,Dsv4CudaExpertSet *local,Dsv4CudaExpertSet *peer,

@@ -374,7 +374,7 @@ the model's `config.json`):
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
-> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 22 GB comfortable | not needed |
+> | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; an NVIDIA card (any sm_80+, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
 >
 > A GPU only ever makes it faster. Speed is set by your disk, because the experts
 > are streamed from it — expect a fraction of a token per second on a slow drive
@@ -465,18 +465,26 @@ Two things that differ per model, both documented in the per-model page:
 **DeepSeek V4 Flash** streams the official checkpoint with no conversion: routed
 experts stay **native fp4**, the dense set stays **fp8-e4m3** with UE8M0 block
 scales. MLA + DSA sparse attention, 43 layers, 256 routed experts plus one
-shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2.
+shared, top-6. Supported on x86-64/aarch64 Linux and Windows/MSYS2 (CPU), with
+an optional CUDA tier (Windows runtime DLL; Linux `CUDA=1` direct link,
+verified under WSL2) that keeps every stage CPU-canonical and falls back per stage.
 
 ```bash
 cd c
 make deepseek-v4
-python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 22
+python ./coli chat --model /path/to/DeepSeek-V4-Flash --ram 32
 # also: coli run / coli serve / coli web
+# Windows CUDA tier: make cuda-dsv4-dll CUDA_ARCH=portable  (+ make cuda-dsv4-dg-dll on RTX 50)
 ```
 
 Greedy decode and one KV slot. Tool calling is wired through the HTTP gateway
 with V4's native prompt and DSML call blocks; grammar is not supported. See the
-[per-engine API matrix](docs/api.md#tool-calling-support).
+[per-engine API matrix](docs/api.md#tool-calling-support). Prefix checkpoints
+(in memory + on disk) make agent sessions and follow-up turns start in seconds
+after the first prefill of a system prompt. Measured on an RTX 5080 + 2 NVMe:
+3324-token prefill 90 s, 8.3k-token first turn ~4 min once, later
+sessions/turns 6-9 s, decode ~1.6 tok/s at 3k context — see
+[docs/deepseek-v4.md](docs/deepseek-v4.md).
 
 **Give it RAM.** 43 × 256 routed experts are ~137 GiB on disk and a token
 touches 301 of them, so the expert cache hit rate is what sets tok/s — `--ram`
@@ -491,8 +499,9 @@ the drafts saved — one 14-token answer took 495 seconds. So `V4_DRAFT` and
 `V4_MTP` default to `0` and the code stays, with the numbers beside it, for
 whoever retries this on faster storage.
 
-See [docs/deepseek-v4.md](docs/deepseek-v4.md) for checkpoint validation, the
-generated tiny independent oracle, and the full knob list.
+See [docs/deepseek-v4.md](docs/deepseek-v4.md) for the CUDA tier (build, DLL
+selection, GPU coverage), the environment reference, performance numbers,
+checkpoint validation, and the generated tiny independent oracle.
 
 ## What's next
 

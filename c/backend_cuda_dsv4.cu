@@ -1,4 +1,5 @@
 #include "backend_cuda_dsv4.h"
+#include <chrono>
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 #include <cuda_bf16.h>
@@ -8,6 +9,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <climits>
+#include <vector>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
 #ifdef COLI_DSV4_NCCL
 #include <nccl.h>
 #endif
@@ -18,6 +25,17 @@
 #include <deep_gemm/impls/sm120_bf16_gemm.cuh>
 #endif
 
+/* The cuBLASLt MXFP8 tensor-core path (tc_plan/tc_fp4_matvec, enabled at
+ * runtime by DSV4_CUDA_TC=1, off by default) needs the cuBLASLt >= 12.8
+ * block-scaling APIs (CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0 / *_SCALE_MODE).
+ * Older toolkits (e.g. Jetson JetPack with CUDA 12.6) lack them; build with
+ * -DCOLI_DSV4_NO_TC to compile without that path (generic DLL/object only —
+ * the DeepGEMM sm_120a flavour needs 12.8+ anyway). */
+#if defined(COLI_DSV4_NO_TC)
+#define COLI_DSV4_TC 0
+#else
+#define COLI_DSV4_TC 1
+#endif
 struct Dsv4CudaTensor { void *w,*bf16_cache; uint8_t *scale;int *dg_scale; int O,I,fmt,device,own_w,own_scale,own_dg_scale; long long bytes; };
 struct Dsv4CudaActivation { float *data; long long elements; int device; };
 struct Dsv4CudaGraph { cudaGraph_t graph;cudaGraphExec_t exec;int device; };
@@ -26,7 +44,7 @@ struct MvDesc { const uint8_t *w,*scale; const float *x; float *y; };
 struct ExpertPtr { const uint8_t *w,*scale; };
 struct Dsv4CudaExpertSet { ExpertPtr *table;int64_t *hash;Dsv4CudaTensor *sg,*su,*sd;uint8_t *bank_fc1,*bank_fc1_scale,*bank_fc2,*bank_fc2_scale;int *bank_fc1_dg_scale,*bank_fc2_dg_scale;int count,device,H,I,vocab,topk; };
 struct TcPlan {int O,I,ok;cublasLtMatmulDesc_t op;cublasLtMatrixLayout_t a,b,c,d;cublasLtMatmulHeuristicResult_t algo;};
-struct Dev { int id; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
+struct Dev { int id,sms; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float *dx,*dy,*p1,*p2,*p3,*p4,*aux1,*aux2,*aux3; size_t xcap,ycap,p1cap,p2cap,p3cap,p4cap,aux1cap,aux2cap,aux3cap; float *hx,*hy;
 #ifdef COLI_DSV4_NCCL
     ncclComm_t ep_comm;
 #endif
@@ -34,7 +52,7 @@ struct Dev { int id; cudaStream_t stream,aux; cudaEvent_t ready,fork,join;float 
     MvDesc *mvdesc;size_t mvdesccap;float *expert_weights;size_t expert_weightscap;int *expert_ids;size_t expert_idcap;
     cublasLtHandle_t lt;void *tc_workspace;uint8_t *tcw,*tcs,*tcx,*tcxs;size_t tcwcap,tcscap,tcxcap,tcxscap;TcPlan plans[2];
 #ifdef COLI_DSV4_DEEPGEMM
-    uint8_t *dga1,*dga2;int *dgsfa1,*dgsfa2,*dglayout;__nv_bfloat16 *dgmm1,*dgmm2;float *dgref,*dgdensews;size_t dga1cap,dga2cap,dgsfa1cap,dgsfa2cap,dglayoutcap,dgmm1cap,dgmm2cap,dgrefcap,dgdensewscap;
+    uint8_t *dga1,*dga2;int *dgsfa1,*dgsfa2,*dglayout,*dgrowmap;__nv_bfloat16 *dgmm1,*dgmm2;float *dgref,*dgdensews;size_t dga1cap,dga2cap,dgsfa1cap,dgsfa2cap,dglayoutcap,dgrowmapcap,dgmm1cap,dgmm2cap,dgrefcap,dgdensewscap;
 #endif
 };
 static Dev g[16];static int ng;
@@ -45,6 +63,7 @@ static int bok(cublasStatus_t e,const char*s){if(e==CUBLAS_STATUS_SUCCESS)return
 static int nok(ncclResult_t e,const char*s){if(e==ncclSuccess)return 1;fprintf(stderr,"[DSV4 NCCL] %s: %s\n",s,ncclGetErrorString(e));return 0;}
 #endif
 static int buf(void **p,size_t *cap,size_t n){if(*cap>=n)return 1;if(*p)cudaFree(*p);*p=nullptr;*cap=0;if(!ok(cudaMalloc(p,n),"buffer allocation"))return 0;*cap=n;return 1;}
+
 
 __constant__ float e8_table[256];
 __global__ void set_decode_state(int*state,int token,int position){if(!threadIdx.x){state[0]=token;state[1]=position;}}
@@ -112,6 +131,37 @@ static void run_fp4_grouped(const MvDesc *desc,int count,int O,int I,cudaStream_
     else if(rows==2)mv_fp4_grouped<2><<<dim3((O+1)/2,count),256,0,stream>>>(desc,count,O,I);
     else mv_fp4_grouped<1><<<dim3(O,count),256,0,stream>>>(desc,count,O,I);
 }
+/* Prefill batch GEMM without DeepGEMM: one block per output row and 16-token
+ * tile, so each dequantized weight value is reused across the tile and the
+ * weight matrix is read ceil(T/16) times per call instead of T times (what a
+ * matvec-per-token loop would cost). Numerics match mv<F> exactly: same
+ * e4m3/e8 dequant, same bf16 round-trip for fmt 9. x is tokens-major
+ * [T][I], y is tokens-major [T][O] — the layout dg_dense_batch_dispatch and
+ * the engine's coli_fp8_matmul_batch_ref both use. */
+template<int F> __global__ void mm_batch(const uint8_t *w,const uint8_t *sc,const float *x,float *y,int O,int I,int T){
+    int o=blockIdx.x;if(o>=O)return;int tbase=blockIdx.y*16,tcount=T-tbase<16?T-tbase:16;
+    float sum[16]={};
+    for(int i=threadIdx.x;i<I;i+=blockDim.x){float v;
+        if constexpr(F==8||F==9){v=e4m3(w[(long long)o*I+i])*e8(sc[(o/128)*((I+127)/128)+i/128]);if constexpr(F==9)v=__bfloat162float(__float2bfloat16(v));}
+        else {uint8_t p=w[((long long)o*I+i)>>1],q=(i&1)?p>>4:p&15;v=f4(q)*e8(sc[(long long)o*(I/32)+i/32]);}
+        #pragma unroll
+        for(int t=0;t<16;t++)if(t<tcount)sum[t]+=x[(long long)(tbase+t)*I+i]*v;
+    }
+    __shared__ float s[16][256];
+    #pragma unroll
+    for(int t=0;t<16;t++)s[t][threadIdx.x]=sum[t];
+    __syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n){
+        #pragma unroll
+        for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
+    if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
+}
+static void run_mm_batch(Dsv4CudaTensor*t,const float*x,float*y,int T,cudaStream_t stream){
+    dim3 grid(t->O,(T+15)/16);
+    if(t->fmt==4)mm_batch<4><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+    else if(t->fmt==9)mm_batch<9><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+    else mm_batch<8><<<grid,256,0,stream>>>((uint8_t*)t->w,t->scale,x,y,t->O,t->I,T);
+}
 __device__ int tc_sf_off(int outer,int inner,int sf_inner_dim){int base=((inner/4)*4+(outer/128)*sf_inner_dim)*128,o=outer&127;return base+(o%32)*16+(o/32)*4+(inner&3);}
 __device__ uint8_t e4m3_code(float x){int best=0;float bd=INFINITY;for(int v=0;v<255;v++){float z=e4m3((uint8_t)v),d=fabsf(z-x);if(d<bd||(d==bd&&!(v&1)&&(best&1))){bd=d;best=v;}}return (uint8_t)best;}
 __global__ void tc_expand(const uint8_t*q4,const uint8_t*src,uint8_t*q8,uint8_t*dst,int O,int I){
@@ -172,6 +222,10 @@ __global__ void fp8_sim(float *x,int rows,int n){int row=blockIdx.x/((n+127)/128
         float q=fmaxf(-448.f,fminf(448.f,x[(long long)row*n+i]/scale));x[(long long)row*n+i]=__bfloat162float(__float2bfloat16(e4m3_round(q)*scale));}}
 __global__ void fp8_sim64(float *x,int n){int i=blockIdx.x*64+threadIdx.x;__shared__ float mx[64];float v=i<n?fabsf(x[i]):0;mx[threadIdx.x]=v;__syncthreads();
     for(int k=32;k;k>>=1){if(threadIdx.x<k&&mx[threadIdx.x+k]>mx[threadIdx.x])mx[threadIdx.x]=mx[threadIdx.x+k];__syncthreads();}if(i<n){float m=fmaxf(mx[0],1e-4f),raw=m/448.f;int e;frexpf(raw,&e);float scale=ldexpf(1.f,e-1);uint8_t q=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,x[i]/scale)),__NV_SATFINITE,__NV_E4M3);x[i]=__bfloat162float(__float2bfloat16(e4m3(q)*scale));}}
+/* Batched router (generic CUDA; used by both builds). */
+__device__ __forceinline__ bool route_better(float,unsigned,float,unsigned);__device__ __forceinline__ float route_prob(float);
+__global__ void route_logits_batch(const float*w,const float*x,float*y,int tokens,int E,int H){int e=blockIdx.x% E,t=blockIdx.x/E;float sum=0;const float*in=x+(long long)t*H;for(int h=threadIdx.x;h<H;h+=blockDim.x)sum+=w[(long long)e*H+h]*in[h];__shared__ float s[256];s[threadIdx.x]=sum;__syncthreads();for(int n=128;n;n>>=1){if(threadIdx.x<n)s[threadIdx.x]+=s[threadIdx.x+n];__syncthreads();}if(!threadIdx.x)y[(long long)t*E+e]=s[0];(void)tokens;}
+__global__ void route_top6_batch(int*ids,float*weights,const float*bias,const float*logits,int tokens,float scale){int t=blockIdx.x,lane=threadIdx.x;if(t>=tokens||lane>=32)return;const float*src=logits+(long long)t*256;float prob[8],score[8];for(int j=0;j<8;j++){int e=lane+j*32;prob[j]=route_prob(src[e]);score[j]=prob[j]+(bias?bias[e]:0.f);}float outp[6]={};unsigned outi[6]={};for(int k=0;k<6;k++){float bs=-INFINITY,bp=0;unsigned bi=UINT_MAX;for(int j=0;j<8;j++){unsigned e=lane+j*32;if(route_better(score[j],e,bs,bi)){bs=score[j];bp=prob[j];bi=e;}}for(int m=16;m;m>>=1){float os=__shfl_xor_sync(0xffffffff,bs,m),op=__shfl_xor_sync(0xffffffff,bp,m);unsigned oi=__shfl_xor_sync(0xffffffff,bi,m);if(route_better(os,oi,bs,bi)){bs=os;bp=op;bi=oi;}}for(int j=0;j<8;j++)if((unsigned)(lane+j*32)==bi)score[j]=-INFINITY;if(!lane){outp[k]=bp;outi[k]=bi;}}if(!lane){float sum=0;for(int k=0;k<6;k++)sum+=outp[k];sum=fmaxf(sum,6.103515625e-5f);for(int k=0;k<6;k++){ids[(long long)t*6+k]=(int)outi[k];weights[(long long)t*6+k]=outp[k]/sum*scale;}}}
 #ifdef COLI_DSV4_DEEPGEMM
 __global__ void dg_pack_weight_scale(int*out,const uint8_t*in,int expert,int N,int groups){
     int p=blockIdx.x*blockDim.x+threadIdx.x,total=N*(groups/4);if(p>=total)return;int n=p/(groups/4),kg=p%(groups/4);uint32_t v=0;
@@ -255,14 +309,19 @@ __global__ void dg_swiglu_quant_rows(const __nv_bfloat16*in,uint8_t*q,int*sfa,fl
         for(int j=0;j<4;j++){int k=base+lane+j*32;q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[j]/scale)),__NV_SATFINITE,__NV_E4M3);}}
     __syncthreads();if(threadIdx.x<4){int g=threadIdx.x*4;sfa[(long long)threadIdx.x*rows+row]=(int)((uint32_t)code[g]|((uint32_t)code[g+1]<<8)|((uint32_t)code[g+2]<<16)|((uint32_t)code[g+3]<<24));}}
 __global__ void dg_reduce6_weighted(float*out,const __nv_bfloat16*parts,const float*weight,int align){int h=blockIdx.x*blockDim.x+threadIdx.x;if(h<4096){float v=0;for(int e=0;e<6;e++)v+=weight[e]*__bfloat162float(parts[(long long)e*align*4096+h]);out[h]=__bfloat162float(__float2bfloat16(v));}}
-__device__ __forceinline__ bool route_better(float,unsigned,float,unsigned);__device__ __forceinline__ float route_prob(float);
-__global__ void route_logits_batch(const float*w,const float*x,float*y,int tokens,int E,int H){int e=blockIdx.x% E,t=blockIdx.x/E;float sum=0;const float*in=x+(long long)t*H;for(int h=threadIdx.x;h<H;h+=blockDim.x)sum+=w[(long long)e*H+h]*in[h];__shared__ float s[256];s[threadIdx.x]=sum;__syncthreads();for(int n=128;n;n>>=1){if(threadIdx.x<n)s[threadIdx.x]+=s[threadIdx.x+n];__syncthreads();}if(!threadIdx.x)y[(long long)t*E+e]=s[0];(void)tokens;}
-__global__ void route_top6_batch(int*ids,float*weights,const float*bias,const float*logits,int tokens,float scale){int t=blockIdx.x,lane=threadIdx.x;if(t>=tokens||lane>=32)return;const float*src=logits+(long long)t*256;float prob[8],score[8];for(int j=0;j<8;j++){int e=lane+j*32;prob[j]=route_prob(src[e]);score[j]=prob[j]+(bias?bias[e]:0.f);}float outp[6]={};unsigned outi[6]={};for(int k=0;k<6;k++){float bs=-INFINITY,bp=0;unsigned bi=UINT_MAX;for(int j=0;j<8;j++){unsigned e=lane+j*32;if(route_better(score[j],e,bs,bi)){bs=score[j];bp=prob[j];bi=e;}}for(int m=16;m;m>>=1){float os=__shfl_xor_sync(0xffffffff,bs,m),op=__shfl_xor_sync(0xffffffff,bp,m);unsigned oi=__shfl_xor_sync(0xffffffff,bi,m);if(route_better(os,oi,bs,bi)){bs=os;bp=op;bi=oi;}}for(int j=0;j<8;j++)if((unsigned)(lane+j*32)==bi)score[j]=-INFINITY;if(!lane){outp[k]=bp;outi[k]=bi;}}if(!lane){float sum=0;for(int k=0;k<6;k++)sum+=outp[k];sum=fmaxf(sum,6.103515625e-5f);for(int k=0;k<6;k++){ids[(long long)t*6+k]=(int)outi[k];weights[(long long)t*6+k]=outp[k]/sum*scale;}}}
 __global__ void route_hash_batch(int*ids,const int64_t*map,const int*tokens,int rows){int p=blockIdx.x*blockDim.x+threadIdx.x;if(p<rows*6)ids[p]=(int)map[(long long)tokens[p/6]*6+p%6];}
 __global__ void route_fixed_weights_batch(float*weights,const int*ids,const float*logits,int tokens,float scale){int t=blockIdx.x,k=threadIdx.x;__shared__ float p[6];if(t<tokens&&k<6)p[k]=route_prob(logits[(long long)t*256+ids[(long long)t*6+k]]);__syncthreads();if(t<tokens&&!k){float sum=0;for(int i=0;i<6;i++)sum+=p[i];sum=fmaxf(sum,6.103515625e-5f);for(int i=0;i<6;i++)weights[(long long)t*6+i]=p[i]/sum*scale;}}
 __global__ void dg_layout_routes(int*out,const int*ids,int rows,int align){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<rows)out[i]=ids[i/align];}
 __global__ void dg_quant_routes(const float*x,uint8_t*q,int*sfa,int tokens,int K,int rows,int align){int route=blockIdx.x/(K/512),pack=blockIdx.x%(K/512);if(route>=tokens*6)return;int token=route/6,row=route*align;__shared__ float mx[128];uint32_t codes=0;for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;float v=x[(long long)token*K+k];mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*K+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,v/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}if(!threadIdx.x)sfa[(long long)pack*rows+row]=(int)codes;}
 __global__ void dg_swiglu_quant_routes(const __nv_bfloat16*in,uint8_t*q,int*sfa,const float*weight,float limit,int routes,int rows,int align){int route=blockIdx.x;if(route>=routes)return;int row=route*align;__shared__ float mx[128],value[128];uint32_t pack=0;for(int g=0;g<16;g++){int k=g*128+threadIdx.x;float gate=fminf(__bfloat162float(in[(long long)row*4096+k]),limit),up=fmaxf(-limit,fminf(__bfloat162float(in[(long long)row*4096+2048+k]),limit));float v=__bfloat162float(__float2bfloat16(weight[route]*__bfloat162float(__float2bfloat16((gate/(1.f+expf(-gate)))*up))));value[threadIdx.x]=v;mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[threadIdx.x]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x){pack|=(uint32_t)code<<(8*(g&3));if((g&3)==3){sfa[(long long)(g/4)*rows+row]=(int)pack;pack=0;}}__syncthreads();}}
+/* EXPERT-GROUPED variants: routes are laid out contiguously per expert (host
+ * builds rowmap[route] -> row and layout[row] -> expert, groups 64-aligned,
+ * pad rows zeroed). Each route's row computes exactly what its old 64x
+ * replicated row did, so results are bitwise the replicated layout with
+ * ~4x fewer GEMM rows. */
+__global__ void dg_quant_routes_map(const float*x,uint8_t*q,int*sfa,int tokens,int K,int rows,const int*rowmap){int route=blockIdx.x/(K/512),pack=blockIdx.x%(K/512);if(route>=tokens*6)return;int token=route/6,row=rowmap[route];__shared__ float mx[128];uint32_t codes=0;for(int b=0;b<4;b++){int k=(pack*4+b)*128+threadIdx.x;float v=x[(long long)token*K+k];mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*K+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,v/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x)codes|=(uint32_t)code<<(8*b);__syncthreads();}if(!threadIdx.x)sfa[(long long)pack*rows+row]=(int)codes;}
+__global__ void dg_swiglu_quant_routes_map(const __nv_bfloat16*in,uint8_t*q,int*sfa,const float*weight,float limit,int routes,int rows,const int*rowmap){int route=blockIdx.x;if(route>=routes)return;int row=rowmap[route];__shared__ float mx[128],value[128];uint32_t pack=0;for(int g=0;g<16;g++){int k=g*128+threadIdx.x;float gate=fminf(__bfloat162float(in[(long long)row*4096+k]),limit),up=fmaxf(-limit,fminf(__bfloat162float(in[(long long)row*4096+2048+k]),limit));float v=__bfloat162float(__float2bfloat16(weight[route]*__bfloat162float(__float2bfloat16((gate/(1.f+expf(-gate)))*up))));value[threadIdx.x]=v;mx[threadIdx.x]=fabsf(v);__syncthreads();for(int n=64;n;n>>=1){if(threadIdx.x<n)mx[threadIdx.x]=fmaxf(mx[threadIdx.x],mx[threadIdx.x+n]);__syncthreads();}uint8_t code=dg_scale_code(mx[0]);float scale=dg_scale_value(code);q[(long long)row*2048+k]=__nv_cvt_float_to_fp8(fmaxf(-448.f,fminf(448.f,value[threadIdx.x]/scale)),__NV_SATFINITE,__NV_E4M3);if(!threadIdx.x){pack|=(uint32_t)code<<(8*(g&3));if((g&3)==3){sfa[(long long)(g/4)*rows+row]=(int)pack;pack=0;}}__syncthreads();}}
+__global__ void dg_reduce_routes_map(float*out,const __nv_bfloat16*parts,int tokens,const int*rowmap){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*4096;if(p<n){int t=p/4096,h=p%4096;float v=0;for(int k=0;k<6;k++)v+=__bfloat162float(parts[(long long)rowmap[t*6+k]*4096+h]);out[p]=__bfloat162float(__float2bfloat16(v));}}
 __global__ void dg_reduce_routes(float*out,const __nv_bfloat16*parts,int tokens,int align){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*4096;if(p<n){int t=p/4096,h=p%4096;float v=0;for(int k=0;k<6;k++)v+=__bfloat162float(parts[((long long)(t*6+k)*align)*4096+h]);out[p]=__bfloat162float(__float2bfloat16(v));}}
 __global__ void swiglu_rows(float*out,const float*gate,const float*up,float limit,int rows,int I){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)rows*I;if(p<n){float g=fminf(gate[p],limit),u=fmaxf(-limit,fminf(up[p],limit));out[p]=__bfloat162float(__float2bfloat16((g/(1.f+expf(-g)))*u));}}
 __global__ void add_rows(float*out,const float*x,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=__bfloat162float(__float2bfloat16(out[i]+x[i]));}
@@ -298,9 +357,9 @@ static int dg_dense_2048x4096(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){cons
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,t->dg_scale,O,I/512,(unsigned long long)O*4,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,4,I/512,16,16,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,1,(unsigned long long)O*2,16,64,CU_TENSOR_MAP_SWIZZLE_NONE))return 0;
-    auto gemm=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,64,16,64,64,64,0,16,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,64,4>;
+    auto gemm=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,64,16,64,64,64,0,16,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,64,4>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,64,16,64,64,64,0,16,128,256,84,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,64,4>;
     if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,88320),"dense DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,88320,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,c->dgdensews,O,1,I,1,O,0,a,b,sa,sb,d);
+    gemm<<<(c->sms>=170?170:84),384,88320,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,c->dgdensews,O,1,I,1,O,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     auto reduce=deep_gemm::sm120_split_k_reduce_impl<DgOutput,4>;reduce<<<(O+255)/256,256,0,c->stream>>>((DgOutput*)c->dgmm1,c->dgdensews,O,1,1,O);
     dg_bf16_to_float<<<(O+255)/256,256,0,c->stream>>>(y,c->dgmm1,O);
     static int dumped;if(!dumped++&&getenv("DSV4_CUDA_DENSE_DUMP")){struct Item{const char*p;const void*d;size_t n;}items[]={{"/tmp/dsv4-dense-x.f32",x,I*4},{"/tmp/dsv4-dense-q.fp8",c->dga1,I},{"/tmp/dsv4-dense-sfa.bin",c->dgsfa1,(I/512)*4*sizeof(int)},{"/tmp/dsv4-dense-sfb.bin",t->dg_scale,(size_t)O*(I/512)*sizeof(int)},{"/tmp/dsv4-dense-out.f32",y,O*4}};
@@ -315,9 +374,9 @@ static int dg_dense_4096x2048(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){cons
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,t->dg_scale,O,I/512,(unsigned long long)O*4,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,4,I/512,16,16,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,1,(unsigned long long)O*2,16,64,CU_TENSOR_MAP_SWIZZLE_NONE))return 0;
-    auto gemm=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,64,16,64,64,64,0,16,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,64,4>;
+    auto gemm=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,64,16,64,64,64,0,16,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,64,4>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,64,16,64,64,64,0,16,128,256,84,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,64,4>;
     if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,88320),"dense DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,88320,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,c->dgdensews,O,1,I,1,O,0,a,b,sa,sb,d);
+    gemm<<<(c->sms>=170?170:84),384,88320,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,c->dgdensews,O,1,I,1,O,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     auto reduce=deep_gemm::sm120_split_k_reduce_impl<DgOutput,4>;reduce<<<(O+255)/256,256,0,c->stream>>>((DgOutput*)c->dgmm1,c->dgdensews,O,1,1,O);
     dg_bf16_to_float<<<(O+255)/256,256,0,c->stream>>>(y,c->dgmm1,O);return ok(cudaGetLastError(),"dense DeepGEMM launch");}
 template<int O,int I,int BM,int BK,int SW,int STAGES,int EPI,int SPLIT,bool QUANT=true>
@@ -334,9 +393,9 @@ static int dg_dense_attention(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,t->dg_scale,O,I/512,(unsigned long long)O*4,BM,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,4,I/512,16,16,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,1,(unsigned long long)O*2,16,BM,CU_TENSOR_MAP_SWIZZLE_NONE)){fprintf(stderr,"[DSV4 DG] attention TMA map failed %dx%d\n",O,I);return 0;}
-    auto gemm=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,BM,16,BK,SW,SW,0,STAGES,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,SPLIT>;
+    auto gemm=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,BM,16,BK,SW,SW,0,STAGES,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,SPLIT>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,I,128,128,1,BM,16,BK,SW,SW,0,STAGES,128,256,84,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,SPLIT>;
     if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM),"attention DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,SPLIT>1?c->dgdensews:nullptr,O,1,I,1,O,0,a,b,sa,sb,d);
+    gemm<<<(c->sms>=170?170:84),384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,SPLIT>1?c->dgdensews:nullptr,O,1,I,1,O,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     if constexpr(SPLIT>1){auto reduce=deep_gemm::sm120_split_k_reduce_impl<DgOutput,SPLIT>;reduce<<<(O+255)/256,256,0,c->stream>>>((DgOutput*)c->dgmm1,c->dgdensews,O,1,1,O);}
     dg_bf16_to_float<<<(O+255)/256,256,0,c->stream>>>(y,c->dgmm1,O);return ok(cudaGetLastError(),"attention DeepGEMM launch");
 }
@@ -352,9 +411,9 @@ static int dg_dense_batch(Dev*c,Dsv4CudaTensor*t,const float*x,float*y,int token
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,t->dg_scale,O,I/512,(unsigned long long)O*4,BM,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,aligned_tokens,I/512,(unsigned long long)aligned_tokens*4,BN,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,tokens,(unsigned long long)O*2,16,BM,CU_TENSOR_MAP_SWIZZLE_NONE))return 0;
-    auto gemm=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,0,I,128,128,1,BM,BN,BK,SW,SW,0,STAGES,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,1>;
+    auto gemm=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,0,I,128,128,1,BM,BN,BK,SW,SW,0,STAGES,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,0,I,128,128,1,BM,BN,BK,SW,SW,0,STAGES,128,256,84,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,false,false,false,true,false,EPI,1>;
     if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,SMEM),"batched dense DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,nullptr,O,tokens,I,1,O,0,a,b,sa,sb,d);
+    gemm<<<(c->sms>=170?170:84),384,SMEM,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,nullptr,O,tokens,I,1,O,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     dg_bf16_to_float<<<((long long)tokens*O+255)/256,256,0,c->stream>>>(y,c->dgmm1,tokens*O);return ok(cudaGetLastError(),"batched dense DeepGEMM launch");
 }
 static int dg_dense_batch_dispatch(Dev*c,Dsv4CudaTensor*t,const float*x,float*y,int tokens){
@@ -406,9 +465,9 @@ template<int G> static int dg_attention_wo_a_grouped(Dev*c,Dsv4CudaTensor*t,cons
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,t->dg_scale,N,G*(K/512),(unsigned long long)N*4,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,4,G*(K/512),16,16,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,N,1,(unsigned long long)N*2,16,64,CU_TENSOR_MAP_SWIZZLE_NONE))return 0;
-    auto gemm=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,K,128,128,G,64,16,128,128,128,0,9,128,256,170,deep_gemm::GemmType::Batched,false,DgOutput,DgEpilogue,false,false,false,true,false,64,1>;
+    auto gemm=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,K,128,128,G,64,16,128,128,128,0,9,128,256,170,deep_gemm::GemmType::Batched,false,DgOutput,DgEpilogue,false,false,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,1,K,128,128,G,64,16,128,128,128,0,9,128,256,84,deep_gemm::GemmType::Batched,false,DgOutput,DgEpilogue,false,false,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,95872),"wo_a DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,95872,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,nullptr,N,1,K,1,N,N,a,b,sa,sb,d);
+    gemm<<<(c->sms>=170?170:84),384,95872,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)t->w,(__nv_fp8_e4m3*)c->dga1,nullptr,nullptr,nullptr,N,1,K,1,N,N,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     dg_bf16_to_float<<<(O+255)/256,256,0,c->stream>>>(y,c->dgmm1,O);return ok(cudaGetLastError(),"wo_a DeepGEMM launch");
 }
 static int dg_attention_wo_a(Dev*c,Dsv4CudaTensor*t,const float*x,float*y){
@@ -425,9 +484,9 @@ template<int G> static int dg_moe(Dev*c,Dsv4CudaExpertSet*set,const float*weight
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,M,(unsigned long long)G*8,(unsigned long long)M*4,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc1_dg_scale,N,(unsigned long long)G*32,16384,128,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,N,(unsigned long long)G*M,(unsigned long long)N*2,64,64,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc1=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedMasked,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    auto fc1=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedMasked,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,128,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedMasked,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(fc1,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"DeepGEMM FC1 shared memory"))return 0;
-    fc1<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,a,b,sa,sb,d);
+    fc1<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     int debug=getenv("DSV4_CUDA_DG_PROFILE")&&atoi(getenv("DSV4_CUDA_DG_PROFILE"));if(debug&&!ok(cudaStreamSynchronize(c->stream),"DeepGEMM FC1 sync"))return 0;
     dg_swiglu_quant_masked<<<6,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,c->expert_ids,weight,limit,M);
     if(debug&&!ok(cudaStreamSynchronize(c->stream),"DeepGEMM SwiGLU sync"))return 0;
@@ -436,9 +495,9 @@ template<int G> static int dg_moe(Dev*c,Dsv4CudaExpertSet*set,const float*weight
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa2,M,(unsigned long long)G*4,(unsigned long long)M*4,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc2_dg_scale,N,(unsigned long long)G*16,16384,128,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm2,N,(unsigned long long)G*M,(unsigned long long)N*2,64,64,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc2=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedMasked,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    auto fc2=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedMasked,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,128,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedMasked,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"DeepGEMM FC2 shared memory"))return 0;
-    fc2<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,a,b,sa,sb,d);
+    fc2<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     if(debug&&!ok(cudaStreamSynchronize(c->stream),"DeepGEMM FC2 sync"))return 0;dg_reduce6_masked<<<16,256,0,c->stream>>>(out,c->dgmm2,c->expert_ids,M);if(debug&&!ok(cudaStreamSynchronize(c->stream),"DeepGEMM reduce sync"))return 0;return ok(cudaGetLastError(),"DeepGEMM routed MoE launch");
 }
 template<int G> static int dg_moe_contiguous_fast(Dev*c,Dsv4CudaExpertSet*set,const float*weight,float limit,float*out,int ep_base=-1){constexpr int M=384,N=4096,A=64;
@@ -453,9 +512,9 @@ template<int G> static int dg_moe_contiguous_fast(Dev*c,Dsv4CudaExpertSet*set,co
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,M,8,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc1_dg_scale,N,(unsigned long long)G*32,16384,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc1=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    auto fc1=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(fc1,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"DeepGEMM FC1 shared memory"))return 0;
-    fc1<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,a,b,sa,sb,d);
+    fc1<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     if(ep_base>=0)dg_swiglu_quant_unique_ep<<<6,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,c->expert_ids,ep_base,limit,M,A);
     else dg_swiglu_quant_unique<<<6,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,weight,limit,M,A);
     dg_replicate_expert_rows<<<((long long)M*2048+255)/256,256,0,c->stream>>>(c->dga2,c->dgsfa2,2048,M,A);
@@ -464,20 +523,47 @@ template<int G> static int dg_moe_contiguous_fast(Dev*c,Dsv4CudaExpertSet*set,co
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa2,M,4,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc2_dg_scale,N,(unsigned long long)G*16,16384,128,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm2,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc2=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,128,128,128,128,128,2,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    auto fc2=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,128,128,128,128,128,2,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,128,128,128,128,128,2,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,101376),"DeepGEMM FC2 shared memory"))return 0;
-    fc2<<<170,384,101376,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,a,b,sa,sb,d);
+    fc2<<<(c->sms>=170?170:84),384,101376,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     if(ep_base>=0)dg_reduce6_ep<<<16,256,0,c->stream>>>(out,c->dgmm2,c->expert_ids,weight,ep_base,A);else dg_reduce6<<<16,256,0,c->stream>>>(out,c->dgmm2,A);
     return ok(cudaGetLastError(),"DeepGEMM routed MoE fast launch");
 }
-static int dg_moe_batch_contiguous(Dev*c,Dsv4CudaExpertSet*set,const float*input,const int*ids,const float*weight,int tokens,float limit,float*out){constexpr int N=4096,A=64,G=256;int routes=tokens*6,M=routes*A;size_t a1=(size_t)M*4096,a2=(size_t)M*2048,s1=(size_t)M*8*4,s2=(size_t)M*4*4,mm=(size_t)M*N*2;
+/* ids/weight are DEVICE pointers (uploaded by the caller); host_ids is the
+ * host copy used to build the expert-grouped layout (nullptr = legacy
+ * replicated layout, also DSV4_CUDA_MOE_GROUPED=0). */
+static int dg_moe_batch_contiguous(Dev*c,Dsv4CudaExpertSet*set,const float*input,const int*ids,const float*weight,int tokens,float limit,float*out,const int*host_ids=nullptr){constexpr int N=4096,A=64,G=256;int routes=tokens*6;
+    static int grouped=-1;if(grouped<0){const char*e=getenv("DSV4_CUDA_MOE_GROUPED");grouped=!(e&&*e=='0');}
+    int M=routes*A;
+    std::vector<int> hrow,hlayout;
+    if(host_ids&&grouped){
+        /* Stable bucket by expert: rows per expert padded to A. */
+        int cnt[G]={0};for(int r=0;r<routes;r++){int e=host_ids[r];if(e<0||e>=G)return 0;cnt[e]++;}
+        int base[G];int m=0;for(int e=0;e<G;e++){base[e]=m;if(cnt[e])m+=(cnt[e]+A-1)/A*A;}
+        M=m;hrow.resize(routes);hlayout.assign(M,0);
+        int fill[G]={0};for(int r=0;r<routes;r++){int e=host_ids[r];hrow[r]=base[e]+fill[e]++;}
+        for(int e=0;e<G;e++)if(cnt[e]){int g=(cnt[e]+A-1)/A*A;for(int i=0;i<g;i++)hlayout[base[e]+i]=e;}
+    }
+    size_t a1=(size_t)M*4096,a2=(size_t)M*2048,s1=(size_t)M*8*4,s2=(size_t)M*4*4,mm=(size_t)M*N*2;
     if(set->count!=G||set->H!=4096||set->I!=2048||!buf((void**)&c->dga1,&c->dga1cap,a1)||!buf((void**)&c->dga2,&c->dga2cap,a2)||!buf((void**)&c->dgsfa1,&c->dgsfa1cap,s1)||!buf((void**)&c->dgsfa2,&c->dgsfa2cap,s2)||!buf((void**)&c->dglayout,&c->dglayoutcap,(size_t)M*sizeof(int))||!buf((void**)&c->dgmm1,&c->dgmm1cap,mm)||!buf((void**)&c->dgmm2,&c->dgmm2cap,mm))return 0;
-    dg_layout_routes<<<(M+255)/256,256,0,c->stream>>>(c->dglayout,ids,M,A);dg_quant_routes<<<routes*8,128,0,c->stream>>>(input,c->dga1,c->dgsfa1,tokens,4096,M,A);dg_replicate_expert_rows<<<((long long)M*4096+255)/256,256,0,c->stream>>>(c->dga1,c->dgsfa1,4096,M,A);CUtensorMap a,b,sa,sb,d;
+    bool use_map=!hrow.empty();
+    if(use_map){
+        if(!buf((void**)&c->dgrowmap,&c->dgrowmapcap,(size_t)routes*sizeof(int))||
+           !ok(cudaMemcpyAsync(c->dgrowmap,hrow.data(),(size_t)routes*sizeof(int),cudaMemcpyHostToDevice,c->stream),"grouped MoE rowmap upload")||
+           !ok(cudaMemcpyAsync(c->dglayout,hlayout.data(),(size_t)M*sizeof(int),cudaMemcpyHostToDevice,c->stream),"grouped MoE layout upload")||
+           !ok(cudaMemsetAsync(c->dga1,0,a1,c->stream),"grouped MoE A1 clear")||!ok(cudaMemsetAsync(c->dgsfa1,0,s1,c->stream),"grouped MoE S1 clear")||
+           !ok(cudaMemsetAsync(c->dga2,0,a2,c->stream),"grouped MoE A2 clear")||!ok(cudaMemsetAsync(c->dgsfa2,0,s2,c->stream),"grouped MoE S2 clear"))return 0;
+        dg_quant_routes_map<<<routes*8,128,0,c->stream>>>(input,c->dga1,c->dgsfa1,tokens,4096,M,c->dgrowmap);
+    }else{
+        dg_layout_routes<<<(M+255)/256,256,0,c->stream>>>(c->dglayout,ids,M,A);dg_quant_routes<<<routes*8,128,0,c->stream>>>(input,c->dga1,c->dgsfa1,tokens,4096,M,A);dg_replicate_expert_rows<<<((long long)M*4096+255)/256,256,0,c->stream>>>(c->dga1,c->dgsfa1,4096,M,A);
+    }
+    CUtensorMap a,b,sa,sb,d;
     if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_UINT8,c->dga1,4096,M,4096,128,A,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,set->bank_fc1,4096,(unsigned long long)G*N,2048,128,64,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,M,8,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc1_dg_scale,N,(unsigned long long)G*32,16384,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc1=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;if(!ok(cudaFuncSetAttribute(fc1,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"batched MoE FC1 shared memory"))return 0;fc1<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,a,b,sa,sb,d);
-    dg_swiglu_quant_routes<<<routes,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,weight,limit,routes,M,A);dg_replicate_expert_rows<<<((long long)M*2048+255)/256,256,0,c->stream>>>(c->dga2,c->dgsfa2,2048,M,A);
+    auto fc1=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,4096,128,32,G,64,64,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;if(!ok(cudaFuncSetAttribute(fc1,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"batched MoE FC1 shared memory"))return 0;fc1<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N,4096,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
+    if(use_map)dg_swiglu_quant_routes_map<<<routes,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,weight,limit,routes,M,c->dgrowmap);
+    else{dg_swiglu_quant_routes<<<routes,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,weight,limit,routes,M,A);dg_replicate_expert_rows<<<((long long)M*2048+255)/256,256,0,c->stream>>>(c->dga2,c->dgsfa2,2048,M,A);}
     if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_UINT8,c->dga2,2048,M,2048,128,A,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,set->bank_fc2,2048,(unsigned long long)G*N,1024,128,64,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa2,M,4,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc2_dg_scale,N,(unsigned long long)G*16,16384,64,1,CU_TENSOR_MAP_SWIZZLE_NONE)||!dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm2,N,M,(unsigned long long)N*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc2=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"batched MoE FC2 shared memory"))return 0;fc2<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,a,b,sa,sb,d);dg_reduce_routes<<<((long long)tokens*4096+255)/256,256,0,c->stream>>>(out,c->dgmm2,tokens,A);return ok(cudaGetLastError(),"batched contiguous MoE launch");
+    auto fc2=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N,2048,128,32,G,64,64,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"batched MoE FC2 shared memory"))return 0;fc2<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,N,2048,N,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);if(use_map)dg_reduce_routes_map<<<((long long)tokens*4096+255)/256,256,0,c->stream>>>(out,c->dgmm2,tokens,c->dgrowmap);else dg_reduce_routes<<<((long long)tokens*4096+255)/256,256,0,c->stream>>>(out,c->dgmm2,tokens,A);return ok(cudaGetLastError(),"batched contiguous MoE launch");
 }
 static int dg_moe_tp2(Dev*c,Dsv4CudaExpertSet*set,const float*weight,float limit,float*out){constexpr int G=256,M=384,A=64,H=4096,J=1024,N1=2048;
     int trace=getenv("DSV4_CUDA_TP2_TRACE")&&atoi(getenv("DSV4_CUDA_TP2_TRACE"));
@@ -495,9 +581,9 @@ static int dg_moe_tp2(Dev*c,Dsv4CudaExpertSet*set,const float*weight,float limit
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa1,M,H/512,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc1_dg_scale,N1,(unsigned long long)G*(H/128),(unsigned long long)N1*4,128,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,N1,M,(unsigned long long)N1*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc1=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N1,H,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    auto fc1=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N1,H,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,N1,H,128,32,G,64,128,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(fc1,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"TP2 DeepGEMM FC1 shared memory"))return 0;
-    fc1<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N1,H,N1,0,0,a,b,sa,sb,d);
+    fc1<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(__nv_fp8_e4m3*)c->dga1,(__nv_fp8_e4m3*)set->bank_fc1,c->dglayout,nullptr,nullptr,M,N1,H,N1,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     if(trace){fprintf(stderr,"[DSV4 TP2] device %d FC1 launched\n",c->id);fflush(stderr);if(!ok(cudaStreamSynchronize(c->stream),"TP2 FC1 trace sync"))return 0;fprintf(stderr,"[DSV4 TP2] device %d FC1 done\n",c->id);fflush(stderr);}
     dg_swiglu_quant_unique_tp2<<<6,128,0,c->stream>>>(c->dgmm1,c->dga2,c->dgsfa2,limit,M,A);
     dg_replicate_expert_rows<<<((long long)M*J+255)/256,256,0,c->stream>>>(c->dga2,c->dgsfa2,J,M,A);
@@ -507,9 +593,9 @@ static int dg_moe_tp2(Dev*c,Dsv4CudaExpertSet*set,const float*weight,float limit
        !dg_map(&sa,CU_TENSOR_MAP_DATA_TYPE_INT32,c->dgsfa2,M,J/512,(unsigned long long)M*4,A,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&sb,CU_TENSOR_MAP_DATA_TYPE_INT32,set->bank_fc2_dg_scale,H,(unsigned long long)G*(J/128),(unsigned long long)H*4,128,1,CU_TENSOR_MAP_SWIZZLE_NONE)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm2,H,M,(unsigned long long)H*2,64,A,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto fc2=deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,H,J,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
+    auto fc2=c->sms>=170?deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,H,J,128,32,G,64,128,128,128,128,128,3,128,256,170,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>:deep_gemm::sm120_fp8_fp4_gemm_1d1d_impl<0,H,J,128,32,G,64,128,128,128,128,128,3,128,256,84,deep_gemm::GemmType::MGroupedContiguous,false,DgOutput,DgEpilogue,false,true,false,true,false,64,1>;
     if(!ok(cudaFuncSetAttribute(fc2,cudaFuncAttributeMaxDynamicSharedMemorySize,92672),"TP2 DeepGEMM FC2 shared memory"))return 0;
-    fc2<<<170,384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,H,J,H,0,0,a,b,sa,sb,d);
+    fc2<<<(c->sms>=170?170:84),384,92672,c->stream>>>((DgOutput*)c->dgmm2,nullptr,(__nv_fp8_e4m3*)c->dga2,(__nv_fp8_e4m3*)set->bank_fc2,c->dglayout,nullptr,nullptr,M,H,J,H,0,0,deep_gemm::TmaParamPad48{},a,b,sa,sb,d);
     if(trace){fprintf(stderr,"[DSV4 TP2] device %d FC2 launched\n",c->id);fflush(stderr);if(!ok(cudaStreamSynchronize(c->stream),"TP2 FC2 trace sync"))return 0;fprintf(stderr,"[DSV4 TP2] device %d FC2 done\n",c->id);fflush(stderr);}
     dg_reduce6_weighted<<<16,256,0,c->stream>>>(out,c->dgmm2,weight,A);
     return ok(cudaGetLastError(),"TP2 DeepGEMM routed MoE launch");
@@ -526,6 +612,14 @@ static int dg_dump_once(Dev*c){static int dumped;if(dumped++||!(getenv("DSV4_CUD
 #endif
 __global__ void expert_reduce(float *y,const float *parts,int count,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n){float v=0;
     for(int e=0;e<count;e++)v+=__bfloat162float(__float2bfloat16(parts[(long long)e*n+i]));y[i]=v;}}
+/* Batched siblings of expert_reduce / expert_act(weight=1) for the generic
+ * batched MoE: parts hold `count` rows per token ([t*count+e][n]). */
+__global__ void expert_reduce_rows(float *y,const float *parts,int tokens,int count,int n){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x;
+    if(p<(long long)tokens*n){int t=p/n,i=p%n;float v=0;for(int e=0;e<count;e++)v+=__bfloat162float(__float2bfloat16(parts[((long long)t*count+e)*n+i]));y[p]=v;}}
+__global__ void expert_act_rows1(float *a,const float *g,const float *u,float limit,long long n){long long i=(long long)blockIdx.x*blockDim.x+threadIdx.x;if(i<n){
+    float gg=fminf(__bfloat162float(__float2bfloat16(g[i])),limit);
+    float uu=fmaxf(-limit,fminf(__bfloat162float(__float2bfloat16(u[i])),limit));
+    a[i]=__bfloat162float(__float2bfloat16((gg/(1.f+expf(-gg)))*uu));}}
 __global__ void moe_combine(float *routed,const float *shared,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)
     routed[i]=__bfloat162float(__float2bfloat16(routed[i]+__bfloat162float(__float2bfloat16(shared[i]))));}
 __global__ void ep2_localize(int *ids,float *weights,int base){int k=threadIdx.x;if(k<6){int id=ids[k]-base;if(id<0||id>=128){ids[k]=-1;weights[k]=0.f;}else ids[k]=id;}}
@@ -556,10 +650,469 @@ __global__ void attention_window_kernel(float *context,const float *q,const floa
     int h=blockIdx.x;if(h>=heads)return;extern __shared__ float score[];__shared__ float mx,den;int start=pos-window+1;if(start<0)start=0;int nw=pos-start+1;
     if(!threadIdx.x){mx=sink[h];for(int t=start;t<=pos;t++){float z=0,*v=(float*)cache+(long long)(t%window)*dim;for(int d=0;d<dim;d++)z+=q[(long long)h*dim+d]*v[d];z/=sqrtf((float)dim);score[t-start]=z;mx=fmaxf(mx,z);}for(int i=0;i<cn;i++){float z=0,*v=(float*)compressed+(long long)i*dim;for(int d=0;d<dim;d++)z+=q[(long long)h*dim+d]*v[d];z/=sqrtf((float)dim);score[nw+i]=z;mx=fmaxf(mx,z);}den=expf(sink[h]-mx);for(int i=0;i<nw+cn;i++){float a=expf(score[i]-mx);score[i]=a;den+=a;}}
     __syncthreads();for(int d=threadIdx.x;d<dim;d+=blockDim.x){float sum=0;for(int t=start;t<=pos;t++)sum+=score[t-start]*cache[((long long)(t%window))*dim+d];for(int i=0;i<cn;i++)sum+=score[nw+i]*compressed[(long long)i*dim+d];context[(long long)h*dim+d]=__bfloat162float(__float2bfloat16(sum/den));}}
+/* Prefill batched sparse window attention.  vals is a linear slab of KV rows:
+ * [0, comp_base) window rows in position order, [comp_base, ...) the
+ * compressed rows.  meta[3t] = first window row for token t, meta[3t+1] = its
+ * window row count, meta[3t+2] = its visible compressed prefix.  Numerics
+ * mirror coli_v4_sparse_attention_ref: fp32 scores, max over scores only
+ * (sink joins the denominator, not the max), probabilities rounded to bf16
+ * before the value sum, output rounded to bf16 after the division. */
+/* ---- persistent per-layer KV cache for batched prefill attention ----
+ * The engine rebuilt and re-uploaded the linear KV slab every chunk-layer
+ * (~2 GB PCIe per 826-token prefill). Instead: a per-layer device RING of
+ * window rows (absolute position % window) appended once per chunk, plus an
+ * append-only compressed-prefix buffer. The engine tracks validity by exact
+ * position continuity and reseeds on any mismatch, so no invalidation hooks
+ * are needed here. */
+#define DSV4_KV_CACHE_LAYERS 64
+static float *g_kv_ring[DSV4_KV_CACHE_LAYERS];
+static int g_kv_ring_rows[DSV4_KV_CACHE_LAYERS];
+static float *g_kv_comp[DSV4_KV_CACHE_LAYERS];
+static int g_kv_comp_cap[DSV4_KV_CACHE_LAYERS];
+
+/* Which GPUs this build's kernels can run on. The DeepGEMM build carries
+ * sm_120a-only block-scaled MMA kernels; the generic build is a portable fat
+ * binary of plain CUDA kernels (fp32 compute from fp8/fp4 decode) that runs
+ * on any sm_80+ card. The engine's loader tries the DeepGEMM DLL first and
+ * falls back to the generic one when this says no. */
+extern "C" int dsv4_cuda_backend_arch_ok(int device){
+    cudaDeviceProp prop;
+    if(cudaGetDeviceProperties(&prop,device)!=cudaSuccess){cudaGetLastError();return 0;}
+#ifdef COLI_DSV4_DEEPGEMM
+    return prop.major==12;
+#else
+    return prop.major>=8;
+#endif
+}
+extern "C" const char *dsv4_cuda_backend_name(void){
+#ifdef COLI_DSV4_DEEPGEMM
+    return "deepgemm-sm120";
+#else
+    return "generic";
+#endif
+}
+
+extern "C" long long dsv4_cuda_mem_free_mb(int device){
+    if(!ok(cudaSetDevice(device),"select meminfo device"))return -1;
+    size_t free_b=0,total_b=0;
+    if(!ok(cudaMemGetInfo(&free_b,&total_b),"device meminfo"))return -1;
+    return (long long)(free_b>>20);
+}
+
+extern "C" int dsv4_cuda_kv_ring_append(int device,int layer,const float*rows,
+        int start_pos,int count,int window,int dim){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_pos<0||count<1||
+       window<1||dim<1||!ok(cudaSetDevice(device),"select kv ring device"))return 0;
+    if(g_kv_ring[layer]&&g_kv_ring_rows[layer]!=window){cudaFree(g_kv_ring[layer]);g_kv_ring[layer]=NULL;}
+    if(!g_kv_ring[layer]){
+        if(!ok(cudaMalloc((void**)&g_kv_ring[layer],(size_t)window*dim*4),"kv ring allocation"))return 0;
+        g_kv_ring_rows[layer]=window;
+    }
+    int done=0;
+    while(done<count){
+        int slot=(start_pos+done)%window;
+        int run=count-done;if(run>window-slot)run=window-slot;
+        if(!ok(cudaMemcpyAsync(g_kv_ring[layer]+(size_t)slot*dim,rows+(size_t)done*dim,
+                               (size_t)run*dim*4,cudaMemcpyHostToDevice,c->stream),"kv ring append"))return 0;
+        done+=run;
+    }
+    return 1;
+}
+
+extern "C" int dsv4_cuda_kv_comp_append(int device,int layer,const float*rows,
+        int start_idx,int count,int dim){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!rows||start_idx<0||count<1||dim<1||
+       !ok(cudaSetDevice(device),"select kv comp device"))return 0;
+    int need=start_idx+count;
+    if(g_kv_comp_cap[layer]<need){
+        int cap=g_kv_comp_cap[layer]?g_kv_comp_cap[layer]:512;
+        while(cap<need)cap*=2;
+        float*grown=NULL;
+        if(!ok(cudaMalloc((void**)&grown,(size_t)cap*dim*4),"kv comp allocation"))return 0;
+        if(g_kv_comp[layer]&&start_idx&&
+           !ok(cudaMemcpyAsync(grown,g_kv_comp[layer],(size_t)start_idx*dim*4,
+                               cudaMemcpyDeviceToDevice,c->stream),"kv comp grow copy")){cudaFree(grown);return 0;}
+        if(g_kv_comp[layer]){cudaStreamSynchronize(c->stream);cudaFree(g_kv_comp[layer]);}
+        g_kv_comp[layer]=grown;g_kv_comp_cap[layer]=cap;
+    }
+    return ok(cudaMemcpyAsync(g_kv_comp[layer]+(size_t)start_idx*dim,rows,
+                              (size_t)count*dim*4,cudaMemcpyHostToDevice,c->stream),"kv comp append");
+}
+
+/* Window rows at absolute position >= chunk_start come from the chunk buffer,
+ * not the ring: with the ring indexed position%window, appending the chunk
+ * before attention would let its newest rows overwrite the oldest window rows
+ * that early chunk tokens still need (only bites once start+batch > window).
+ * The engine appends the chunk to the ring AFTER attention instead. */
+__device__ __forceinline__ const float*cached_row(const float*win,const float*chunk,
+        int ap,int chunk_start,int window,int dim){
+    return ap>=chunk_start?chunk+(long long)(ap-chunk_start)*dim
+                          :win+(long long)(ap%window)*dim;
+}
+
+__global__ void sparse_attn_batch_cached_kernel(float*out,const float*q,const float*win,
+        const float*chunk,const float*comp,const float*sink,const int*meta,int abs_base,
+        int chunk_start,int window,int heads,int dim,float scale){
+    int t=blockIdx.y,h=blockIdx.x;
+    int wo=meta[3*t],wn=meta[3*t+1],cn=meta[3*t+2],total=wn+cn;
+    const float*qh=q+((long long)t*heads+h)*dim;
+    extern __shared__ float score[];
+    __shared__ float den;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    for(int item=warp;item<total;item+=blockDim.x/32){
+        const float*v=item<wn?cached_row(win,chunk,abs_base+wo+item,chunk_start,window,dim)
+                              :comp+(long long)(item-wn)*dim;
+        float z=0;for(int d=lane;d<dim;d+=32)z+=qh[d]*v[d];
+        for(int n=16;n;n>>=1)z+=__shfl_down_sync(0xffffffff,z,n);
+        if(!lane)score[item]=z*scale;
+    }
+    __syncthreads();
+    if(!threadIdx.x){float m=-INFINITY;for(int i=0;i<total;i++)m=fmaxf(m,score[i]);
+        float d0=expf(sink[h]-m);
+        for(int i=0;i<total;i++){float a=expf(score[i]-m);d0+=a;score[i]=__bfloat162float(__float2bfloat16(a));}
+        den=d0;}
+    __syncthreads();
+    for(int d=threadIdx.x;d<dim;d+=blockDim.x){
+        float sum=0;
+        for(int i=0;i<wn;i++)sum+=score[i]*cached_row(win,chunk,abs_base+wo+i,chunk_start,window,dim)[d];
+        for(int i=0;i<cn;i++)sum+=score[wn+i]*comp[(long long)i*dim+d];
+        out[((long long)t*heads+h)*dim+d]=__bfloat162float(__float2bfloat16(sum/den));
+    }
+}
+
+extern "C" int dsv4_cuda_sparse_attn_batch_cached(int device,int layer,const float*q,
+        const float*chunk,int chunk_start,const float*sinks,const int*meta,int abs_base,
+        int comp_limit,int heads,int dim,int tokens,float scale,float*out){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||!q||!chunk||!sinks||
+       !meta||!out||abs_base<0||chunk_start<0||heads<1||dim<1||tokens<1||!(scale>0.f))return 0;
+    if(comp_limit>0&&(!g_kv_comp[layer]||g_kv_comp_cap[layer]<comp_limit))return 0;
+    int window=g_kv_ring_rows[layer],max_total=0;
+    for(int t=0;t<tokens;t++){
+        int wn=meta[3*t+1],cn=meta[3*t+2],tt=wn+cn;
+        if(meta[3*t]<0||wn<1||wn>window||cn<0||cn>comp_limit)return 0;
+        if(abs_base+meta[3*t]+wn>chunk_start+tokens)return 0;
+        if(tt>max_total)max_total=tt;
+    }
+    size_t qb=(size_t)tokens*heads*dim*4,cb=(size_t)tokens*dim*4,sb=(size_t)heads*4,
+           mb=(size_t)tokens*3*sizeof(int),sm=(size_t)max_total*4;
+    if(sm>96*1024)return 0;
+    if(!ok(cudaSetDevice(device),"select cached sparse attention device")||
+       !buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,qb)||
+       !buf((void**)&c->p3,&c->p3cap,cb)||
+       !buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb))return 0;
+    if(!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"cached attention query upload")||
+       !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"cached attention chunk upload")||
+       !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached attention sink upload")||
+       !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached attention meta upload"))return 0;
+    sparse_attn_batch_cached_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
+        c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,
+        abs_base,chunk_start,window,heads,dim,scale);
+    return ok(cudaGetLastError(),"cached sparse attention launch")&&
+           ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"cached attention download")&&
+           ok(cudaStreamSynchronize(c->stream),"cached sparse attention sync");
+}
+
+/* Indexed variant: past index_topk the indexer selects a strict subset of the
+ * compressed prefix, so meta[3t+2] becomes the SELECTED count and sel holds
+ * each token's compressed ordinals (score order — the same order the CPU
+ * reference accumulates, keeping fp32 sums bitwise identical). */
+__global__ void sparse_attn_batch_cached_idx_kernel(float*out,const float*q,const float*win,
+        const float*chunk,const float*comp,const float*sink,const int*meta,const int*sel,
+        int selstride,int abs_base,int chunk_start,int window,int heads,int dim,float scale){
+    int t=blockIdx.y,h=blockIdx.x;
+    int wo=meta[3*t],wn=meta[3*t+1],cn=meta[3*t+2],total=wn+cn;
+    const int*ts=sel+(long long)t*selstride;
+    const float*qh=q+((long long)t*heads+h)*dim;
+    extern __shared__ float score[];
+    __shared__ float den;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    for(int item=warp;item<total;item+=blockDim.x/32){
+        const float*v=item<wn?cached_row(win,chunk,abs_base+wo+item,chunk_start,window,dim)
+                              :comp+(long long)ts[item-wn]*dim;
+        float z=0;for(int d=lane;d<dim;d+=32)z+=qh[d]*v[d];
+        for(int n=16;n;n>>=1)z+=__shfl_down_sync(0xffffffff,z,n);
+        if(!lane)score[item]=z*scale;
+    }
+    __syncthreads();
+    if(!threadIdx.x){float m=-INFINITY;for(int i=0;i<total;i++)m=fmaxf(m,score[i]);
+        float d0=expf(sink[h]-m);
+        for(int i=0;i<total;i++){float a=expf(score[i]-m);d0+=a;score[i]=__bfloat162float(__float2bfloat16(a));}
+        den=d0;}
+    __syncthreads();
+    for(int d=threadIdx.x;d<dim;d+=blockDim.x){
+        float sum=0;
+        for(int i=0;i<wn;i++)sum+=score[i]*cached_row(win,chunk,abs_base+wo+i,chunk_start,window,dim)[d];
+        for(int i=0;i<cn;i++)sum+=score[wn+i]*comp[(long long)ts[i]*dim+d];
+        out[((long long)t*heads+h)*dim+d]=__bfloat162float(__float2bfloat16(sum/den));
+    }
+}
+
+extern "C" int dsv4_cuda_sparse_attn_batch_cached_idx(int device,int layer,const float*q,
+        const float*chunk,int chunk_start,const float*sinks,const int*meta,const int*sel,
+        int selstride,int abs_base,int comp_limit,int heads,int dim,int tokens,
+        float scale,float*out){
+    Dev*c=ctx(device);
+    if(!c||layer<0||layer>=DSV4_KV_CACHE_LAYERS||!g_kv_ring[layer]||!q||!chunk||!sinks||
+       !meta||!sel||selstride<1||!out||abs_base<0||chunk_start<0||heads<1||dim<1||
+       tokens<1||!(scale>0.f))return 0;
+    if(comp_limit>0&&(!g_kv_comp[layer]||g_kv_comp_cap[layer]<comp_limit))return 0;
+    int window=g_kv_ring_rows[layer],max_total=0;
+    for(int t=0;t<tokens;t++){
+        int wn=meta[3*t+1],cn=meta[3*t+2],tt=wn+cn;
+        if(meta[3*t]<0||wn<1||wn>window||cn<0||cn>selstride||cn>comp_limit)return 0;
+        if(abs_base+meta[3*t]+wn>chunk_start+tokens)return 0;
+        for(int i=0;i<cn;i++){int o=sel[(long long)t*selstride+i];if(o<0||o>=comp_limit)return 0;}
+        if(tt>max_total)max_total=tt;
+    }
+    size_t qb=(size_t)tokens*heads*dim*4,cb=(size_t)tokens*dim*4,sb=(size_t)heads*4,
+           mb=(size_t)tokens*3*sizeof(int),ib=(size_t)tokens*selstride*sizeof(int),
+           sm=(size_t)max_total*4;
+    if(sm>96*1024)return 0;
+    if(!ok(cudaSetDevice(device),"select cached idx sparse attention device")||
+       !buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p4,&c->p4cap,qb)||
+       !buf((void**)&c->p3,&c->p3cap,cb)||
+       !buf((void**)&c->aux1,&c->aux1cap,sb)||!buf((void**)&c->aux2,&c->aux2cap,mb)||
+       !buf((void**)&c->aux3,&c->aux3cap,ib))return 0;
+    if(!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"cached idx attention query upload")||
+       !ok(cudaMemcpyAsync(c->p3,chunk,cb,cudaMemcpyHostToDevice,c->stream),"cached idx attention chunk upload")||
+       !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"cached idx attention sink upload")||
+       !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"cached idx attention meta upload")||
+       !ok(cudaMemcpyAsync(c->aux3,sel,ib,cudaMemcpyHostToDevice,c->stream),"cached idx attention index upload"))return 0;
+    sparse_attn_batch_cached_idx_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(
+        c->p4,c->p2,g_kv_ring[layer],c->p3,g_kv_comp[layer],c->aux1,(int*)c->aux2,(int*)c->aux3,
+        selstride,abs_base,chunk_start,window,heads,dim,scale);
+    return ok(cudaGetLastError(),"cached idx sparse attention launch")&&
+           ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"cached idx attention download")&&
+           ok(cudaStreamSynchronize(c->stream),"cached idx sparse attention sync");
+}
+
+/* Batched indexer scoring for prefill. One thread per (token, candidate):
+ * score = sum_h relu(q_h . k) * w_h with the SAME sequential fp32 order as the
+ * CPU reference (dims inner, heads outer, separately rounded mul/add) so the
+ * host-side top-k sort sees bitwise-identical scores. queries [tokens][heads*dim]
+ * (already hadamard/fp4-rounded), keys [count][dim], head_w [tokens][heads],
+ * counts[t] = candidates visible to token t. Candidates >= counts[t] get 0. */
+__global__ void indexer_score_kernel(float*scores,const float*queries,const float*keys,
+        const float*head_w,const int*counts,int heads,int dim,int count){
+    int t=blockIdx.y,c=blockIdx.x*blockDim.x+threadIdx.x;
+    extern __shared__ float qs[];
+    int qn=heads*dim;
+    for(int i=threadIdx.x;i<qn;i+=blockDim.x)qs[i]=queries[(long long)t*qn+i];
+    __syncthreads();
+    if(c>=count)return;
+    float score=0.f;
+    if(c<counts[t]){
+        const float*k=keys+(long long)c*dim;
+        for(int h=0;h<heads;h++){
+            const float*q=qs+h*dim;
+            float dot=0.f;
+            /* The CPU build (MinGW GCC, -O3 -march=native) does NOT contract
+             * these into FMAs — measured — so keep mul and add separately
+             * rounded here too. */
+            for(int i=0;i<dim;i++)dot=__fadd_rn(dot,__fmul_rn(q[i],k[i]));
+            score=__fadd_rn(score,__fmul_rn(fmaxf(dot,0.f),head_w[(long long)t*heads+h]));
+        }
+    }
+    scores[(long long)t*count+c]=score;
+}
+
+extern "C" int dsv4_cuda_indexer_score_batch(int device,const float*queries,const float*keys,
+        const float*head_w,const int*counts,int tokens,int heads,int dim,int count,
+        float*scores){
+    Dev*c=ctx(device);
+    if(!c||!queries||!keys||!head_w||!counts||!scores||tokens<1||heads<1||dim<1||count<1)return 0;
+    size_t qb=(size_t)tokens*heads*dim*4,kb=(size_t)count*dim*4,wb=(size_t)tokens*heads*4,
+           cb=(size_t)tokens*sizeof(int),sb=(size_t)tokens*count*4,sm=(size_t)heads*dim*4;
+    if(sm>96*1024)return 0;
+    if(!ok(cudaSetDevice(device),"select indexer score device")||
+       !buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p3,&c->p3cap,kb)||
+       !buf((void**)&c->p4,&c->p4cap,sb)||!buf((void**)&c->aux1,&c->aux1cap,wb)||
+       !buf((void**)&c->aux2,&c->aux2cap,cb))return 0;
+    if(!ok(cudaMemcpyAsync(c->p2,queries,qb,cudaMemcpyHostToDevice,c->stream),"indexer query upload")||
+       !ok(cudaMemcpyAsync(c->p3,keys,kb,cudaMemcpyHostToDevice,c->stream),"indexer key upload")||
+       !ok(cudaMemcpyAsync(c->aux1,head_w,wb,cudaMemcpyHostToDevice,c->stream),"indexer head weight upload")||
+       !ok(cudaMemcpyAsync(c->aux2,counts,cb,cudaMemcpyHostToDevice,c->stream),"indexer count upload"))return 0;
+    if(sm>48*1024&&cudaFuncSetAttribute(indexer_score_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm)!=cudaSuccess)return 0;
+    indexer_score_kernel<<<dim3((count+127)/128,tokens),128,sm,c->stream>>>(
+        c->p4,c->p2,c->p3,c->aux1,(int*)c->aux2,heads,dim,count);
+    return ok(cudaGetLastError(),"indexer score launch")&&
+           ok(cudaMemcpyAsync(scores,c->p4,sb,cudaMemcpyDeviceToHost,c->stream),"indexer score download")&&
+           ok(cudaStreamSynchronize(c->stream),"indexer score sync");
+}
+
+/* Exact replica of the CPU reference matmul_fp8 (quant.h): per output row,
+ * per 128-column block a sequential fp32 accumulate of e4m3(w)*x, then a
+ * DOUBLE accumulate of block*scale across blocks, cast to float. Separately
+ * rounded mul/add (the CPU build does not contract to FMA), so results are
+ * bitwise the reference. x is the fp8-qdq'd activation (done on the host).
+ * One thread per (row, token); tokens are the fast dimension so the 64
+ * threads of a token block broadcast-read the same weight bytes. */
+__device__ __forceinline__ float e4m3_dev(uint8_t b){
+    int s=b>>7,e=(b>>3)&15,m=b&7;
+    float v;
+    if(e==15&&m==7)v=__int_as_float(0x7fc00000);          /* nan */
+    else if(e==0)v=ldexpf((float)m/8.f,-6);
+    else v=ldexpf(1.f+(float)m/8.f,e-7);
+    return s?-v:v;
+}
+__global__ void fp8_ref_matmul_kernel(float*y,const uint8_t*w,const float*bscale,
+        const float*x,int rows,int cols,int tokens){
+    int t=threadIdx.x,o=blockIdx.x;
+    if(t>=tokens||o>=rows)return;
+    const uint8_t*wr=w+(long long)o*cols;
+    const float*xs=x+(long long)t*cols;
+    int nblk=(cols+127)/128;
+    const float*scl=bscale+(long long)(o/128)*nblk;
+    double a=0.0;
+    for(int bi=0;bi*128<cols;bi++){
+        int base=bi*128,blen=cols-base<128?cols-base:128;
+        float acc=0.f;
+        for(int i=base;i<base+blen;i++)acc=__fadd_rn(acc,__fmul_rn(e4m3_dev(wr[i]),xs[i]));
+        a=__dadd_rn(a,__dmul_rn((double)acc,(double)scl[bi]));
+    }
+    y[(long long)t*rows+o]=__double2float_rn(a);
+}
+
+/* rows8-PACKED replica: the resident CPU layout stores 8 consecutive rows'
+ * bytes per column ((tile*cols+col)*8 + r) and the AVX2 reference kernel
+ * accumulates sum += (x*w)*scale in fp32 sequentially over ALL columns (no
+ * per-block double). Same order here, so bitwise the AVX2 path. */
+__global__ void fp8_ref_matmul_rows8_kernel(float*y,const uint8_t*w,const float*bscale,
+        const float*x,int rows,int cols,int tokens){
+    int t=threadIdx.x,o=blockIdx.x;
+    if(t>=tokens||o>=rows)return;
+    const float*xs=x+(long long)t*cols;
+    int nblk=cols/128;
+    const float*scl=bscale+(long long)(o/128)*nblk;
+    long long tile=o>>3;int r=o&7;
+    float sum=0.f;
+    for(int base=0;base<cols;base+=128){
+        float sc=scl[base/128];
+        for(int i=base;i<base+128;i++){
+            float v=e4m3_dev(w[((tile*cols)+i)*8+r]);
+            sum=__fadd_rn(sum,__fmul_rn(__fmul_rn(xs[i],v),sc));
+        }
+    }
+    y[(long long)t*rows+o]=sum;
+}
+
+extern "C" int dsv4_cuda_fp8_ref_matmul(int device,const uint8_t*w,const float*bscale,
+        int rows,int cols,int packed_rows8,const float*x,int tokens,float*y){
+    Dev*c=ctx(device);
+    if(!c||!w||!bscale||!x||!y||rows<1||cols<1||cols%128||tokens<1||tokens>1024||
+       (packed_rows8&&rows%8))return 0;
+    size_t wb=(size_t)rows*cols,sb=(size_t)((rows+127)/128)*(cols/128)*4,
+           xb=(size_t)tokens*cols*4,yb=(size_t)tokens*rows*4;
+    if(!ok(cudaSetDevice(device),"select fp8 ref matmul device")||
+       !buf((void**)&c->p1,&c->p1cap,wb)||!buf((void**)&c->aux1,&c->aux1cap,sb)||
+       !buf((void**)&c->p2,&c->p2cap,xb)||!buf((void**)&c->p4,&c->p4cap,yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->p1,w,wb,cudaMemcpyHostToDevice,c->stream),"fp8 ref weight upload")||
+       !ok(cudaMemcpyAsync(c->aux1,bscale,sb,cudaMemcpyHostToDevice,c->stream),"fp8 ref scale upload")||
+       !ok(cudaMemcpyAsync(c->p2,x,xb,cudaMemcpyHostToDevice,c->stream),"fp8 ref activation upload"))return 0;
+    int threads=tokens<32?32:((tokens+31)/32)*32;
+    if(packed_rows8)
+        fp8_ref_matmul_rows8_kernel<<<rows,threads,0,c->stream>>>(c->p4,(const uint8_t*)c->p1,c->aux1,c->p2,rows,cols,tokens);
+    else
+        fp8_ref_matmul_kernel<<<rows,threads,0,c->stream>>>(c->p4,(const uint8_t*)c->p1,c->aux1,c->p2,rows,cols,tokens);
+    return ok(cudaGetLastError(),"fp8 ref matmul launch")&&
+           ok(cudaMemcpyAsync(y,c->p4,yb,cudaMemcpyDeviceToHost,c->stream),"fp8 ref matmul download")&&
+           ok(cudaStreamSynchronize(c->stream),"fp8 ref matmul sync");
+}
+
+__global__ void sparse_attn_batch_kernel(float*out,const float*q,const float*vals,const float*sink,
+        const int*meta,int comp_base,int heads,int dim,float scale){
+    int t=blockIdx.y,h=blockIdx.x;
+    int wo=meta[3*t],wn=meta[3*t+1],cn=meta[3*t+2],total=wn+cn;
+    const float*qh=q+((long long)t*heads+h)*dim;
+    extern __shared__ float score[];
+    __shared__ float den;
+    int warp=threadIdx.x>>5,lane=threadIdx.x&31;
+    for(int item=warp;item<total;item+=blockDim.x/32){
+        const float*v=vals+(long long)(item<wn?wo+item:comp_base+item-wn)*dim;
+        float z=0;for(int d=lane;d<dim;d+=32)z+=qh[d]*v[d];
+        for(int n=16;n;n>>=1)z+=__shfl_down_sync(0xffffffff,z,n);
+        if(!lane)score[item]=z*scale;
+    }
+    __syncthreads();
+    if(!threadIdx.x){float m=-INFINITY;for(int i=0;i<total;i++)m=fmaxf(m,score[i]);
+        float d0=expf(sink[h]-m);
+        for(int i=0;i<total;i++){float a=expf(score[i]-m);d0+=a;score[i]=__bfloat162float(__float2bfloat16(a));}
+        den=d0;}
+    __syncthreads();
+    for(int d=threadIdx.x;d<dim;d+=blockDim.x){
+        float sum=0;
+        for(int i=0;i<wn;i++)sum+=score[i]*vals[(long long)(wo+i)*dim+d];
+        for(int i=0;i<cn;i++)sum+=score[wn+i]*vals[(long long)(comp_base+i)*dim+d];
+        out[((long long)t*heads+h)*dim+d]=__bfloat162float(__float2bfloat16(sum/den));
+    }
+}
+extern "C" int dsv4_cuda_sparse_attn_batch(int device,const float*q,const float*vals,const float*sinks,
+        const int*meta,int value_rows,int comp_base,int heads,int dim,int tokens,float scale,float*out){
+    Dev*c=ctx(device);
+    if(!c||!q||!vals||!sinks||!meta||!out||value_rows<1||comp_base<0||comp_base>value_rows||
+       heads<1||dim<1||tokens<1||!(scale>0.f))return 0;
+    int max_total=0;
+    for(int t=0;t<tokens;t++){
+        int wn=meta[3*t+1],cn=meta[3*t+2],tt=wn+cn;
+        if(meta[3*t]<0||wn<1||cn<0||meta[3*t]+wn>comp_base||comp_base+cn>value_rows)return 0;
+        if(tt>max_total)max_total=tt;
+    }
+    size_t qb=(size_t)tokens*heads*dim*4,vb=(size_t)value_rows*dim*4,sb=(size_t)heads*4,
+           mb=(size_t)tokens*3*sizeof(int),sm=(size_t)max_total*4;
+    if(sm>96*1024)return 0;
+    if(!ok(cudaSetDevice(device),"select batched sparse attention device")||
+       !buf((void**)&c->p2,&c->p2cap,qb)||!buf((void**)&c->p1,&c->p1cap,vb)||
+       !buf((void**)&c->p4,&c->p4cap,qb)||!buf((void**)&c->aux1,&c->aux1cap,sb)||
+       !buf((void**)&c->aux2,&c->aux2cap,mb))return 0;
+    if(!ok(cudaMemcpyAsync(c->p2,q,qb,cudaMemcpyHostToDevice,c->stream),"batched attention query upload")||
+       !ok(cudaMemcpyAsync(c->p1,vals,vb,cudaMemcpyHostToDevice,c->stream),"batched attention KV upload")||
+       !ok(cudaMemcpyAsync(c->aux1,sinks,sb,cudaMemcpyHostToDevice,c->stream),"batched attention sink upload")||
+       !ok(cudaMemcpyAsync(c->aux2,meta,mb,cudaMemcpyHostToDevice,c->stream),"batched attention meta upload"))return 0;
+    if(sm>48*1024&&!ok(cudaFuncSetAttribute(sparse_attn_batch_kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)sm),"batched sparse attention shared memory"))return 0;
+    sparse_attn_batch_kernel<<<dim3(heads,tokens),256,sm,c->stream>>>(c->p4,c->p2,c->p1,c->aux1,(int*)c->aux2,comp_base,heads,dim,scale);
+    return ok(cudaGetLastError(),"batched sparse attention launch")&&
+           ok(cudaMemcpyAsync(out,c->p4,qb,cudaMemcpyDeviceToHost,c->stream),"batched attention context download")&&
+           ok(cudaStreamSynchronize(c->stream),"batched sparse attention sync");
+}
+/* Prefill batch GEMM over a resident bf16 matrix (compressor / indexer
+ * projections).  Same tiling as mm_batch; numerics match the CPU reference:
+ * bf16-decoded weights, fp32 accumulation, no activation quantization. */
+__global__ void mm_bf16_batch(const __nv_bfloat16*w,const float*x,float*y,int O,int I,int T){
+    int o=blockIdx.x;if(o>=O)return;int tbase=blockIdx.y*16,tcount=T-tbase<16?T-tbase:16;
+    float sum[16]={};
+    for(int i=threadIdx.x;i<I;i+=blockDim.x){float v=__bfloat162float(w[(long long)o*I+i]);
+        #pragma unroll
+        for(int t=0;t<16;t++)if(t<tcount)sum[t]+=x[(long long)(tbase+t)*I+i]*v;}
+    __shared__ float s[16][256];
+    #pragma unroll
+    for(int t=0;t<16;t++)s[t][threadIdx.x]=sum[t];
+    __syncthreads();
+    for(int n=128;n;n>>=1){if(threadIdx.x<n){
+        #pragma unroll
+        for(int t=0;t<16;t++)s[t][threadIdx.x]+=s[t][threadIdx.x+n];}__syncthreads();}
+    if(!threadIdx.x)for(int t=0;t<tcount;t++)y[(long long)(tbase+t)*O+o]=s[t][0];
+}
+extern "C" int dsv4_cuda_matmul_bf16_batch(Dsv4CudaTensor*t,const float*x,int tokens,float*y){
+    Dev*c=t?ctx(t->device):nullptr;
+    if(!c||!x||!y||tokens<1||t->fmt!=16||!ok(cudaSetDevice(t->device),"select bf16 batch device"))return 0;
+    size_t xb=(size_t)tokens*t->I*4,yb=(size_t)tokens*t->O*4;
+    if(!buf((void**)&c->dx,&c->xcap,xb)||!buf((void**)&c->dy,&c->ycap,yb))return 0;
+    if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"bf16 batch upload"))return 0;
+    mm_bf16_batch<<<dim3(t->O,(tokens+15)/16),256,0,c->stream>>>((__nv_bfloat16*)t->w,c->dx,c->dy,t->O,t->I,tokens);
+    return ok(cudaGetLastError(),"bf16 batch launch")&&
+           ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"bf16 batch download")&&
+           ok(cudaStreamSynchronize(c->stream),"bf16 batch sync");
+}
 __device__ __forceinline__ int decode_pos(const int *state){return state[1];}
 __device__ __forceinline__ int compression_ready(const int *state,int ratio){return ratio&&decode_pos(state)%ratio==ratio-1;}
 __global__ void rope_heads_dynamic(float*x,int heads,int dim,int rope,const int*state,int delta,int inverse,int predicate,const float*cs,const float*sn){if(predicate&&!compression_ready(state,predicate))return;int pos=decode_pos(state)+delta,p=blockIdx.x*blockDim.x+threadIdx.x,pairs=rope/2;if(p<heads*pairs){int h=p/pairs,k=p%pairs,off=h*dim+dim-rope+2*k;float s=inverse?-sn[(long long)pos*pairs+k]:sn[(long long)pos*pairs+k],u=x[off],v=x[off+1];x[off]=__bfloat162float(__float2bfloat16(u*cs[(long long)pos*pairs+k]-v*s));x[off+1]=__bfloat162float(__float2bfloat16(u*s+v*cs[(long long)pos*pairs+k]));}}
 __global__ void cache_store_dynamic(float*cache,const float*kv,const int*state,int window,int dim){int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<dim)cache[(long long)(decode_pos(state)%window)*dim+d]=kv[d];}
+/* Unconditional, not FLASHINFER-gated: the DeepGEMM batched wo path
+ * (dsv4_cuda_wo) launches these too, and a DEEPGEMM=1 FLASHINFER=0 build
+ * otherwise fails to compile. */
 __global__ void gather_group_rows(float*out,const float*in,int tokens,int groups,int width,int group){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*width;if(p<n){int row=p/width,col=p%width;out[p]=in[((long long)row*groups+group)*width+col];}}
 __global__ void scatter_group_rows(float*out,const float*in,int tokens,int groups,int width,int group){long long p=(long long)blockIdx.x*blockDim.x+threadIdx.x,n=(long long)tokens*width;if(p<n){int row=p/width,col=p%width;out[((long long)row*groups+group)*width+col]=in[p];}}
 __global__ void compress_store_dynamic(float*values,float*scores,const float*v,const float*g,const float*ape,const int*state,int ratio,int overlap,int O){int d=blockIdx.x*blockDim.x+threadIdx.x;if(d<O){int phase=decode_pos(state)%ratio,slot=(overlap?ratio:0)+phase;values[(long long)slot*O+d]=v[d];scores[(long long)slot*O+d]=g[d]+ape[(long long)phase*O+d];}}
@@ -641,7 +1194,7 @@ __global__ void final_mhc_coeff(float*pre,const float*res,const float*fn,const f
     for(int k=128;k;k>>=1){if(threadIdx.x<k)for(int m=0;m<=M;m++)sum[m][threadIdx.x]+=sum[m][threadIdx.x+k];__syncthreads();}if(threadIdx.x<M){float inv=rsqrtf(sum[0][0]/MH+eps);pre[threadIdx.x]=1.f/(1.f+expf(-(sum[threadIdx.x+1][0]*inv*scale[0]+base[threadIdx.x])))+pre_eps;}}
 __global__ void final_mhc_mix(float*out,const float*res,const float*pre,int M,int H){int h=blockIdx.x*blockDim.x+threadIdx.x;if(h<H){float v=0;for(int m=0;m<M;m++)v+=pre[m]*res[(long long)m*H+h];out[h]=__bfloat162float(__float2bfloat16(v));}}
 
-extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!bok(cublasLtCreate(&g[i].lt),"cuBLASLt create")||!ok(cudaMalloc(&g[i].tc_workspace,32<<20),"Tensor Core workspace")||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return 0;g[i].id=dev[i];ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return 0;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return 0;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled)return ok(e,"enable peer access");}}
+extern "C" int dsv4_cuda_init(const int *dev,int n){if(n<1||n>16)return 0;float scale[256];for(int b=0;b<256;b++)scale[b]=b?ldexpf(1.f,b-127):ldexpf(1.f,-127);ng=0;for(int i=0;i<n;i++){cudaDeviceProp p{};if(!ok(cudaSetDevice(dev[i]),"select device")||!ok(cudaMemcpyToSymbol(e8_table,scale,sizeof(scale)),"scale table upload")||!ok(cudaGetDeviceProperties(&p,dev[i]),"device properties")||!ok(cudaStreamCreateWithFlags(&g[i].stream,cudaStreamNonBlocking),"stream")||!ok(cudaStreamCreateWithFlags(&g[i].aux,cudaStreamNonBlocking),"aux stream")||!ok(cudaEventCreateWithFlags(&g[i].ready,cudaEventDisableTiming),"device event")||!ok(cudaEventCreateWithFlags(&g[i].fork,cudaEventDisableTiming),"fork event")||!ok(cudaEventCreateWithFlags(&g[i].join,cudaEventDisableTiming),"join event")||!bok(cublasLtCreate(&g[i].lt),"cuBLASLt create")||!ok(cudaMalloc(&g[i].tc_workspace,32<<20),"Tensor Core workspace")||!ok(cudaMalloc(&g[i].decode_state,2*sizeof(int)),"decode state allocation"))return 0;g[i].id=dev[i];g[i].sms=p.multiProcessorCount;ng++;fprintf(stderr,"[DSV4 CUDA] device %d: %s %.1f GB sm_%d%d\n",dev[i],p.name,p.totalGlobalMem/1e9,p.major,p.minor);}for(int i=0;i<n;i++)for(int j=0;j<n;j++)if(i!=j){int can=0;if(!ok(cudaDeviceCanAccessPeer(&can,dev[i],dev[j]),"peer query"))return 0;if(can){if(!ok(cudaSetDevice(dev[i]),"select peer device"))return 0;cudaError_t e=cudaDeviceEnablePeerAccess(dev[j],0);if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled)return ok(e,"enable peer access");}}
 #ifdef COLI_DSV4_NCCL
     if(n==6)for(int pair=0;pair<3;pair++){int ids[2]={dev[2*pair],dev[2*pair+1]};ncclComm_t comm[2];if(!nok(ncclCommInitAll(comm,2,ids),"EP2 communicator init"))return 0;g[2*pair].ep_comm=comm[0];g[2*pair+1].ep_comm=comm[1];}
 #endif
@@ -655,7 +1208,7 @@ extern "C" void dsv4_cuda_shutdown(void){
     }
     for(int i=0;i<ng;i++){cudaSetDevice(g[i].id);if(g[i].dx)cudaFree(g[i].dx);if(g[i].dy)cudaFree(g[i].dy);if(g[i].p1)cudaFree(g[i].p1);if(g[i].p2)cudaFree(g[i].p2);if(g[i].p3)cudaFree(g[i].p3);if(g[i].p4)cudaFree(g[i].p4);if(g[i].aux1)cudaFree(g[i].aux1);if(g[i].aux2)cudaFree(g[i].aux2);if(g[i].aux3)cudaFree(g[i].aux3);if(g[i].mvdesc)cudaFree(g[i].mvdesc);if(g[i].expert_weights)cudaFree(g[i].expert_weights);if(g[i].expert_ids)cudaFree(g[i].expert_ids);if(g[i].tcw)cudaFree(g[i].tcw);if(g[i].tcs)cudaFree(g[i].tcs);if(g[i].tcx)cudaFree(g[i].tcx);if(g[i].tcxs)cudaFree(g[i].tcxs);if(g[i].tc_workspace)cudaFree(g[i].tc_workspace);
 #ifdef COLI_DSV4_DEEPGEMM
-        if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
+        if(g[i].dga1)cudaFree(g[i].dga1);if(g[i].dga2)cudaFree(g[i].dga2);if(g[i].dgsfa1)cudaFree(g[i].dgsfa1);if(g[i].dgsfa2)cudaFree(g[i].dgsfa2);if(g[i].dglayout)cudaFree(g[i].dglayout);if(g[i].dgrowmap)cudaFree(g[i].dgrowmap);if(g[i].dgmm1)cudaFree(g[i].dgmm1);if(g[i].dgmm2)cudaFree(g[i].dgmm2);if(g[i].dgref)cudaFree(g[i].dgref);if(g[i].dgdensews)cudaFree(g[i].dgdensews);
 #endif
         for(int p=0;p<2;p++)plan_free(&g[i].plans[p]);if(g[i].lt)cublasLtDestroy(g[i].lt);if(g[i].hx)cudaFreeHost(g[i].hx);if(g[i].hy)cudaFreeHost(g[i].hy);if(g[i].ready)cudaEventDestroy(g[i].ready);if(g[i].fork)cudaEventDestroy(g[i].fork);if(g[i].join)cudaEventDestroy(g[i].join);cudaStreamDestroy(g[i].aux);cudaStreamDestroy(g[i].stream);}ng=0;}
 extern "C" Dsv4CudaActivation *dsv4_cuda_activation_create(int device,long long elements){Dev*c=ctx(device);if(!c||elements<1||!ok(cudaSetDevice(device),"select activation device"))return nullptr;Dsv4CudaActivation*a=(Dsv4CudaActivation*)calloc(1,sizeof(*a));if(!a)return nullptr;a->device=device;a->elements=elements;if(!ok(cudaMalloc(&a->data,(size_t)elements*sizeof(float)),"activation allocation")){free(a);return nullptr;}return a;}
@@ -703,6 +1256,25 @@ extern "C" int dsv4_cuda_upload_fp8(Dsv4CudaTensor **t,const uint8_t*w,const uin
 extern "C" int dsv4_cuda_upload_fp8_bf16(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){return upload(t,w,(size_t)O*I,s,(size_t)((O+127)/128)*((I+127)/128),O,I,d,9);}
 extern "C" int dsv4_cuda_upload_fp4(Dsv4CudaTensor **t,const uint8_t*w,const uint8_t*s,int O,int I,int d){if(!upload(t,w,(size_t)O*I/2,s,(size_t)O*I/32,O,I,d,4))return 0;
     return 1;}
+/* In-place refill of an existing fp4 mirror with a same-shape expert: no
+ * cudaFree/cudaMalloc churn, DMA from page-locked slabs when possible. The
+ * copies are stream-ordered; sync=1 drains before returning (needed when the
+ * host slab may be released before the next stream sync). */
+static bool host_pinned(const void*p,size_t len);
+extern "C" int dsv4_cuda_tensor_refill_fp4(Dsv4CudaTensor *t,const uint8_t*w,const uint8_t*s,int O,int I,int sync){
+    if(!t||!w||!s||t->fmt!=4||t->O!=O||t->I!=I||!t->own_w||!t->own_scale||!t->w||!t->scale)return 0;
+    Dev*c=ctx(t->device);if(!c||!ok(cudaSetDevice(t->device),"select refill device"))return 0;
+    size_t wb=(size_t)O*I/2,sb=(size_t)O*I/32;
+    if(host_pinned(w,wb)&&host_pinned(s,sb)){
+        if(!ok(cudaMemcpyAsync(t->w,w,wb,cudaMemcpyHostToDevice,c->stream),"refill weight upload")||
+           !ok(cudaMemcpyAsync(t->scale,s,sb,cudaMemcpyHostToDevice,c->stream),"refill scale upload"))return 0;
+        if(sync&&!ok(cudaStreamSynchronize(c->stream),"refill drain"))return 0;
+    }else{
+        if(!ok(cudaMemcpy(t->w,w,wb,cudaMemcpyHostToDevice),"refill weight upload")||
+           !ok(cudaMemcpy(t->scale,s,sb,cudaMemcpyHostToDevice),"refill scale upload"))return 0;
+    }
+    return 1;
+}
 extern "C" int dsv4_cuda_upload_bf16(Dsv4CudaTensor **t,const uint16_t*w,int O,int I,int d){return upload(t,w,(size_t)O*I*2,nullptr,0,O,I,d,16);}
 extern "C" int dsv4_cuda_upload_f32(Dsv4CudaTensor **t,const float*w,int O,int I,int d){return upload(t,w,(size_t)O*I*4,nullptr,0,O,I,d,32);}
 extern "C" int dsv4_cuda_mhc_pre(const Dsv4CudaActivation*r,Dsv4CudaTensor*fn,Dsv4CudaTensor*scale,Dsv4CudaTensor*base,int M,int H,float rms_eps,float pre_eps,float sink_eps,float post_mult,int sink_iters,Dsv4CudaActivation*state,Dsv4CudaActivation*input){
@@ -894,6 +1466,10 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
         if (qk_rope)
             rope_heads_dynamic<<<(qk_rope / 2 + 255) / 256, 256, 0, comp>>>(
                 comp3, 1, dim, qk_rope, c->decode_state, 1 - ratio, 0, ratio, cache->comp_cos, cache->comp_sin);
+        /* The FlashInfer cache packer performs the model's UE8M0 FP8
+         * quantization.  Quantizing and dequantizing here first would apply
+         * a second, differently-scaled FP8 round before the real cache
+         * store.  Keep the simulation only for the float-cache fallback. */
         if (dim > qk_rope)
             fp8_sim64_dynamic<<<(dim - qk_rope + 63) / 64, 64, 0, comp>>>(comp3, dim - qk_rope,
                                                                           c->decode_state, ratio);
@@ -919,8 +1495,9 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     {fp8_sim<<<(R + 127) / 128, 128, 0, c->stream>>>(c->p1, 1, R);
     run_mv<8>((uint8_t *)qb->w, qb->scale, c->p1, c->p2, Q, R, 1, c->stream);}
     bf16_round<<<(Q + 255) / 256, 256, 0, c->stream>>>(c->p2, Q);
-    head_rmsnorm<<<heads, 256, 0, c->stream>>>(c->p2, heads, dim, eps);
-    if (qk_rope)
+    int sparse=0;
+    if(!sparse)head_rmsnorm<<<heads, 256, 0, c->stream>>>(c->p2, heads, dim, eps);
+    if (qk_rope&&!sparse)
         rope_heads_dynamic<<<(heads * (qk_rope / 2) + 255) / 256, 256, 0, c->stream>>>(
             c->p2, heads, dim, qk_rope, c->decode_state, 0, 0, 0, cache->rope_cos, cache->rope_sin);
 #ifdef COLI_DSV4_DEEPGEMM
@@ -929,11 +1506,10 @@ extern "C" int dsv4_cuda_attention_window(const Dsv4CudaActivation *input, Dsv4C
     run_mv<8>((uint8_t *)kv->w, kv->scale, c->dx, c->p3, K, H, 1, c->stream);
     if (!fused_qkv) bf16_round<<<(K + 255) / 256, 256, 0, c->stream>>>(c->p3, K);
     rmsnorm_f32<<<1, 256, 0, c->stream>>>(c->p3, fused_qkv ? c->p1 + R : c->p3, (float *)kvn->w, K, eps);
-    if (qk_rope)
+    if (qk_rope&&!sparse)
         rope_heads_dynamic<<<(qk_rope / 2 + 255) / 256, 256, 0, c->stream>>>(
             c->p3, 1, dim, qk_rope, c->decode_state, 0, 0, 0, cache->rope_cos, cache->rope_sin);
-    if (K > qk_rope) fp8_sim64<<<(K - qk_rope + 63) / 64, 64, 0, c->stream>>>(c->p3, K - qk_rope);
-    cache_store_dynamic<<<(K + 255) / 256, 256, 0, c->stream>>>(cache->kv, c->p3, c->decode_state, cache->window, K);
+    if(!sparse){if (K > qk_rope) fp8_sim64<<<(K - qk_rope + 63) / 64, 64, 0, c->stream>>>(c->p3, K - qk_rope);cache_store_dynamic<<<(K + 255) / 256, 256, 0, c->stream>>>(cache->kv, c->p3, c->decode_state, cache->window, K);}
     if (async && !ok(cudaStreamWaitEvent(c->stream, c->join, 0), "attention join wait")) return 0;
     attention_window_dynamic<<<heads, 256, (size_t)(cache->window + cache->max_compressed) * 4, c->stream>>>(
         c->p4, c->p2, cache->kv, cache->compressed, (float *)sink->w, heads, dim, cache->window, c->decode_state,
@@ -974,7 +1550,21 @@ extern "C" int dsv4_cuda_attention_output_batch(const Dsv4CudaActivation*context
         scatter_group_rows<<<((long long)tokens*N+255)/256,256,0,c->stream>>>(c->p1,c->aux2,tokens,groups,N,gidx);}
     return dg_dense_batch_dispatch(c,wb,c->p1,output->data,tokens);
 #else
-    (void)context;(void)wa;(void)wb;(void)groups;(void)tokens;(void)output;return 0;
+    /* GENERIC grouped wo_a (fmt 9 view per group) + wo_b via the portable
+     * batch matmul; same gather/scatter structure as the DeepGEMM path. */
+    Dev*c=context?ctx(context->device):nullptr;int K=wa?wa->I:0,N=wa&&groups?wa->O/groups:0,WR=wa?wa->O:0,H=wb?wb->O:0;
+    if(!c||!wa||!wb||!output||groups<1||tokens<1||wa->fmt!=9||wa->O%groups||N%128||K%128||wb->fmt!=8||wb->I!=WR||
+       wa->device!=context->device||wb->device!=context->device||output->device!=context->device||
+       context->elements<(long long)tokens*groups*K||output->elements<(long long)tokens*H)return 0;
+    size_t in=(size_t)tokens*K*sizeof(float),part=(size_t)tokens*N*sizeof(float),joined=(size_t)tokens*WR*sizeof(float);
+    if(!ok(cudaSetDevice(context->device),"select generic attention output device")||!buf((void**)&c->aux1,&c->aux1cap,in)||
+       !buf((void**)&c->aux2,&c->aux2cap,part)||!buf((void**)&c->p1,&c->p1cap,joined))return 0;
+    for(int gidx=0;gidx<groups;gidx++){gather_group_rows<<<((long long)tokens*K+255)/256,256,0,c->stream>>>(c->aux1,context->data,tokens,groups,K,gidx);
+        Dsv4CudaTensor view=*wa;view.O=N;view.w=(uint8_t*)wa->w+(long long)gidx*N*K;view.scale=wa->scale+(long long)gidx*(N/128)*(K/128);
+        run_mm_batch(&view,c->aux1,c->aux2,tokens,c->stream);
+        scatter_group_rows<<<((long long)tokens*N+255)/256,256,0,c->stream>>>(c->p1,c->aux2,tokens,groups,N,gidx);}
+    run_mm_batch(wb,c->p1,output->data,tokens,c->stream);
+    return ok(cudaGetLastError(),"generic attention output launch");
 #endif
 }
 
@@ -1028,12 +1618,14 @@ extern "C" int dsv4_cuda_matvec_grouped(Dsv4CudaTensor *t,float *y,const float*x
     return ok(cudaGetLastError(),"matvec launch")&&ok(cudaMemcpyAsync(y,c->dy,yb,cudaMemcpyDeviceToHost,c->stream),"result download")&&ok(cudaStreamSynchronize(c->stream),"matvec sync");}
 extern "C" int dsv4_cuda_matvec(Dsv4CudaTensor*t,float*y,const float*x){return dsv4_cuda_matvec_grouped(t,y,x,1);}
 extern "C" int dsv4_cuda_matmul_batch(Dsv4CudaTensor*t,const Dsv4CudaActivation*input,int tokens,Dsv4CudaActivation*output){
-#ifdef COLI_DSV4_DEEPGEMM
     Dev*c=t?ctx(t->device):nullptr;if(!c||!input||!output||tokens<1||input->device!=t->device||output->device!=t->device||
        input->elements<(long long)tokens*t->I||output->elements<(long long)tokens*t->O||!ok(cudaSetDevice(t->device),"select batched dense device"))return 0;
+#ifdef COLI_DSV4_DEEPGEMM
     return dg_dense_batch_dispatch(c,t,input->data,output->data,tokens);
 #else
-    (void)t;(void)input;(void)tokens;(void)output;return 0;
+    if(t->fmt!=8&&t->fmt!=9&&t->fmt!=4)return 0;
+    run_mm_batch(t,input->data,output->data,tokens,c->stream);
+    return ok(cudaGetLastError(),"batched dense launch");
 #endif
 }
 extern "C" int dsv4_cuda_head_argmax(Dsv4CudaTensor*t,const float*x,int*id,float*value){
@@ -1046,9 +1638,9 @@ extern "C" int dsv4_cuda_head_argmax(Dsv4CudaTensor*t,const float*x,int*id,float
     if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dga1,I,1,(unsigned long long)I*2,64,64,CU_TENSOR_MAP_SWIZZLE_128B)||
        !dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,t->w,I,O,(unsigned long long)I*2,64,128,CU_TENSOR_MAP_SWIZZLE_128B)||
        !dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,1,(unsigned long long)O*2,64,64,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto gemm=deep_gemm::sm120_bf16_gemm_impl<0,O,I,1,64,128,64,128,128,128,3,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,true,2>;
+    auto gemm=c->sms>=170?deep_gemm::sm120_bf16_gemm_impl<0,O,I,1,64,128,64,128,128,128,3,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,true,2>:deep_gemm::sm120_bf16_gemm_impl<0,O,I,1,64,128,64,128,128,128,3,128,256,84,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,true,2>;
     if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,90368),"output head DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,90368,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(DgOutput*)c->dga1,(DgOutput*)t->w,nullptr,nullptr,1,O,I,a,b,d);
+    gemm<<<(c->sms>=170?170:84),384,90368,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(DgOutput*)c->dga1,(DgOutput*)t->w,nullptr,nullptr,1,O,I,a,b,d);
     dg_argmax_bf16<<<1,256,0,c->stream>>>(c->dgmm1,O,c->expert_ids,c->expert_weights);
     return ok(cudaGetLastError(),"output head DeepGEMM launch")&&ok(cudaMemcpyAsync(id,c->expert_ids,sizeof(*id),cudaMemcpyDeviceToHost,c->stream),"output id download")&&
            ok(cudaMemcpyAsync(value,c->expert_weights,sizeof(*value),cudaMemcpyDeviceToHost,c->stream),"output logit download")&&ok(cudaStreamSynchronize(c->stream),"output head sync");
@@ -1064,13 +1656,14 @@ extern "C" int dsv4_cuda_final_argmax(const Dsv4CudaActivation*r,Dsv4CudaTensor*
        !buf((void**)&c->expert_ids,&c->expert_idcap,sizeof(int))||!buf((void**)&c->expert_weights,&c->expert_weightscap,sizeof(float)))return 0;
     final_mhc_coeff<<<1,256,0,c->stream>>>(c->p1,r->data,(float*)fn->w,(float*)scale->w,(float*)base->w,M,H,eps,pre_eps);final_mhc_mix<<<(H+255)/256,256,0,c->stream>>>(c->dx,r->data,c->p1,M,H);rmsnorm_f32<<<1,256,0,c->stream>>>(c->dx,c->dx,(float*)norm->w,H,eps);dg_float_to_bf16<<<(I+255)/256,256,0,c->stream>>>((__nv_bfloat16*)c->dga1,c->dx,I);CUtensorMap a,b,d;
     if(!dg_map(&a,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dga1,I,1,(unsigned long long)I*2,64,64,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&b,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,head->w,I,O,(unsigned long long)I*2,64,128,CU_TENSOR_MAP_SWIZZLE_128B)||!dg_map(&d,CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,c->dgmm1,O,1,(unsigned long long)O*2,64,64,CU_TENSOR_MAP_SWIZZLE_128B))return 0;
-    auto gemm=deep_gemm::sm120_bf16_gemm_impl<0,O,I,1,64,128,64,128,128,128,3,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,true,2>;if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,90368),"final head DeepGEMM shared memory"))return 0;
-    gemm<<<170,384,90368,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(DgOutput*)c->dga1,(DgOutput*)head->w,nullptr,nullptr,1,O,I,a,b,d);dg_argmax_bf16<<<1,256,0,c->stream>>>(c->dgmm1,O,c->expert_ids,c->expert_weights);
+    auto gemm=c->sms>=170?deep_gemm::sm120_bf16_gemm_impl<0,O,I,1,64,128,64,128,128,128,3,128,256,170,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,true,2>:deep_gemm::sm120_bf16_gemm_impl<0,O,I,1,64,128,64,128,128,128,3,128,256,84,deep_gemm::GemmType::Normal,false,DgOutput,DgEpilogue,true,2>;if(!ok(cudaFuncSetAttribute(gemm,cudaFuncAttributeMaxDynamicSharedMemorySize,90368),"final head DeepGEMM shared memory"))return 0;
+    gemm<<<(c->sms>=170?170:84),384,90368,c->stream>>>((DgOutput*)c->dgmm1,nullptr,(DgOutput*)c->dga1,(DgOutput*)head->w,nullptr,nullptr,1,O,I,a,b,d);dg_argmax_bf16<<<1,256,0,c->stream>>>(c->dgmm1,O,c->expert_ids,c->expert_weights);
     return ok(cudaGetLastError(),"final head launch")&&ok(cudaMemcpyAsync(id,c->expert_ids,sizeof(*id),cudaMemcpyDeviceToHost,c->stream),"final id download")&&ok(cudaMemcpyAsync(value,c->expert_weights,sizeof(*value),cudaMemcpyDeviceToHost,c->stream),"final logit download")&&ok(cudaStreamSynchronize(c->stream),"final head sync");
 #else
     (void)r;(void)fn;(void)scale;(void)base;(void)norm;(void)head;(void)M;(void)H;(void)eps;(void)pre_eps;(void)id;(void)value;return 0;
 #endif
 }
+#if COLI_DSV4_TC
 static TcPlan *tc_plan(Dev*c,int O,int I){int pi=O>I;TcPlan*p=&c->plans[pi];if(p->ok)return p;if(p->op)plan_free(p);p->O=O;p->I=I;
     cublasOperation_t ta=CUBLAS_OP_T,tb=CUBLAS_OP_N;cublasLtMatmulMatrixScale_t mode=CUBLASLT_MATMUL_MATRIX_SCALE_VEC32_UE8M0;
     if(!bok(cublasLtMatmulDescCreate(&p->op,CUBLAS_COMPUTE_32F,CUDA_R_32F),"TC operation")||
@@ -1096,6 +1689,7 @@ static int tc_fp4_matvec(Dev*c,Dsv4CudaTensor*t,float*y){int O=t->O,I=t->I;size_
     void *as=c->tcs,*bs=c->tcxs;if(!bok(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,&as,sizeof(as)),"TC A scale")||
        !bok(cublasLtMatmulDescSetAttribute(p->op,CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,&bs,sizeof(bs)),"TC B scale"))return 0;float alpha=1,beta=0;
     return bok(cublasLtMatmul(c->lt,p->op,&alpha,c->tcw,p->a,c->tcx,p->b,&beta,y,p->c,y,p->d,&p->algo.algo,c->tc_workspace,32<<20,c->stream),"TC matvec");}
+#endif /* COLI_DSV4_TC */
 extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor *const *up,Dsv4CudaTensor *const *down,
         const float *weights,int count,float limit,float *y,const float *x){
     if(count<1||count>16||!gate||!up||!down)return 0;Dsv4CudaTensor *t=gate[0];Dev*c=t?ctx(t->device):nullptr;
@@ -1106,12 +1700,14 @@ extern "C" int dsv4_cuda_expert_group(Dsv4CudaTensor *const *gate,Dsv4CudaTensor
        !buf((void**)&c->p1,&c->p1cap,ib)||!buf((void**)&c->p2,&c->p2cap,ib)||
        !buf((void**)&c->p3,&c->p3cap,ib)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
     if(!ok(cudaMemcpyAsync(c->dx,x,xb,cudaMemcpyHostToDevice,c->stream),"expert-group activation upload"))return 0;
+#if COLI_DSV4_TC
     static int tc=-1;if(tc<0)tc=getenv("DSV4_CUDA_TC")?atoi(getenv("DSV4_CUDA_TC")):0;
     if(tc){for(int e=0;e<count;e++){if(!tc_prepare_x(c,c->dx,H)||!tc_fp4_matvec(c,gate[e],c->p1+(long long)e*I)||!tc_fp4_matvec(c,up[e],c->p2+(long long)e*I))return 0;
             expert_act<<<(I+255)/256,256,0,c->stream>>>(c->p3+(long long)e*I,c->p1+(long long)e*I,c->p2+(long long)e*I,weights[e],limit,I);
             if(!tc_prepare_x(c,c->p3+(long long)e*I,I)||!tc_fp4_matvec(c,down[e],c->p4+(long long)e*H))return 0;}
         expert_reduce<<<(H+255)/256,256,0,c->stream>>>(c->dy,c->p4,count,H);
         return ok(cudaGetLastError(),"TC expert-group launch")&&ok(cudaMemcpyAsync(y,c->dy,(size_t)H*4,cudaMemcpyDeviceToHost,c->stream),"TC expert-group result download")&&ok(cudaStreamSynchronize(c->stream),"TC expert-group sync");}
+#endif /* COLI_DSV4_TC */
     static int batched=-1;if(batched<0)batched=getenv("DSV4_CUDA_BATCHED")?atoi(getenv("DSV4_CUDA_BATCHED")):1;
     if(batched){MvDesc hd[32];for(int e=0;e<count;e++){
             hd[2*e]={(uint8_t*)gate[e]->w,gate[e]->scale,c->dx,c->p1+(long long)e*I};
@@ -1273,6 +1869,41 @@ extern "C" Dsv4CudaExpertSet *dsv4_cuda_expert_bank_create(int count,int H,int I
     }
     return set;
 }
+/* ---- transparent host pinning for expert uploads ----
+ * The engine's expert-cache slot slabs are stable for the process lifetime
+ * (posix_memalign once per slot, freed only at store destroy), so the first
+ * upload from a slab page-locks its whole allocation region (VirtualQuery
+ * bounds) and every later upload from it is a pure DMA at PCIe speed instead
+ * of a CPU staging copy (~4.7 GB/s measured while the refill's parallel
+ * lookups compete for the cores). Failures fall back to pageable copies;
+ * DSV4_CUDA_PIN_HOST=0 disables; total pinned bytes are capped. */
+struct PinRegion{uintptr_t base;size_t size;};
+static std::vector<PinRegion> g_pin_regions,g_pin_failed;
+static size_t g_pin_bytes;
+static int g_pin_enabled=-1;
+static bool host_pinned(const void*p,size_t len){
+    if(g_pin_enabled<0){const char*e=getenv("DSV4_CUDA_PIN_HOST");g_pin_enabled=!(e&&*e=='0');}
+    if(!g_pin_enabled||!p||!len)return false;
+    uintptr_t a=(uintptr_t)p;
+    for(auto&r:g_pin_regions)if(a>=r.base&&a+len<=r.base+r.size)return true;
+    for(auto&r:g_pin_failed)if(a>=r.base&&a+len<=r.base+r.size)return false;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if(!VirtualQuery(p,&mbi,sizeof mbi)||mbi.State!=MEM_COMMIT)return false;
+    uintptr_t base=(uintptr_t)mbi.BaseAddress;size_t size=mbi.RegionSize;
+    if(a<base||a+len>base+size)return false;
+    static const size_t cap=(size_t)20<<30;
+    if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
+    cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
+    if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
+    if(err!=cudaSuccess){cudaGetLastError();g_pin_failed.push_back({base,size});return false;}
+    g_pin_bytes+=size;g_pin_regions.push_back({base,size});
+    return true;
+#else
+    (void)a;return false;
+#endif
+}
+
 extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,
         const uint8_t*gw,const uint8_t*gs,const uint8_t*uw,const uint8_t*us,const uint8_t*dw,const uint8_t*ds,
         Dsv4CudaTensor**gate,Dsv4CudaTensor**up,Dsv4CudaTensor**down){
@@ -1281,6 +1912,20 @@ extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,
     int H=set->H,I=set->I;size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
     uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
     uint8_t*fc2=set->bank_fc2+(size_t)e*w2,*fc2s=set->bank_fc2_scale+(size_t)e*s2;
+    Dev*c=ctx(set->device);
+    bool pinned=c&&host_pinned(gw,w1)&&host_pinned(uw,w1)&&host_pinned(gs,s1)&&
+                host_pinned(us,s1)&&host_pinned(dw,w2)&&host_pinned(ds,s2);
+    if(pinned){
+        /* Pure DMA on the device stream; the caller releases the host slab
+         * right after we return, so drain before returning. */
+        if(!ok(cudaMemcpyAsync(fc1,gw,w1,cudaMemcpyHostToDevice,c->stream),"expert gate upload")||
+           !ok(cudaMemcpyAsync(fc1+w1,uw,w1,cudaMemcpyHostToDevice,c->stream),"expert up upload")||
+           !ok(cudaMemcpyAsync(fc1s,gs,s1,cudaMemcpyHostToDevice,c->stream),"expert gate scale upload")||
+           !ok(cudaMemcpyAsync(fc1s+s1,us,s1,cudaMemcpyHostToDevice,c->stream),"expert up scale upload")||
+           !ok(cudaMemcpyAsync(fc2,dw,w2,cudaMemcpyHostToDevice,c->stream),"expert down upload")||
+           !ok(cudaMemcpyAsync(fc2s,ds,s2,cudaMemcpyHostToDevice,c->stream),"expert down scale upload")||
+           !ok(cudaStreamSynchronize(c->stream),"expert upload drain"))return 0;
+    }else
     if(!ok(cudaMemcpy(fc1,gw,w1,cudaMemcpyHostToDevice),"expert gate upload")||
        !ok(cudaMemcpy(fc1+w1,uw,w1,cudaMemcpyHostToDevice),"expert up upload")||
        !ok(cudaMemcpy(fc1s,gs,s1,cudaMemcpyHostToDevice),"expert gate scale upload")||
@@ -1294,7 +1939,7 @@ extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,
 #endif
     Dsv4CudaTensor*g=expert_view(fc1,fc1s,I,H,set->device),*u=expert_view(fc1+w1,fc1s+s1,I,H,set->device),*d=expert_view(fc2,fc2s,H,I,set->device);
     if(!g||!u||!d){free(g);free(u);free(d);return 0;}
-    ExpertPtr p[3]={{(uint8_t*)g->w,g->scale,nullptr},{(uint8_t*)u->w,u->scale,nullptr},{(uint8_t*)d->w,d->scale,nullptr}};
+    ExpertPtr p[3]={{(uint8_t*)g->w,g->scale},{(uint8_t*)u->w,u->scale},{(uint8_t*)d->w,d->scale}};
     if(!ok(cudaMemcpy(set->table+e,p,sizeof(*p),cudaMemcpyHostToDevice),"expert gate table upload")||
        !ok(cudaMemcpy(set->table+set->count+e,p+1,sizeof(*p),cudaMemcpyHostToDevice),"expert up table upload")||
        !ok(cudaMemcpy(set->table+2*set->count+e,p+2,sizeof(*p),cudaMemcpyHostToDevice),"expert down table upload")){
@@ -1324,6 +1969,19 @@ extern "C" int dsv4_cuda_expert_bank_upload_tp2(Dsv4CudaExpertSet*set,int e,int 
     return 1;
 }
 extern "C" void dsv4_cuda_expert_set_free(Dsv4CudaExpertSet*set){if(!set)return;cudaSetDevice(set->device);if(set->table)cudaFree(set->table);if(set->hash)cudaFree(set->hash);if(set->bank_fc1)cudaFree(set->bank_fc1);if(set->bank_fc1_scale)cudaFree(set->bank_fc1_scale);if(set->bank_fc2)cudaFree(set->bank_fc2);if(set->bank_fc2_scale)cudaFree(set->bank_fc2_scale);if(set->bank_fc1_dg_scale)cudaFree(set->bank_fc1_dg_scale);if(set->bank_fc2_dg_scale)cudaFree(set->bank_fc2_dg_scale);free(set);}
+/* Rebind the shared-expert mirrors on a bank set. The bank is a per-layer
+ * streaming buffer during batched prefill, but the shared experts differ per
+ * layer and are already resident as the layer's fp8 mirrors — rebinding them
+ * is free, re-creating the ~2 GiB bank per layer is not. Same shape contract
+ * as dsv4_cuda_expert_bank_create. */
+extern "C" int dsv4_cuda_expert_bank_set_shared(Dsv4CudaExpertSet*set,Dsv4CudaTensor*sg,Dsv4CudaTensor*su,Dsv4CudaTensor*sd){
+    if(!set)return 0;
+    if(!sg&&!su&&!sd){set->sg=set->su=set->sd=nullptr;return 1;}
+    int H=set->H,J=sg?sg->O:0;
+    if(!sg||!su||!sd||sg->device!=set->device||su->device!=set->device||sd->device!=set->device||
+       sg->fmt!=8||su->fmt!=8||sd->fmt!=8||sg->I!=H||su->I!=H||su->O!=J||sd->I!=J||sd->O!=H)return 0;
+    set->sg=sg;set->su=su;set->sd=sd;return 1;
+}
 extern "C" int dsv4_cuda_expert_set_upload_hash(Dsv4CudaExpertSet*set,const int64_t*map,int vocab,int topk){
     if(!set||!map||vocab<1||topk!=6||!ok(cudaSetDevice(set->device),"select hash router device"))return 0;
     size_t bytes=(size_t)vocab*topk*sizeof(*map);if(set->hash)cudaFree(set->hash);set->hash=nullptr;set->vocab=0;set->topk=0;
@@ -1392,10 +2050,10 @@ extern "C" int dsv4_cuda_route_moe(const Dsv4CudaActivation*input,Dsv4CudaTensor
 #endif
     fp8_sim<<<(H+127)/128,128,0,c->stream>>>(c->dx,1,H);
     build_moe_desc<<<1,K,0,c->stream>>>(c->mvdesc,set->table,c->expert_ids,c->dx,c->p1,c->p2,c->p3,c->p4,K,set->count,H,I);
-run_fp4_grouped(c->mvdesc,2*K,I,H,c->stream);
+    run_fp4_grouped(c->mvdesc,2*K,I,H,c->stream);
     expert_act_grouped<<<(K*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,K,I);
     fp8_sim<<<K*((I+127)/128),128,0,c->stream>>>(c->p3,K,I);
-run_fp4_grouped(c->mvdesc+2*K,K,H,I,c->stream);
+    run_fp4_grouped(c->mvdesc+2*K,K,H,I,c->stream);
     expert_reduce<<<(H+255)/256,256,0,c->stream>>>(output->data,c->p4,K,H);
     run_mv<8>((uint8_t*)set->sg->w,set->sg->scale,c->dx,c->p1,I,H,1,c->stream);
     run_mv<8>((uint8_t*)set->su->w,set->su->scale,c->dx,c->p2,I,H,1,c->stream);
@@ -1405,19 +2063,127 @@ run_fp4_grouped(c->mvdesc+2*K,K,H,I,c->stream);
 }
 extern "C" int dsv4_cuda_route_moe_batch(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,const int*tokens,int count,float scale,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
 #ifdef COLI_DSV4_DEEPGEMM
-    Dev*c=input?ctx(input->device):nullptr;if(!c||!gate||!set||!output||count<1||count>64||set->device!=input->device||output->device!=input->device||gate->fmt!=32||gate->O!=256||gate->I!=4096||gate->device!=input->device||set->count!=256||set->H!=4096||set->I!=2048||input->elements<(long long)count*4096||output->elements<(long long)count*4096||(bias&&(bias->fmt!=32||bias->O*bias->I<256||bias->device!=input->device))||(set->hash&&!tokens)||!ok(cudaSetDevice(input->device),"select batched MoE device"))return 0;
+    Dev*c=input?ctx(input->device):nullptr;if(!c||!gate||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||gate->fmt!=32||gate->O!=256||gate->I!=4096||gate->device!=input->device||set->count!=256||set->H!=4096||set->I!=2048||input->elements<(long long)count*4096||output->elements<(long long)count*4096||(bias&&(bias->fmt!=32||bias->O*bias->I<256||bias->device!=input->device))||(set->hash&&!tokens)||!ok(cudaSetDevice(input->device),"select batched MoE device"))return 0;
     int routes=count*6;size_t logits=(size_t)count*256*sizeof(float),ids=(size_t)routes*sizeof(int),weights=(size_t)routes*sizeof(float);
     if(!buf((void**)&c->dy,&c->ycap,logits)||!buf((void**)&c->expert_ids,&c->expert_idcap,ids)||!buf((void**)&c->expert_weights,&c->expert_weightscap,weights)||
        (set->hash&&!buf((void**)&c->aux3,&c->aux3cap,(size_t)count*sizeof(int))))return 0;
     route_logits_batch<<<count*256,256,0,c->stream>>>((float*)gate->w,input->data,c->dy,count,256,4096);
     if(set->hash){if(!ok(cudaMemcpyAsync(c->aux3,tokens,(size_t)count*sizeof(int),cudaMemcpyHostToDevice,c->stream),"batch token upload"))return 0;route_hash_batch<<<(routes+255)/256,256,0,c->stream>>>(c->expert_ids,set->hash,(int*)c->aux3,count);route_fixed_weights_batch<<<count,6,0,c->stream>>>(c->expert_weights,c->expert_ids,c->dy,count,scale);}
     else route_top6_batch<<<count,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,count,scale);
+    /* DSV4_CUDA_MOE_PROF=1: wall-time the three segments (forced syncs, so
+     * only for diagnosis) and print the first few calls. */
+    static int prof=-1;static int prof_calls;if(prof<0){const char*e=getenv("DSV4_CUDA_MOE_PROF");prof=e&&atoi(e);}
+    double t_route=0,t_expert=0,t_shared=0;std::chrono::steady_clock::time_point ta,tb;
+    if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);ta=std::chrono::steady_clock::now();}
     if(!dg_moe_batch_contiguous(c,set,input->data,c->expert_ids,c->expert_weights,count,limit,output->data))return 0;
+    if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_expert=std::chrono::duration<double>(tb-ta).count();ta=tb;}
     Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;if(!sg||!su||!sd||sg->O!=2048||su->O!=2048||sd->I!=2048)return 0;
     size_t mid=(size_t)count*2048*sizeof(float),hb=(size_t)count*4096*sizeof(float);if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
-    if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);return ok(cudaGetLastError(),"batched MoE launch");
+    if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
+    if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_shared=std::chrono::duration<double>(tb-ta).count();
+        fprintf(stderr,"[DSV4 CUDA] moe-batch prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
+    (void)t_route;return ok(cudaGetLastError(),"batched MoE launch");
 #else
     (void)input;(void)gate;(void)bias;(void)tokens;(void)count;(void)scale;(void)set;(void)limit;(void)output;return 0;
+#endif
+}
+/* Batched top-6 routing only: logits from the f32 gate mirror, ids/weights
+ * downloaded to the host so the caller can stage exactly the routed experts
+ * before running the expert GEMMs. */
+extern "C" int dsv4_cuda_route_top6_batch(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,int count,float scale,int*ids,float*weights){
+    Dev*c=input?ctx(input->device):nullptr;
+    if(!c||!gate||!ids||!weights||count<1||count>128||gate->fmt!=32||gate->O!=256||gate->I!=4096||gate->device!=input->device||
+       input->elements<(long long)count*4096||(bias&&(bias->fmt!=32||bias->O*bias->I<256||bias->device!=input->device))||
+       !ok(cudaSetDevice(input->device),"select batched route device"))return 0;
+    int routes=count*6;size_t logits=(size_t)count*256*sizeof(float),ib=(size_t)routes*sizeof(int),wb=(size_t)routes*sizeof(float);
+    if(!buf((void**)&c->dy,&c->ycap,logits)||!buf((void**)&c->expert_ids,&c->expert_idcap,ib)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb))return 0;
+    route_logits_batch<<<count*256,256,0,c->stream>>>((float*)gate->w,input->data,c->dy,count,256,4096);
+    route_top6_batch<<<count,32,0,c->stream>>>(c->expert_ids,c->expert_weights,bias?(float*)bias->w:nullptr,c->dy,count,scale);
+    return ok(cudaGetLastError(),"batched route launch")&&
+           ok(cudaMemcpyAsync(ids,c->expert_ids,ib,cudaMemcpyDeviceToHost,c->stream),"batched route id download")&&
+           ok(cudaMemcpyAsync(weights,c->expert_weights,wb,cudaMemcpyDeviceToHost,c->stream),"batched route weight download")&&
+           ok(cudaStreamSynchronize(c->stream),"batched route sync");
+}
+/* Batched MoE over host-provided routes (ids/weights per token, 6 each).
+ * The caller guarantees every id's bank slot holds that expert's weights;
+ * routed sum and the shared expert land in output like route_moe_batch. */
+extern "C" int dsv4_cuda_route_moe_ids_batch(const Dsv4CudaActivation*input,const int*ids,const float*weights,int count,Dsv4CudaExpertSet*set,float limit,Dsv4CudaActivation*output){
+#ifdef COLI_DSV4_DEEPGEMM
+    Dev*c=input?ctx(input->device):nullptr;
+    if(!c||!ids||!weights||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||
+       set->count!=256||set->H!=4096||set->I!=2048||!set->bank_fc1||
+       input->elements<(long long)count*4096||output->elements<(long long)count*4096||
+       !ok(cudaSetDevice(input->device),"select batched MoE device"))return 0;
+    int routes=count*6;
+    for(int r=0;r<routes;r++)if(ids[r]<0||ids[r]>=set->count)return 0;
+    size_t ib=(size_t)routes*sizeof(int),wb=(size_t)routes*sizeof(float);
+    if(!buf((void**)&c->expert_ids,&c->expert_idcap,ib)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb))return 0;
+    if(!ok(cudaMemcpyAsync(c->expert_ids,ids,ib,cudaMemcpyHostToDevice,c->stream),"batched MoE id upload")||
+       !ok(cudaMemcpyAsync(c->expert_weights,weights,wb,cudaMemcpyHostToDevice,c->stream),"batched MoE weight upload"))return 0;
+    static int prof=-1;static int prof_calls;if(prof<0){const char*e=getenv("DSV4_CUDA_MOE_PROF");prof=e&&atoi(e);}
+    double t_expert=0,t_shared=0;std::chrono::steady_clock::time_point ta,tb;
+    if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);ta=std::chrono::steady_clock::now();}
+    if(!dg_moe_batch_contiguous(c,set,input->data,c->expert_ids,c->expert_weights,count,limit,output->data,ids))return 0;
+    if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_expert=std::chrono::duration<double>(tb-ta).count();ta=tb;}
+    Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;if(!sg||!su||!sd||sg->O!=2048||su->O!=2048||sd->I!=2048)return 0;
+    size_t mid=(size_t)count*2048*sizeof(float),hb=(size_t)count*4096*sizeof(float);
+    if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
+    if(!dg_dense_batch_dispatch(c,sg,input->data,c->p1,count)||!dg_dense_batch_dispatch(c,su,input->data,c->p2,count))return 0;
+    swiglu_rows<<<((long long)count*2048+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count,2048);
+    if(!dg_dense_batch_dispatch(c,sd,c->p3,c->p4,count))return 0;
+    add_rows<<<((long long)count*4096+255)/256,256,0,c->stream>>>(output->data,c->p4,count*4096);
+    if(prof&&prof_calls<6){cudaStreamSynchronize(c->stream);tb=std::chrono::steady_clock::now();t_shared=std::chrono::duration<double>(tb-ta).count();
+        fprintf(stderr,"[DSV4 CUDA] moe-ids prof count=%d experts=%.3fs shared=%.3fs\n",count,t_expert,t_shared);prof_calls++;}
+    return ok(cudaGetLastError(),"batched MoE ids launch");
+#else
+    /* GENERIC batched MoE (no DeepGEMM): the decode kernels applied to every
+     * token of the chunk in one grouped launch each — fp32 accumulate over
+     * fp4-decoded expert rows from the same VRAM bank, then the fp8 shared
+     * experts through the generic batch matmul. Slower than the tensor-core
+     * path (~10-20 ms per 128-token chunk-layer) but runs on any sm_80+ GPU,
+     * so prefill stays GPU-side instead of falling back to the CPU union. */
+    Dev*c=input?ctx(input->device):nullptr;
+    if(!c||!ids||!weights||!set||!output||count<1||count>128||set->device!=input->device||output->device!=input->device||
+       set->count!=256||set->H!=4096||set->I!=2048||!set->bank_fc1||
+       input->elements<(long long)count*4096||output->elements<(long long)count*4096||
+       !ok(cudaSetDevice(input->device),"select generic batched MoE device"))return 0;
+    const int H=4096,I=2048,K=6;int routes=count*K;
+    for(int r=0;r<routes;r++)if(ids[r]<0||ids[r]>=set->count)return 0;
+    Dsv4CudaTensor*sg=set->sg,*su=set->su,*sd=set->sd;
+    if(!sg||!su||!sd||sg->fmt!=8||su->fmt!=8||sd->fmt!=8||sg->O!=I||su->O!=I||sd->I!=I||sg->I!=H||sd->O!=H)return 0;
+    size_t w1=(size_t)I*(H/2),s1=(size_t)I*(H/32),w2=(size_t)H*(I/2),s2=(size_t)H*(I/32);
+    size_t rb=(size_t)routes*I*sizeof(float),pb=(size_t)routes*H*sizeof(float),wb=(size_t)routes*sizeof(float);
+    if(!buf((void**)&c->p1,&c->p1cap,rb)||!buf((void**)&c->p2,&c->p2cap,rb)||!buf((void**)&c->p3,&c->p3cap,rb)||
+       !buf((void**)&c->p4,&c->p4cap,pb)||!buf((void**)&c->expert_weights,&c->expert_weightscap,wb)||
+       !buf((void**)&c->mvdesc,&c->mvdesccap,(size_t)routes*2*sizeof(MvDesc)))return 0;
+    if(!ok(cudaMemcpyAsync(c->expert_weights,weights,wb,cudaMemcpyHostToDevice,c->stream),"generic MoE weight upload"))return 0;
+    std::vector<MvDesc> hd((size_t)routes*2);
+    for(int r=0;r<routes;r++){int e=ids[r],t=r/K;
+        const uint8_t*fc1=set->bank_fc1+(size_t)e*2*w1,*fc1s=set->bank_fc1_scale+(size_t)e*2*s1;
+        const float*x=input->data+(long long)t*H;
+        hd[2*r]={fc1,fc1s,x,c->p1+(long long)r*I};
+        hd[2*r+1]={fc1+w1,fc1s+s1,x,c->p2+(long long)r*I};}
+    if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*2*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE fc1 descriptors"))return 0;
+    mv_fp4_grouped<4><<<dim3((I+3)/4,routes*2),256,0,c->stream>>>(c->mvdesc,routes*2,I,H);
+    expert_act_grouped<<<((long long)routes*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,c->expert_weights,limit,routes,I);
+    fp8_sim<<<routes*((I+127)/128),128,0,c->stream>>>(c->p3,routes,I);
+    /* down: descriptors must not be overwritten while fc1 still reads them —
+     * the copy is stream-ordered after the launches above, so reuse is safe. */
+    for(int r=0;r<routes;r++){int e=ids[r];
+        hd[r]={set->bank_fc2+(size_t)e*w2,set->bank_fc2_scale+(size_t)e*s2,c->p3+(long long)r*I,c->p4+(long long)r*H};}
+    if(!ok(cudaMemcpyAsync(c->mvdesc,hd.data(),(size_t)routes*sizeof(MvDesc),cudaMemcpyHostToDevice,c->stream),"generic MoE down descriptors"))return 0;
+    mv_fp4_grouped<4><<<dim3((H+3)/4,routes),256,0,c->stream>>>(c->mvdesc,routes,H,I);
+    expert_reduce_rows<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count,K,H);
+    /* shared experts (fp8 dense) over the whole chunk, then the same combine
+     * as decode: routed = bf16(routed + bf16(shared)). */
+    size_t mid=(size_t)count*I*sizeof(float),hb=(size_t)count*H*sizeof(float);
+    if(!buf((void**)&c->p1,&c->p1cap,mid)||!buf((void**)&c->p2,&c->p2cap,mid)||!buf((void**)&c->p3,&c->p3cap,mid)||!buf((void**)&c->p4,&c->p4cap,hb))return 0;
+    run_mm_batch(sg,input->data,c->p1,count,c->stream);run_mm_batch(su,input->data,c->p2,count,c->stream);
+    expert_act_rows1<<<((long long)count*I+255)/256,256,0,c->stream>>>(c->p3,c->p1,c->p2,limit,count*I);
+    fp8_sim<<<count*((I+127)/128),128,0,c->stream>>>(c->p3,count,I);
+    run_mm_batch(sd,c->p3,c->p4,count,c->stream);
+    moe_combine<<<((long long)count*H+255)/256,256,0,c->stream>>>(output->data,c->p4,count*H);
+    return ok(cudaGetLastError(),"generic batched MoE launch");
 #endif
 }
 extern "C" int dsv4_cuda_route_moe_ep2(const Dsv4CudaActivation*input,Dsv4CudaTensor*gate,Dsv4CudaTensor*bias,
@@ -1542,3 +2308,4 @@ extern "C" int dsv4_cuda_wo(Dsv4CudaTensor *wa,Dsv4CudaTensor *wb,int groups,flo
 }
 extern "C" void dsv4_cuda_tensor_free(Dsv4CudaTensor*t){if(!t)return;cudaSetDevice(t->device);if(t->own_w&&t->w)cudaFree(t->w);if(t->bf16_cache)cudaFree(t->bf16_cache);if(t->own_scale&&t->scale)cudaFree(t->scale);if(t->own_dg_scale&&t->dg_scale)cudaFree(t->dg_scale);free(t);}
 extern "C" long long dsv4_cuda_tensor_bytes(const Dsv4CudaTensor*t){return t?t->bytes:0;}
+extern "C" int dsv4_cuda_tensor_device(const Dsv4CudaTensor*t){return t?t->device:-1;}

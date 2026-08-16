@@ -424,7 +424,45 @@ def env_for_engine(a, arch):
         env.setdefault("V4_MTP_MISS", "96")
         env.setdefault("V4_MTP_MIN", "3")
         env.setdefault("V4_MTP_CONF", "0.55")
+        # GPU mirroring of the MTP draft experts stays opt-in: the CUDA kernels
+        # accumulate fp32 differently from the CPU refs and speculative
+        # acceptance needs a bit-exact draft. V4_MTP_GPU=1 mirrors GLM's
+        # COLI_CUDA_MTP switch for CUDA-driven speculative decoding.
+        env.setdefault("V4_MTP_GPU", "0")
+    # getattr: tests build partial Namespaces for env_for_engine.
+    gpu = getattr(a, "gpu", None)
+    vram = getattr(a, "vram", None)
+    if gpu is not None:
+        env.pop("COLI_GPU", None); env.pop("COLI_GPUS", None)
+        if gpu == "none":
+            env["COLI_CUDA"] = "0"
+            env.pop("CUDA_EXPERT_GB", None); env.pop("CUDA_DENSE", None)
+        else:
+            if arch == "deepseek_v4":
+                if not dsv4_cuda_available(a.model):
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+            elif not cuda_binary():
+                sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
+            env["COLI_CUDA"] = "1"
+            if gpu != "auto":
+                env["COLI_GPUS"] = gpu
+            env.setdefault("CUDA_DENSE", "1")
+    if vram and gpu != "none":
+        if arch == "deepseek_v4":
+            if not dsv4_cuda_available(a.model):
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+        elif not cuda_binary():
+            sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
+        env["COLI_CUDA"] = "1"
+        env["CUDA_EXPERT_GB"] = str(vram)
     return env
+
+def dsv4_cuda_available(model=None):
+    if sys.platform != "win32":
+        return False
+    eng = engine_for(model) if model else GLM
+    dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
+    return os.path.exists(dll)
 
 def cuda_binary():
     if not os.path.exists(GLM): return False

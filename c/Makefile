@@ -479,7 +479,7 @@ CFLAGS += -DCOLI_DSV4_DEEPGEMM
 # default g++ is too new for CUDA names a supported host compiler. DeepGEMM
 # needs C++20 and the relaxed-constexpr/extended-lambda pair, not its own arch.
 override NVCC_STD  := c++20
-override NVCCFLAGS += --expt-relaxed-constexpr --expt-extended-lambda -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)"
+override NVCCFLAGS += --expt-relaxed-constexpr --expt-extended-lambda -DCOLI_DSV4_DEEPGEMM -I"$(DEEPGEMM_HOME)" -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
 LDFLAGS += -lcuda
 endif
 ifeq ($(NCCL),1)
@@ -696,6 +696,45 @@ backend_cuda.o: backend_cuda.cu backend_cuda.h backend_gpu_compat.h .build-confi
 backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h .build-config
 	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
 	"$(NVCC)" $(NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+# Windows DeepSeek V4 CUDA DLLs: the sibling of cuda-dll for the DeepSeek V4
+# engine. deepseek-v4.exe is built with MinGW gcc and cannot link MSVC/nvcc
+# objects, so backend_cuda_dsv4.cu compiles into its own DLL (nvcc + MSVC
+# cl.exe as host) whose symbols are exported via dsv4.def; the engine resolves
+# them at runtime through backend_loader_dsv4.c, mirroring the
+# backend_loader.c / coli_cuda.dll split. Run from a vcvars64 shell, like
+# cuda-dll. Two flavours ship side by side and the loader picks at runtime by
+# compute capability: coli_cuda_dsv4.dll is the GENERIC build (plain CUDA
+# kernels, any sm_80+ card; CUDA_ARCH=portable for a fat binary) and
+# coli_cuda_dsv4_dg.dll the DeepGEMM sm_120a build (tensor-core prefill paths;
+# needs the sm120 DeepGEMM checkout at DEEPGEMM_HOME, see
+# patches-deepgemm-sm120-msvc.patch). Both need -lcuda for the TMA driver API.
+cuda-dsv4-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	"$(NVCC)" $(NVCCFLAGS) --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor -shared \
+		-Xlinker /DEF:dsv4.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		backend_cuda_dsv4.cu -o coli_cuda_dsv4.dll
+
+DEEPGEMM_INC = -I"$(DEEPGEMM_HOME)/deep_gemm/include" -I"$(DEEPGEMM_HOME)/cutlass/include" -I"$(DEEPGEMM_HOME)/third-party/cutlass/include"
+cuda-dsv4-dg-dll: backend_cuda_dsv4.cu backend_cuda_dsv4.h dsv4.def
+	@test -n "$(DEEPGEMM_HOME)" || { echo "DEEPGEMM_HOME must point to the sm120 DeepGEMM checkout" >&2; exit 1; }
+	@command -v "$(NVCC)" >/dev/null 2>&1 || { echo "nvcc not found: set CUDA_HOME or NVCC" >&2; exit 1; }
+	@command -v cl >/dev/null 2>&1 || { echo "cl.exe (MSVC) not in PATH — run vcvars64.bat first" >&2; exit 1; }
+	"$(NVCC)" -O3 -std=c++20 -ftz=false --expt-relaxed-constexpr --expt-extended-lambda -Xcompiler=/Zc:preprocessor \
+		-gencode arch=compute_120a,code=sm_120a -DCOLI_DSV4_DEEPGEMM \
+		$(DEEPGEMM_INC) -shared \
+		-Xlinker /DEF:dsv4.def \
+		-L"$(CUDA_HOME)/lib/x64" -lcublasLt -lcudart -lcuda \
+		backend_cuda_dsv4.cu -o coli_cuda_dsv4_dg.dll
+
+# Windows: the decode-path kernels validated through the runtime DLL loader.
+# deepseek-v4.exe is MinGW gcc; backend_loader_dsv4.c resolves the MSVC/nvcc
+# built coli_cuda_dsv4*.dll and this test proves that ABI boundary.
+dsv4-cuda-loader-test: tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c backend_cuda_dsv4.h
+	$(CC) $(CFLAGS) tests/test_dsv4_decode_cuda.c backend_loader_dsv4.c -o dsv4_decode_loader_test$(EXE)
+	./dsv4_decode_loader_test$(EXE)
 backend_metal.o: backend_metal.mm backend_metal.h
 	$(METALXX) -c backend_metal.mm -o $@
 
@@ -994,12 +1033,21 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
 	COLI_V4_UNIT_NATIVE_QUANT.o
+# Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
+# is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
+# native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
+# without a DLL next to the test binary.
+ifneq ($(IS_WIN),)
+V4_TEST_LINK_OBJS += COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+V4_TEST_EXTRA_TARGETS = COLI_V4_UNIT_GPU.o backend_loader_dsv4.o
+endif
 
 tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4.h \
 		Makefile.deepseek-v4.units
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
-		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o
+		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		$(V4_TEST_EXTRA_TARGETS)
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
 V4_OWN_DIR = build/ownership
@@ -1209,7 +1257,7 @@ bench: iobench$(EXE)
 # Own line: see the TEST_RULES note above on shared .PHONY lines.
 .PHONY: bench-omp-grain
 .PHONY: test-asan
-.PHONY: dsv4-cuda-test
+.PHONY: dsv4-cuda-test cuda-dsv4-dll cuda-dsv4-dg-dll dsv4-cuda-loader-test
 
 tests/test_kv_prefix$(EXE): tests/test_kv_prefix.c kv_prefix.h
 	$(CC) $(CFLAGS) tests/test_kv_prefix.c -o tests/test_kv_prefix$(EXE) $(LDFLAGS)

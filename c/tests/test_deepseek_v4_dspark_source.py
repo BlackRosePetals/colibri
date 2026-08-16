@@ -84,6 +84,7 @@ class DeepSeekV4DSparkSourceTest(unittest.TestCase):
             'env.setdefault("V4_MTP", "0")',
             'env.setdefault("V4_MTP_DRAFT", "3")',
             'env.setdefault("V4_MTP_GB", "0.45")',
+            'env.setdefault("V4_MTP_GPU", "0")',
         ):
             self.assertIn(setting, self.launcher)
         self.assertIn(".no_dspark = 0,", self.engine)

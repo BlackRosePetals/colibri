@@ -1,6 +1,9 @@
-# DeepSeek V4 目标引擎（colibri CPU）
+# DeepSeek V4 目标引擎（CPU + 可选 CUDA 层）
 
 [English](deepseek-v4.md)
+
+> 本页为早期版本，尚未更新 CUDA 层（Windows DLL / Linux `CUDA=1`）、环境变量
+> 参考、前缀检查点与性能数据。以英文页为准。
 
 这是 V4 拆分后第一个 PR 中的 DeepSeek V4 Flash 目标引擎。DSpark 推测解码
 不属于本 PR，将放在后续连续（stacked）PR 中。

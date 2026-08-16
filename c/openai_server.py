@@ -1682,6 +1682,10 @@ def tune_child_env(env, arch):
     env.setdefault("V4_MTP_MISS", "96")
     env.setdefault("V4_MTP_MIN", "3")
     env.setdefault("V4_MTP_CONF", "0.55")
+    # CUDA-driven MTP drafting stays opt-in (mirrors GLM's COLI_CUDA_MTP): the
+    # GPU fp4 kernels accumulate fp32 differently from the CPU refs, and a
+    # speculative draft must match the target bit-for-bit to be accepted.
+    env.setdefault("V4_MTP_GPU", "0")
     return env
 
 
@@ -1868,9 +1872,25 @@ class Engine:
             self.next_request_id += 1
             self.pending[request_id] = events
         xpayload = gpayload or apayload
+        # DeepSeek V4 prefix hint (optional 8th header field): the byte length of
+        # the rendered prompt up to the first user/assistant turn marker — the
+        # stable system prefix. The engine snapshots its attention state at that
+        # token boundary during the prefill, so the FIRST request of the first
+        # conversation already seeds the shared-prefix checkpoint that every later
+        # conversation (opencode session) restores in seconds; without the hint
+        # the engine only discovers the boundary on the second fresh prompt.
+        # Older engines parse six or seven fields and ignore the eighth.
+        prefix_field = ""
+        if ARCH == "deepseek_v4":
+            cut = min((i for i in (prompt.find("<\uff5cUser\uff5c>"),
+                                   prompt.find("<\uff5cAssistant\uff5c>")) if i > 0),
+                      default=0)
+            if cut > 0:
+                prefix_field = f" {len(xpayload)} {len(prompt[:cut].encode('utf-8'))}"
         header = (f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "
                   f"{temperature:.8g} {top_p:.8g}"
-                  + (f" {len(xpayload)}" if xpayload else "") + "\n").encode()
+                  + (prefix_field if prefix_field else (f" {len(xpayload)}" if xpayload else ""))
+                  + "\n").encode()
         try:
             with self.write_lock:
                 if self.process.poll() is not None:
@@ -1907,6 +1927,13 @@ class Engine:
                 # out, the turn ran to its token limit, and this thread stayed
                 # blocked until the engine emitted something. Poll the callback
                 # while idle so a pre-first-frame disconnect cancels too.
+                #
+                # Do NOT raise here: this thread holds the scheduler admission,
+                # and releasing it before the engine confirms the cancel lets
+                # the next request SUBMIT into a pipe the busy engine is not
+                # reading — every later request then hangs silently behind the
+                # orphaned generation. Wait for the engine's ERROR CANCELLED /
+                # DONE frame; ClientCancelled is raised when it arrives.
                 if not cancel_sent and not stop_sent and cancelled and cancelled():
                     cancel_sent = True
                     with self.write_lock:
@@ -1927,12 +1954,21 @@ class Engine:
                             self.process.stdin.write(f"STOP {request_id}\n".encode())
                             self.process.stdin.flush()
                     elif cancelled and cancelled():
+                        # Same admission-holding rule as the idle branch above:
+                        # send CANCEL, then keep consuming frames until the
+                        # engine acknowledges with ERROR CANCELLED or DONE.
                         cancel_sent = True
                         with self.write_lock:
                             self.process.stdin.write(f"CANCEL {request_id}\n".encode())
                             self.process.stdin.flush()
             elif kind == "done":
                 _accept({"prompt_tokens": None})
+                if cancel_sent:
+                    # The engine finished the turn before seeing the CANCEL
+                    # (or honored it at a token boundary and still framed a
+                    # DONE). Either way the client is gone: the ack is what
+                    # mattered, the output is not deliverable.
+                    raise ClientCancelled()
                 tail = decoder.decode(b"", final=True)
                 if tail:
                     on_text(tail)
@@ -2688,7 +2724,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_tools, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 if think:
@@ -2717,7 +2753,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 stop_filter = StopFilter(stop_sequences, emit_plain, ignore_leading_stop)
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
-                    lambda: not connected, grammar=grammar, stopped=stop_filter.stopped,
+                    self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
                     on_accept=start_stream, **({"audio": audio} if audio else {}))
                 stop_filter.finish()
                 if content_split:
@@ -3098,7 +3134,10 @@ def serve(model, host="127.0.0.1", port=8000, model_id="glm-5.2-colibri", api_ke
         server.engine = runtime
         print(f"OpenAI-compatible API listening on http://{host}:{port}/v1", file=sys.stderr)
         signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
     finally:
         signal.signal(signal.SIGTERM, previous_sigterm)
         server.scheduler.close()
