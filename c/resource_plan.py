@@ -290,12 +290,133 @@ def _discover_nvidia_gpus():
     return devices
 
 
+_HIPINFO_UNITS = {"B": 1, "KB": 1024, "MB": 1024 ** 2,
+                  "GB": 1024 ** 3, "TB": 1024 ** 4}
+
+
+def _hipinfo_executable():
+    """Locate hipInfo.exe, preferring the runtime Colibri will actually bind.
+
+    rocm-smi does not exist on Windows -- neither the HIP SDK installer nor a
+    source build ships it -- so the rocm-smi probe below finds nothing there and
+    every Windows AMD host planned CPU-only. hipInfo.exe is what both shipped
+    SDKs do provide, and it sits in the same directory as amdhip64_7.dll.
+
+    Lookup order, and why:
+
+    1. ``COLI_HIP_RUNTIME_DIR`` -- the directory the loader binds the HIP
+       runtime from (docs/windows.md). hipInfo lives beside amdhip64_7.dll
+       there, so its answer describes the runtime the engine will actually
+       load.
+    2. ``HIP_PATH``\\bin -- the SDK root the Windows HIP SDK installer sets, and
+       the same variable c/Makefile derives HIP_SDK_ROOT from.
+    3. ``PATH``.
+
+    The order is the point on a host carrying more than one HIP install: a
+    stale ambient HIP_PATH must not describe the hardware through a runtime the
+    engine is not going to bind. No install location is hardcoded.
+    """
+    if sys.platform != "win32":
+        return None
+    candidates = []
+    runtime_dir = os.environ.get("COLI_HIP_RUNTIME_DIR")
+    if runtime_dir:
+        candidates.append(Path(runtime_dir.strip('"')) / "hipInfo.exe")
+    hip_path = os.environ.get("HIP_PATH")
+    if hip_path:
+        candidates.append(Path(hip_path.strip('"')) / "bin" / "hipInfo.exe")
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    found = shutil.which("hipInfo")
+    return Path(found) if found else None
+
+
+def _hipinfo_bytes(value):
+    """``"89.39 GB"`` -> bytes, or None. hipInfo divides by 1024 (it prints a
+    65536-byte shared block as ``64.00 KB``), so the units are binary."""
+    match = re.match(r"([0-9.]+)\s*([KMGT]?B)\b", (value or "").strip())
+    if not match:
+        return None
+    try:
+        return int(float(match.group(1)) * _HIPINFO_UNITS[match.group(2)])
+    except (ValueError, KeyError, OverflowError):
+        return None
+
+
+def _parse_hipinfo(text):
+    """Devices from hipInfo output, one block per ``device#`` line.
+
+    A block that does not carry both a name and a total is dropped rather than
+    completed with zeros: a half-trusted device is worse than no device,
+    because the zeros would read as measurements.
+
+    ``memInfo.free`` is deliberately NOT carried into ``free_bytes``. hipInfo
+    does report it, but on integrated hardware it has not been qualified as a
+    budget. On the validated gfx1151 host, four controlled rebooted sessions
+    varying the firmware shared-memory limit reported the same 76.79 GiB total
+    at the ~6, ~32 and ~64 GB settings -- about 12.8x the configured limit at
+    the minimum -- and 93.00 GiB only at the ~123 GB maximum, with
+    Windows-visible memory unchanged throughout. What that figure permits, and
+    at what cost to the host, is a later slice; until then the value is
+    observed and discarded, and ``free_bytes`` stays None. See
+    plans_placement().
+    """
+    blocks = []
+    current = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("device#"):
+            index = stripped[len("device#"):].strip()
+            current = {"index": int(index)} if index.isdigit() else None
+            if current is not None:
+                blocks.append(current)
+            continue
+        if current is None:
+            continue
+        key, sep, value = line.partition(":")
+        if sep:
+            current[key.strip()] = value.strip()
+    devices = []
+    for block in blocks:
+        name = block.get("Name", "")
+        total = _hipinfo_bytes(block.get("memInfo.total")
+                               or block.get("totalGlobalMem"))
+        if not name or not total:
+            continue
+        devices.append({"index": block["index"], "name": name,
+                        "arch": block.get("gcnArchName", ""),
+                        "total_bytes": total,
+                        "free_bytes": None,
+                        "unified_memory": block.get("isIntegrated") == "1"})
+    return devices
+
+
+def _discover_amd_gpus_windows():
+    hipinfo = _hipinfo_executable()
+    if hipinfo is None:
+        return []
+    try:
+        result = subprocess.run([str(hipinfo)], text=True, capture_output=True,
+                                check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return _parse_hipinfo(result.stdout)
+
+
 def _discover_amd_gpus():
-    """ROCm/HIP discovery via rocm-smi (#662). Absent on non-AMD hosts, so this
-    returns [] there. rocm-smi --showmeminfo vram reports BYTES (unlike nvidia-smi's
-    MiB), so no unit scaling. Column names drift across ROCm versions, so match them
-    by substring rather than position. VERIFY on AMD hardware (labelled
-    hardware-owner-needed) -- authored without a ROCm host to test against."""
+    """ROCm/HIP discovery. Windows goes through hipInfo (see above); everywhere
+    else through rocm-smi (#662), which is absent on non-AMD hosts so this
+    returns [] there. rocm-smi --showmeminfo vram reports BYTES (unlike
+    nvidia-smi's MiB), so no unit scaling. Column names drift across ROCm
+    versions, so match them by substring rather than position. The rocm-smi
+    branch remains VERIFY-on-AMD-hardware (labelled hardware-owner-needed) --
+    authored without a ROCm host to test against."""
+    if sys.platform == "win32":
+        return _discover_amd_gpus_windows()
     command = ["rocm-smi", "--showmeminfo", "vram", "--showproductname", "--csv"]
     try:
         result = subprocess.run(command, text=True, capture_output=True, check=True, timeout=5)
@@ -336,6 +457,27 @@ def _discover_amd_gpus():
                         "total_bytes": total, "free_bytes": free,
                         "unified_memory": False})
     return devices
+
+
+def plans_placement(gpu):
+    """Whether a discovered device's memory is qualified to drive placement.
+
+    Discovery is a fact; a placement budget is a policy decision, and the two
+    are not the same thing. ``free_bytes`` normally carries both, because a
+    discrete card's free VRAM *is* the budget. It is ``None`` for a device that
+    exists and is worth reporting but whose free memory has not been qualified
+    as a Colibri budget -- today, a Windows AMD part found through hipInfo,
+    where the GPU and the host draw on one physical pool and the relationship
+    between the runtime's free figure and host-available memory has not been
+    measured.
+
+    ``None`` is deliberately distinct from ``0``. Zero is a measurement ("the
+    card is full") and keeps every behaviour it has always had. ``None`` says
+    "not measured in a way this planner may spend", which is a different claim
+    and must not silently collapse into the other -- hence ``is not None``
+    rather than a truthiness test.
+    """
+    return gpu.get("free_bytes") is not None
 
 
 def _physical_cores_warn(message):
@@ -566,7 +708,13 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         wanted = set(gpu_indices)
         gpus = [gpu for gpu in gpus if gpu["index"] in wanted]
 
-    unified = any(gpu.get("unified_memory", False) for gpu in gpus)
+    # Every discovered device is reported; only the ones whose free memory is a
+    # qualified budget may steer placement. Keeping the two lists apart is what
+    # stops "a GPU exists" from being read as "a GPU should be used" -- see
+    # plans_placement().
+    planning_gpus = [gpu for gpu in gpus if plans_placement(gpu)]
+
+    unified = any(gpu.get("unified_memory", False) for gpu in planning_gpus)
     typical = info["typical_expert_bytes"]
     max_expert = info["max_expert_bytes"] or typical
     layers = int(cfg.get("num_hidden_layers") or 0) + 1
@@ -582,7 +730,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     gpu_plan = []
     safe_vram = 0
     for gpu in gpus:
-        usable = max(0, gpu["free_bytes"] - reserve)
+        usable = max(0, gpu["free_bytes"] - reserve) if plans_placement(gpu) else 0
         safe_vram += usable
         gpu_plan.append(dict(gpu, reserve_bytes=reserve, usable_bytes=usable))
     requested_vram = int(vram_gb * GB) if vram_gb > 0 else safe_vram
@@ -623,8 +771,14 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         warnings.append("RAM budget cannot hold one expert slot per sparse layer")
     if gpu_indices is not None and len(gpus) != len(set(gpu_indices)):
         warnings.append("one or more requested GPUs were not detected")
-    if gpus and vram_budget < requested_vram_before_clamp:
+    if planning_gpus and vram_budget < requested_vram_before_clamp:
         warnings.append("VRAM tier was clamped by free VRAM, shared memory, or model expert size")
+    for gpu in gpus:
+        if not plans_placement(gpu):
+            warnings.append(
+                f"GPU {gpu['index']} ({gpu['name']}) was detected but its free memory is "
+                "not qualified as a placement budget on this platform; it is reported "
+                "only and drives no automatic tier")
     if unified:
         warnings.append(
             "GPU and RAM share one physical memory pool; budgets were jointly constrained")
@@ -633,9 +787,9 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     # pessimistic hit rate that describe nothing. That is exactly when a user
     # reaches for `coli plan` -- before changing a live deployment -- so say so
     # rather than let the numbers be read as a capacity answer.
-    if gpus:
-        gpu_total = sum(g["total_bytes"] for g in gpus)
-        gpu_free = sum(g["free_bytes"] for g in gpus)
+    if planning_gpus:
+        gpu_total = sum(g["total_bytes"] for g in planning_gpus)
+        gpu_free = sum(g["free_bytes"] for g in planning_gpus)
         if gpu_total and gpu_free < 0.75 * gpu_total:
             warnings.append(
                 f"{format_bytes(gpu_total - gpu_free)} of VRAM is already in use "
@@ -652,11 +806,11 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     if cold_bytes:
         bottleneck = "disk expert misses"
         bottleneck_class = "disk"
-    elif warm_bytes and gpus:
+    elif warm_bytes and planning_gpus:
         bottleneck = "CPU expert tail and GPU compute"
         bottleneck_class = "mixed"
     elif projected_hit >= 0.99:
-        if gpus:
+        if planning_gpus:
             bottleneck = "GPU compute and interconnect"
         else:
             bottleneck = "CPU expert compute (fully resident)"
@@ -665,7 +819,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         bottleneck = "CPU expert compute and RAM bandwidth"
         bottleneck_class = "memory"
 
-    tune = _auto_tune(bottleneck_class, projected_hit, gpus, cpu_sockets,
+    tune = _auto_tune(bottleneck_class, projected_hit, planning_gpus, cpu_sockets,
                       plan_has_metal=False)
     probe_state, probe_gbs = ssd_probe_state(info["path"])
 
@@ -736,7 +890,9 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
 
     vram = plan["tiers"]["vram"]
-    devices = [device["index"] for device in vram["devices"]]
+    # Report every device, but only name the placement-qualified ones to the
+    # engine: COLI_GPU/COLI_GPUS is an instruction, not an inventory.
+    devices = [device["index"] for device in vram["devices"] if plans_placement(device)]
     if not cuda_enabled or not devices or vram["budget_bytes"] <= 0:
         return result
     if result.get("COLI_CUDA", "1") == "0":
@@ -770,11 +926,16 @@ def format_plan(plan):
              f"cap {tiers['ram']['cache_slots_per_layer']}/layer"]
     vram = tiers["vram"]
     if vram["devices"]:
-        names = ", ".join(f"{gpu['index']}:{gpu['name']}" for gpu in vram["devices"])
+        names = ", ".join(
+            f"{gpu['index']}:{gpu['name']}"
+            + ("" if plans_placement(gpu) else " (identity only)")
+            for gpu in vram["devices"])
         lines.append(f"VRAM   {format_bytes(vram['budget_bytes'])} hot tier · "
                      f"~{vram['expert_capacity']} experts · {names}")
     else:
-        lines.append("VRAM   no NVIDIA device detected · CPU path")
+        # Backend-neutral, matching the accelerator wording #903 settled on:
+        # an AMD or Intel host that finds nothing is not "no NVIDIA device".
+        lines.append("VRAM   no supported GPU detected · CPU path")
     if plan.get("ssd_probe_gbs") is not None:
         lines.append(f"ssd    {plan['ssd_probe_gbs']:.1f} GB/s F_NOCACHE (cached probe, #379)")
     elif plan.get("ssd_probe_state") in SSD_PROBE_PENDING:

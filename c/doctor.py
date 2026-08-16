@@ -351,7 +351,13 @@ def cuda_linkage(engine_path):
     engine = Path(engine_path)
     if not engine.is_file():
         return {"linked": False, "missing": False}
-    if os.name == "posix":
+    # `sys.platform` alone selects the branch, so a test can exercise the
+    # Windows probe on a POSIX host by faking it. Faking `os.name` instead
+    # would repoint pathlib at Windows semantics and turn the POSIX fixture
+    # path into a WindowsPath that no longer resolves, so `is_file()` above
+    # would return early. On every real host the two agree and this reads
+    # exactly as `os.name == "posix"` did.
+    if os.name == "posix" and sys.platform != "win32":
         try:
             result = subprocess.run(["ldd", str(engine)], capture_output=True, text=True,
                                     timeout=3, check=False)
@@ -365,18 +371,30 @@ def cuda_linkage(engine_path):
         return {"linked": any("not found" not in line for line in lines),
                 "missing": any("not found" in line for line in lines)}
     if sys.platform == "win32":
-        # Windows CUDA_DLL=1 builds never link libcudart directly: glm.exe loads
-        # coli_cuda.dll at runtime via LoadLibrary (backend_loader.c), so there's no
-        # import-table entry for ldd/dumpbin to see. Detect the COLI_CUDA build via a
-        # marker string baked into glm.c's #ifdef COLI_CUDA block instead, and require
-        # coli_cuda.dll to actually sit next to glm.exe (else CUDA init fails at startup).
+        # Windows DLL-split builds never link the GPU runtime directly: the host
+        # LoadLibrary's its backend at runtime (backend_loader.c), so there's no
+        # import-table entry for ldd/dumpbin to see. Detect the GPU build via a
+        # marker string baked into the engine's #ifdef COLI_CUDA block, then
+        # require the backend artifact to sit next to the executable.
+        #
+        # WHICH artifact is not a guess. backend_loader.c compiles exactly one
+        # basename into the host -- COLI_BACKEND_DLL is "coli_hip.dll" under
+        # COLI_HIP_DLL and "coli_cuda.dll" otherwise -- so the binary states
+        # what it will load and we check for that. Asking for coli_cuda.dll
+        # unconditionally failed a working HIP host (a hard error, not a
+        # warning), and accepting either name would have passed a HIP host that
+        # only had a stray CUDA backend beside it.
         try:
-            built = b"[CUDA] mode: routed experts" in engine.read_bytes()
+            image = engine.read_bytes()
         except OSError:
             return {"linked": False, "missing": False}
-        if not built:
+        if b"[CUDA] mode: routed experts" not in image:
             return {"linked": False, "missing": False}
-        dll_present = (engine.parent / "coli_cuda.dll").is_file()
+        expected = next((name for name in ("coli_hip.dll", "coli_cuda.dll")
+                         if name.encode() in image), None)
+        if expected is None:
+            return {"linked": False, "missing": False}
+        dll_present = (engine.parent / expected).is_file()
         return {"linked": dll_present, "missing": not dll_present}
     return {"linked": False, "missing": False}
 

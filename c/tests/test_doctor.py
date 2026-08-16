@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from doctor import exit_code, format_doctor, run_doctor
+from doctor import cuda_linkage, exit_code, format_doctor, run_doctor
 from resource_plan import GB
 
 
@@ -160,6 +160,77 @@ class DoctorTest(unittest.TestCase):
 
     # #379: doctor surfaces the cached F_NOCACHE probe read-only (S4) -- it
     # never re-measures storage itself, only reflects what colibri.c already wrote.
+    # --- Windows backend-artifact linkage ---------------------------------
+    # c/backend_loader.c compiles exactly one backend basename into the host:
+    # COLI_BACKEND_DLL is "coli_hip.dll" under COLI_HIP_DLL and "coli_cuda.dll"
+    # otherwise. So the binary states which artifact it will LoadLibrary, and
+    # doctor can check for that one instead of assuming CUDA. This validates the
+    # host/artifact contract only -- it says nothing about the runtime binding
+    # or about any GPU actually computing.
+
+    def _win_engine(self, backend_dll, artifacts=()):
+        engine = self.root / "colibri.exe"
+        engine.write_bytes(b"...[CUDA] mode: routed experts..."
+                           + backend_dll.encode() + b"...")
+        for artifact in artifacts:
+            (self.root / artifact).write_bytes(b"")
+        return engine
+
+    def _win_linkage(self, engine):
+        # Only sys.platform is faked. Faking os.name as well would make
+        # pathlib build a WindowsPath from the POSIX fixture path, which does
+        # not resolve on Linux/macOS, so cuda_linkage would bail at its
+        # is_file() guard before reaching the backend-marker logic and every
+        # assertion below would compare against a false negative.
+        with mock.patch.object(sys, "platform", "win32"):
+            return cuda_linkage(engine)
+
+    def test_windows_cuda_host_accepts_its_own_backend(self):
+        engine = self._win_engine("coli_cuda.dll", ["coli_cuda.dll"])
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": True, "missing": False})
+
+    def test_windows_hip_host_accepts_its_own_backend(self):
+        engine = self._win_engine("coli_hip.dll", ["coli_hip.dll"])
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": True, "missing": False})
+
+    def test_windows_hip_host_is_not_satisfied_by_the_cuda_backend(self):
+        engine = self._win_engine("coli_hip.dll", ["coli_cuda.dll"])
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": False, "missing": True})
+
+    def test_windows_cuda_host_is_not_satisfied_by_the_hip_backend(self):
+        engine = self._win_engine("coli_cuda.dll", ["coli_hip.dll"])
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": False, "missing": True})
+
+    def test_windows_missing_backend_artifact_still_fails(self):
+        engine = self._win_engine("coli_hip.dll")
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": False, "missing": True})
+
+    def test_windows_cpu_only_engine_is_not_a_gpu_build(self):
+        engine = self.root / "colibri.exe"
+        engine.write_bytes(b"a plain CPU build with no backend loader")
+        self.assertEqual(self._win_linkage(engine),
+                         {"linked": False, "missing": False})
+
+    def test_hip_host_with_its_backend_reports_gpu_available(self):
+        # End-to-end: the same host that previously reported a hard error
+        # ("GPU runtime library is missing") now passes, with #903's
+        # backend-neutral wording preserved.
+        engine = self._win_engine("coli_hip.dll", ["coli_hip.dll"])
+        report = self.report(gpu_indices=None, engine_path=engine,
+                             gpus=[{"index": 0, "name": "AMD Radeon(TM) 8060S Graphics",
+                                    "total_bytes": 78 * GB, "free_bytes": None,
+                                    "unified_memory": True}],
+                             linkage=self._win_linkage(engine))
+        check = self.checks_by_id(report)["accelerator.gpu"]
+        self.assertEqual(check["status"], "pass")
+        self.assertNotIn("CUDA", check["summary"])
+        self.assertNotIn("NVIDIA", check["summary"])
+
     def test_ssd_probe_check_skips_when_not_yet_cached(self):
         checks = self.checks_by_id(self.report())
         self.assertEqual(checks["storage.ssd_probe"]["status"], "skip")
