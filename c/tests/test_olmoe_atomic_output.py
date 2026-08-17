@@ -19,6 +19,11 @@ def load_converter():
     spec = importlib.util.spec_from_file_location("olmoe_atomic_output_test", CONVERTER)
     module = importlib.util.module_from_spec(spec)
     with mock.patch.dict(sys.modules, {
+        # numpy joins the converter's dependency guard in #1048 (safetensors.torch
+        # imports it internally). This test imports the converter with its real
+        # dependencies absent, so every name in that guard has to be stubbed here
+        # or the guard sys.exit()s during exec_module and the module never loads.
+        "numpy": mock.Mock(),
         "torch": torch,
         "safetensors": safetensors,
         "safetensors.torch": safetensors_torch,
