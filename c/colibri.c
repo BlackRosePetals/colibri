@@ -922,6 +922,43 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
     }
 }
 
+/* ---- quantizzazione attivazioni sollevata a livello layer ---------------------------
+ * moe() quantizza x UNA volta per layer e raccoglie le righe int8 accanto al gather
+ * f32; il ramo IDOT di matmul_qt_ex le riusa quando (x,S,I) coincidono ESATTAMENTE
+ * col contesto. Prima lo stesso vettore veniva riquantizzato da ogni matmul che lo
+ * consumava (~16x per layer: 8 expert x gate+up), in seriale sul thread master.
+ * Bit-identico: qrow_i8 e' pura, quantizzare la riga originale o la sua copia
+ * raccolta produce gli stessi byte; l'ordine per-riga non cambia. Ogni altro
+ * percorso (CUDA/Metal/Vulkan, fmt 0/3/4/5/6/8, attenzione con allow_idot=0, la
+ * copia ruotata fmt=6) ignora il contesto e resta identico.
+ * EN: layer-level hoisted activation quantization. moe() quantizes x once and
+ * gathers int8 rows next to the f32 gather; the IDOT branch reuses them on an
+ * exact (x,S,I) pointer/shape match. Bit-identical (qrow_i8 is a pure function
+ * of the row bytes). Every other path ignores the context and is unchanged. */
+static struct { const float *x; int S, I; const int8_t *xq; const float *sx; } g_pq;
+static void pq_build(const float *x, int S, int D, int8_t *xq, float *sx){
+    /* righe indipendenti -> parallelizzare sulle righe e' bit-identico; il loop
+     * DENTRO qrow_i8 resta scalare (stesso ordine di lrintf di sempre).
+     * EN: rows are independent, so parallelizing across rows is bit-identical;
+     * the per-row loop inside qrow_i8 stays scalar (same lrintf order). */
+    #pragma omp parallel for schedule(static) if(S>=8)
+    for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*D, xq+(int64_t)s*D, D);
+}
+/* Il gate/up di questo expert passerebbe dall'IDOT di matmul_qt_ex? Specchia
+ * l'ordine di dispatch di expert_gate_up: a S==1 la fused pair f32 (fmt=2)
+ * preempta matmul_qt, quindi li' il contesto non servirebbe a nessuno.
+ * EN: would this expert's gate/up take matmul_qt_ex's IDOT branch? Mirrors
+ * expert_gate_up's dispatch order: at S==1 the f32 fused pair (fmt=2) preempts
+ * matmul_qt entirely, so the context would go unused there. */
+static inline int pq_want(const QT *g,const QT *u,int nr){
+    if(!g_idot) return 0;
+    if(nr==1 && !g_no_fused_pair && !spec_pinned() &&
+       g->fmt==2 && u->fmt==2 && g->I==u->I && g->O==u->O) return 0;
+    int a = g->fmt==1 || (g->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
+    int b = u->fmt==1 || (u->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
+    return a || b;
+}
+
 /* allow_idot=0: forza il kernel int4/int8 ESATTO (attivazioni f32). Serve alle proiezioni di
  * attenzione: sono sensibili alla quantizzazione int8 delle attivazioni dell'IDOT. Misurato su
  * GLM-5.2 int4, 1023 token, log-lik -5040.33 (esatto) -> -5160.47 (IDOT) = +0.117 nat/token,
@@ -967,9 +1004,15 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
-        if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
-        quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
-        for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        if(g_pq.x==x && g_pq.S==S && g_pq.I==I){
+            /* righe gia' quantizzate una volta dal layer (vedi g_pq sopra)
+             * EN: rows already quantized once at layer level (see g_pq above) */
+            xq=(int8_t*)g_pq.xq; sx=(float*)g_pq.sx;
+        } else {
+            if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
+            quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+            for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+        }
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
@@ -4612,6 +4655,12 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
     /* ---- FASE C/D: risolvi (pin/cache/disco) e calcola, a blocchi di 64 unici ---- */
     float *xg=falloc((int64_t)S*D), *gg=falloc((int64_t)S*I), *uu=falloc((int64_t)S*I), *hh=falloc((int64_t)S*D);
+    /* quantizzazione sollevata (g_pq): materializzata al PRIMO expert che prenderebbe
+     * l'IDOT — mai per fmt 0/3/4/5/6/8, mai sui percorsi GPU, costo zero se inutile.
+     * EN: hoisted activation quantization, materialized on the FIRST IDOT-eligible
+     * expert; zero cost when no expert would take the IDOT branch. */
+    int8_t *xq_all=NULL, *xqg=NULL; float *sx_all=NULL, *sxg=NULL; int pq_ready=0;
+    g_pq.x=NULL;      /* mai fidarsi di un contesto di un moe() precedente / never trust a stale context */
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
                        * experts of the layer share it (the placement rule in quant.h) */
     /* Materialise xe on first use. Every site that feeds a routed expert's gate/up
@@ -5140,6 +5189,24 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             }
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
+            /* quantizzazione sollevata: raccogli le righe int8 accanto al gather f32 e
+             * pubblica il contesto per il ramo IDOT di matmul_qt_ex. Solo quando l'input
+             * e' x originale (mai la copia ruotata fmt=6) e gate/up lo consumerebbero.
+             * EN: hoisted quantization — gather the int8 rows next to the f32 gather and
+             * publish the context for matmul_qt_ex's IDOT branch. Only when the input is
+             * the original x (never the fmt=6 rotated copy) and gate/up would take it. */
+            g_pq.x=NULL;
+            if(xsrc==x && pq_want(&e->g,&e->u,nr)){
+                if(!pq_ready){
+                    if(!xq_all){
+                        xq_all=xalloc((size_t)S*D,"moe xq"); sx_all=xalloc((size_t)S*sizeof(float),"moe sx");
+                        xqg   =xalloc((size_t)S*D,"moe xqg"); sxg  =xalloc((size_t)S*sizeof(float),"moe sxg");
+                    }
+                    pq_build(x,S,D,xq_all,sx_all); pq_ready=1;
+                }
+                for(int r=0;r<nr;r++){ memcpy(xqg+(int64_t)r*D, xq_all+(int64_t)rows[r]*D,(size_t)D); sxg[r]=sx_all[rows[r]]; }
+                g_pq.x=xg; g_pq.S=nr; g_pq.I=D; g_pq.xq=xqg; g_pq.sx=sxg;
+            }
             expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
@@ -5374,6 +5441,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     }
 shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
+    g_pq.x=NULL;   /* xg sta per essere liberato: nessun contesto deve sopravvivergli
+                    * EN: xg is about to be freed — no context may outlive it */
+    free(xq_all); free(sx_all); free(xqg); free(sxg);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
     #undef E8_XE
 #ifdef COLI_CUDA
