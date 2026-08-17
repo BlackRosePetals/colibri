@@ -1547,8 +1547,12 @@ static void dense_forward(Model *m, Layer *l, const float *x, int C, float *out)
  * Returns the LAST position's logits (falloc'd), or NULL pre-head. ---------- */
 static float *g_x0=NULL; static int g_x0_n=0;  /* K3_X0: injected inputs (validation) */
 static FILE *g_lfp=NULL;                       /* K3_LOGITS: per-position logit dump */
-static float *step_chunk(Model *m, const int *ids, int pos0, int C){
+typedef int (*K3CancelPoll)(void *context);
+static float *step_chunk_ex(Model *m, const int *ids, int pos0, int C,
+                            K3CancelPoll poll_cancel, void *cancel_context,
+                            int *cancelled){
     Cfg *c=&m->c; int D=c->hidden;
+    if(cancelled) *cancelled=0;
 #ifdef COLI_VULKAN
     g_vk_up_left=g_vk_upcap;              /* routed-tier upload budget per step */
 #endif
@@ -1599,9 +1603,16 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
             memcpy(hidden+(int64_t)t*D,p,D*sizeof(float));
             if(m->trace) fwrite(hidden+(int64_t)t*D,sizeof(float),D,m->trace);
         }
+        /* Prefill does not emit tokens, and a full chunk can take minutes on
+         * CPU. Poll after each layer so the gateway can cancel before the
+         * first token instead of waiting for the entire prompt. */
+        if(poll_cancel&&poll_cancel(cancel_context)){
+            if(cancelled) *cancelled=1;
+            break;
+        }
     }
     float *logits=NULL;
-    if(m->has_head){
+    if((!cancelled||!*cancelled)&&m->has_head){
         double t0=now_s();
         for(int t=0;t<C;t++){
             /* head only where needed: the chunk's last token (feeds sampling)
@@ -1618,9 +1629,13 @@ static float *step_chunk(Model *m, const int *ids, int pos0, int C){
         m->t_head+=now_s()-t0;
     }
     /* record what was just fed, at the positions it went to (kv_prefix.h) */
-    kv_prefix_record(&m->kvp, ids, pos0, C);
+    if(!cancelled||!*cancelled) kv_prefix_record(&m->kvp,ids,pos0,C);
     free(hidden);free(bres);free(prefix);free(nrm);free(att);free(mix);free(mlp);
     return logits;
+}
+
+static float *step_chunk(Model *m, const int *ids, int pos0, int C){
+    return step_chunk_ex(m,ids,pos0,C,NULL,NULL,NULL);
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -1880,6 +1895,28 @@ static int serve_read_req(ServeReq *q, const char *active){
     return 2;
 }
 
+/* Drain only commands that can arrive while one request owns the engine. A
+ * second SUBMIT is refused without stealing the active request's state. */
+static int k3_serve_poll_cancel(void *context){
+    const char *active=context;
+    int cancelled=0;
+    while(serve_stdin_readable()){
+        ServeReq queued={0}; int r=serve_read_req(&queued,active);
+        if(r<0||r==1) cancelled=1;
+        if(r==2){
+            printf("ERROR %s engine busy\n",queued.id); fflush(stdout);
+            free(queued.payload);
+        }
+    }
+    return cancelled;
+}
+
+/* A cancelled prefill changed recurrent/KV state without publishing a model
+ * token. Drop that partial state so a later request cannot reuse it. */
+static void k3_cancel_unpublished_state(Model *m){
+    model_state_reset(m);
+}
+
 static void serve_data(const char *id, const char *p, int n){
     if(n<=0) return;
     printf("DATA %s %d\n",id,n);
@@ -1948,9 +1985,16 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     float *lo=NULL;
     /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
      * position-indexed, so the loop starts at `reuse`, not at 0. */
+    int prefill_cancelled=0;
     for(int i=reuse;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
-        free(lo); lo=step_chunk(m,ids+i,i,C);
+        free(lo); lo=step_chunk_ex(m,ids+i,i,C,k3_serve_poll_cancel,q->id,
+                                   &prefill_cancelled);
+        if(prefill_cancelled) break;
+    }
+    if(prefill_cancelled){
+        free(lo); k3_cancel_unpublished_state(m); free(ids);
+        printf("ERROR %s CANCELLED\n",q->id); fflush(stdout); return;
     }
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
     char buf[512], xtag[64];

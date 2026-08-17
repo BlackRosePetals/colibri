@@ -237,7 +237,8 @@ loaded for the whole terminal session. `coli serve` exposes streaming and
 non-streaming `/v1/chat/completions`; `coli web` uses that same API. Reasoning
 is returned as `reasoning_content`, response text as `content`, and
 `<|end_of_msg|>` remains the model-owned stop token. `STOP` and `CANCEL` are
-honoured between generated tokens.
+honoured between generated tokens. Long prefill also polls `CANCEL` between
+layers and drops the unpublished partial state before serving another request.
 
 ## Vulkan tier (`make VK=1 kimi_k3`)
 
