@@ -70,7 +70,8 @@ class Zero(nn.Module):
 
 def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           head_dim=16, rope_dim=8, n_experts=8, topk=2, inter=32,
-          vocab=320, max_new=16, prompt_ids=None, emit_ref=None):
+          vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
+          ref_mode="attention_only"):
     ModelCls, ConfigCls = get_classes()
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
@@ -113,14 +114,26 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
     print(f"Tiny model saved at {out}  (params ~ {sum(p.numel() for p in model.parameters())/1e6:.1f}M)")
 
     if emit_ref is not None:
-        # attention_only: replace DeltaNet layers (i%4!=3) with identity
-        replaced = 0
-        for i in range(n_layers):
-            if i % 4 != 3:
-                model.model.layers[i].self_attn = Zero()
-                model.model.layers[i].mlp = Zero()
-                replaced += 1
-        print(f"attention_only: replaced {replaced} DeltaNet layers with identity")
+        # attention_only replaces the DeltaNet layers (i%4!=3) with identity,
+        # which is what the Phase-1 engine computed. The Phase-2 engine runs
+        # BOTH layer kinds, so a gate built on that reference would pass while
+        # never touching 30 of 40 layers -- hence ref_mode="full", which leaves
+        # the model whole.
+        #
+        # This lives here rather than in make_qwen36_oracle.py because that
+        # script encodes a text prompt through AutoTokenizer.from_pretrained(),
+        # and this fixture is synthetic: it has weights and no tokenizer. The
+        # oracle script stays the tool for real checkpoints.
+        if ref_mode == "attention_only":
+            replaced = 0
+            for i in range(n_layers):
+                if i % 4 != 3:
+                    model.model.layers[i].self_attn = Zero()
+                    model.model.layers[i].mlp = Zero()
+                    replaced += 1
+            print(f"attention_only: replaced {replaced} DeltaNet layers with identity")
+        else:
+            print("full: both layer kinds active (Gated Attention + Gated DeltaNet)")
         if prompt_ids is None:
             prompt_ids = [1, 2, 3, 4, 5]
         input_ids = torch.tensor([prompt_ids])
@@ -129,7 +142,7 @@ def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
                                      use_cache=True)
         full = out_ids[0].tolist()
         payload = {"prompt_ids": prompt_ids, "full_ids": full,
-                   "mode": "attention_only", "model": "qwen36_tiny"}
+                   "mode": ref_mode, "model": "qwen36_tiny"}
         Path(emit_ref).write_text(json.dumps(payload, indent=2))
         print(f"ref.json -> {emit_ref}")
         print(f"  prompt_ids={prompt_ids}")
@@ -141,6 +154,10 @@ def main():
     ap.add_argument("--out", required=True, help="Output model dir")
     ap.add_argument("--emit-ref", default="ref_qwen36.json",
                     help="Also emit this ref.json (attention_only). Set '' to skip.")
+    ap.add_argument("--ref-mode", choices=["attention_only", "full"],
+                    default="attention_only",
+                    help="full keeps both layer kinds (Phase-2 engine); "
+                         "attention_only replaces DeltaNet with identity (Phase 1)")
     ap.add_argument("--max-new", type=int, default=16)
     ap.add_argument("--prompt-ids", default=None,
                     help="Comma-separated token ids for the prompt (default 1,2,3,4,5)")
@@ -151,7 +168,8 @@ def main():
         prompt_ids = [int(x) for x in args.prompt_ids.split(",") if x.strip() != ""]
     emit = args.emit_ref if args.emit_ref else None
 
-    build(Path(args.out), max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit)
+    build(Path(args.out), max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit,
+          ref_mode=args.ref_mode)
 
 
 if __name__ == "__main__":

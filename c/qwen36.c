@@ -2267,12 +2267,14 @@ int main(int argc, char **argv) {
         else fprintf(stderr, "[dump] cannot open %s\n", dp ? dp : "qwen36_logits.f32");
     }
 
+    int ref_match = 0;
     if (is_ref) {
         int match = 0;
         printf("\nReference: ");  for (int i=np;i<nfull;i++) printf("%d ", full[i]);
         printf("\nC engine : ");  for (int i=np;i<nfull;i++) { printf("%d ", out[i]); if (out[i]==full[i]) match++; }
         if (g_tok) { printf("Text      : "); print_decoded(out, np, nfull); printf("\n"); }
         printf("\nMatching tokens: %d/%d\n", match, n_new);
+        ref_match = match;
     } else {
     if (g_openai) {
         emit_openai_result(out, np, n_new, g_stream);
@@ -2292,6 +2294,11 @@ int main(int argc, char **argv) {
            (unsigned long long)m.hits, (unsigned long long)m.miss);
     fprintf(stderr, "Speed: %.2f tok/s (%.1fs for %d tokens)\n", n_new/dt, dt, n_new);
     free(buf); free(arena);
+    /* Oracle mode is a gate, not a report: a mismatch must fail the caller.
+     * inkling.c does the same (`return (match == ngen) ? 0 : 1;`) and its CI
+     * job relies on it — without this, tools/make_qwen36_oracle.py could be
+     * wired into a workflow that stays green through any regression. */
+    if (is_ref) return ref_match == n_new ? 0 : 1;
     return 0;
 }
 #endif /* QWEN36_NO_MAIN */
