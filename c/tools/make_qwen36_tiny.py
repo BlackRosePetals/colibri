@@ -71,7 +71,11 @@ class Zero(nn.Module):
 def build(out: Path, hidden=64, n_layers=8, q_heads=4, kv_heads=2,
           head_dim=16, rope_dim=8, n_experts=8, topk=2, inter=32,
           vocab=320, max_new=16, prompt_ids=None, emit_ref=None,
-          ref_mode="attention_only"):
+          ref_mode="attention_only", seed=20260817):
+    # Fixed by default: an unseeded draw makes the gate flaky. Measured --
+    # three local draws passed, one CI draw failed at 11/16, with identical
+    # code. A gate that reddens at random gets muted within a week.
+    torch.manual_seed(seed)
     ModelCls, ConfigCls = get_classes()
     layer_types = ["full_attention" if i % 4 == 3 else "linear_attention"
                    for i in range(n_layers)]
@@ -154,6 +158,9 @@ def main():
     ap.add_argument("--out", required=True, help="Output model dir")
     ap.add_argument("--emit-ref", default="ref_qwen36.json",
                     help="Also emit this ref.json (attention_only). Set '' to skip.")
+    ap.add_argument("--seed", type=int, default=20260817,
+                    help="RNG seed for the random init; fixed so the gate is "
+                         "reproducible")
     ap.add_argument("--ref-mode", choices=["attention_only", "full"],
                     default="attention_only",
                     help="full keeps both layer kinds (Phase-2 engine); "
@@ -169,7 +176,7 @@ def main():
     emit = args.emit_ref if args.emit_ref else None
 
     build(Path(args.out), max_new=args.max_new, prompt_ids=prompt_ids, emit_ref=emit,
-          ref_mode=args.ref_mode)
+          ref_mode=args.ref_mode, seed=args.seed)
 
 
 if __name__ == "__main__":

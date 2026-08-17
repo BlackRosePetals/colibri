@@ -346,9 +346,13 @@ jobs:
           # untested.
           python3 tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full \
                   --emit-ref qwen36_tiny/ref_full.json
-          # ebits=8 keeps the expert quantization error far below anything that
-          # could flip a greedy argmax, so a mismatch means the engine changed,
-          # not the container.
+          # ebits=8 keeps the expert quantization error below anything that could
+          # flip a greedy argmax here -- measured. The DENSE weights are the ones
+          # that matter: the engine quantizes them to int8 by default, the torch
+          # reference does not, and that alone cost 7 of 16 tokens. The runs below
+          # therefore set COLI_DENSE_I8=0, which is what the accuracy A/B in
+          # 07_Tests uses for the same reason. Without it this gate compares two
+          # different models and reddens on the luck of the draw.
           python3 tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
       - name: Token-exact against the oracle, at several cache capacities
         run: |
@@ -361,7 +365,8 @@ jobs:
           # in flight. The engine exits non-zero on any token mismatch.
           for cap in 1 2 8; do
             echo "::group::cap=$cap"
-            SNAP=qwen36_tiny_c ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c \
+              ./qwen36 "$cap" 8 qwen36_tiny/ref_full.json
             echo "::endgroup::"
           done
       - name: Same run under ASan + UBSan
@@ -375,7 +380,7 @@ jobs:
           make clean >/dev/null 2>&1 || true
           make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
-            SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
+            COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
             ./qwen36 1 8 qwen36_tiny/ref_full.json
           # TODO once A1/A2 land: add a malformed-container case here (config.json
           # and qwen36_meta.json disagreeing on the layer count) and assert the
