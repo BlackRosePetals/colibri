@@ -4,6 +4,14 @@
 /* Amalgamated deepseek_v4.c — GLM-style source; compile with -DCOLI_V4_UNIT_* per object */
 /* Umbrella API: deepseek_v4.h (included by units) */
 
+/* n_routed_experts has no config.json upper bound (only >=1 is checked), so a
+ * fixed-size stack buffer can't be the only path -- an unusually large/hostile
+ * config must still work via heap, just slower. COLI_V4_ROUTE_STACK_EXPERTS
+ * covers every routed-MoE config seen in practice (typical: 64-256) so the
+ * per-token/per-layer routing call in the hot decode path allocates nothing;
+ * anything larger falls back to malloc exactly like before this change. */
+#define COLI_V4_ROUTE_STACK_EXPERTS 512
+
 #ifdef COLI_V4_UNIT_ST
 /* Shared st.h adapter and V4 tensor materialization helpers. */
 #include "deepseek_v4_internal.h"
@@ -37,7 +45,8 @@ int coli_st_index_open(ColiSafetensorsIndex **out, const char *directory,
     ColiSafetensorsIndex *index = calloc(1, sizeof(*index));
     if (!index)
         return set_error(error, error_size, "out of memory opening: %s", directory);
-    st_init(index, directory);
+    const char *extra_dirs = getenv("COLI_MODEL_DIRS"); /* SPLIT: shards spread across N drives */
+    st_init_multi(index, directory, (extra_dirs && *extra_dirs) ? extra_dirs : NULL);
     if (!index->nfd || !index->n) {
         coli_st_index_close(index);
         return set_error(error, error_size, "no safetensors tensors in: %s", directory);
@@ -1712,13 +1721,16 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts)
         return -1;
-    float *scores = malloc((size_t)experts * sizeof(*scores));
-    float *selection = malloc((size_t)experts * sizeof(*selection));
-    unsigned char *selected = calloc((size_t)experts, 1);
+    float scores_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    float selection_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    unsigned char selected_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    int on_stack = experts <= COLI_V4_ROUTE_STACK_EXPERTS;
+    float *scores = on_stack ? scores_buf : malloc((size_t)experts * sizeof(*scores));
+    float *selection = on_stack ? selection_buf : malloc((size_t)experts * sizeof(*selection));
+    unsigned char *selected = on_stack ? selected_buf : calloc((size_t)experts, 1);
+    if (on_stack) memset(selected, 0, (size_t)experts);
     if (!scores || !selection || !selected) {
-        free(scores);
-        free(selection);
-        free(selected);
+        if (!on_stack) { free(scores); free(selection); free(selected); }
         return -1;
     }
     for (int expert = 0; expert < experts; expert++) {
@@ -1731,9 +1743,7 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
     if (forced_indices) {
         for (int rank = 0; rank < topk; rank++) {
             if (forced_indices[rank] < 0 || forced_indices[rank] >= experts) {
-                free(selected);
-                free(selection);
-                free(scores);
+                if (!on_stack) { free(selected); free(selection); free(scores); }
                 return -1;
             }
             indices[rank] = forced_indices[rank];
@@ -1754,16 +1764,12 @@ int coli_v4_route(float *weights, int *indices, const float *hidden,
     for (int rank = 0; rank < topk; rank++)
         total += scores[indices[rank]];
     if (!(total > 0.0f)) {
-        free(selected);
-        free(selection);
-        free(scores);
+        if (!on_stack) { free(selected); free(selection); free(scores); }
         return -1;
     }
     for (int rank = 0; rank < topk; rank++)
         weights[rank] = scores[indices[rank]] / total * route_scale;
-    free(selected);
-    free(selection);
-    free(scores);
+    if (!on_stack) { free(selected); free(selection); free(scores); }
     return 0;
 }
 
@@ -7522,15 +7528,17 @@ static int v4_read_expert_record(V4ExpertStoreState *state,
         __atomic_fetch_add(&v4_direct_reads, UINT64_C(1), __ATOMIC_RELAXED);
         __atomic_fetch_add(&v4_direct_payload_bytes, record->weight_bytes,
                            __ATOMIC_RELAXED);
-    } else {
-        if (direct_available)
-            __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
-                               __ATOMIC_RELAXED);
-        if (coli_st_read_at_rep(state->index, record->shard, rep,
+        return coli_st_read_at_rep(state->index, record->shard, rep,
+                                   record->scale_offset,
+                                   (size_t)record->scale_bytes, slot->slab);
+    }
+    if (direct_available)
+        __atomic_fetch_add(&v4_direct_fallbacks, UINT64_C(1),
+                           __ATOMIC_RELAXED);
+    if (coli_st_read_at_rep(state->index, record->shard, rep,
                             record->weight_offset,
                             (size_t)record->weight_bytes,
                             slot->slab + record->scale_bytes)) return -1;
-    }
     return coli_st_read_at_rep(state->index, record->shard, rep,
                                record->scale_offset,
                                (size_t)record->scale_bytes, slot->slab);
@@ -8273,11 +8281,17 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
                        int topk, float route_scale) {
     if (!weights || !indices || !hidden || !gate || experts < 1 ||
         dimension < 1 || topk < 1 || topk > experts) return -1;
-    float *scores = malloc((size_t)experts * sizeof(*scores));
-    float *selection = malloc((size_t)experts * sizeof(*selection));
-    unsigned char *selected = calloc((size_t)experts, 1);
+    float scores_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    float selection_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    unsigned char selected_buf[COLI_V4_ROUTE_STACK_EXPERTS];
+    int on_stack = experts <= COLI_V4_ROUTE_STACK_EXPERTS;
+    float *scores = on_stack ? scores_buf : malloc((size_t)experts * sizeof(*scores));
+    float *selection = on_stack ? selection_buf : malloc((size_t)experts * sizeof(*selection));
+    unsigned char *selected = on_stack ? selected_buf : calloc((size_t)experts, 1);
+    if (on_stack) memset(selected, 0, (size_t)experts);
     if (!scores || !selection || !selected) {
-        free(selected); free(selection); free(scores); return -1;
+        if (!on_stack) { free(selected); free(selection); free(scores); }
+        return -1;
     }
     for (int expert = 0; expert < experts; expert++) {
         float sum = 0.0f;
@@ -8290,7 +8304,8 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
     if (forced_indices) {
         for (int rank = 0; rank < topk; rank++) {
             if (forced_indices[rank] < 0 || forced_indices[rank] >= experts) {
-                free(selected); free(selection); free(scores); return -1;
+                if (!on_stack) { free(selected); free(selection); free(scores); }
+                return -1;
             }
             indices[rank] = forced_indices[rank];
         }
@@ -8309,11 +8324,12 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
     for (int rank = 0; rank < topk; rank++)
         total += scores[indices[rank]];
     if (!(total > 0.0f)) {
-        free(selected); free(selection); free(scores); return -1;
+        if (!on_stack) { free(selected); free(selection); free(scores); }
+        return -1;
     }
     for (int rank = 0; rank < topk; rank++)
         weights[rank] = scores[indices[rank]] / total * route_scale;
-    free(selected); free(selection); free(scores);
+    if (!on_stack) { free(selected); free(selection); free(scores); }
     return 0;
 }
 #endif /* COLI_V4_UNIT_ROUTE_BF16 */
