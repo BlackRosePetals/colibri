@@ -906,10 +906,16 @@ tests/test_tok_o200k$(EXE): tests/test_tok_o200k.c tok.h tok_unicode.h tok_unico
 tests/test_k3_ram_budget$(EXE): tests/test_k3_ram_budget.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_k3_mmap$(EXE): tests/test_k3_mmap.c kimi_k3.c st.h tok.h quant.h compat.h omp_tune.h route_trace.h kv_prefix.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 tests/test_tok_kimi_tiny$(EXE): tests/test_tok_kimi_tiny.c tok.h tok_unicode.h tok_unicode_o200k.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 	$(CC) $(CFLAGS) -DST_PREAD_CHUNK=7 $< -o $@ $(LDFLAGS)
+
+tests/test_st_map$(EXE): tests/test_st_map.c st.h json.h compat.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_st_shape$(EXE): tests/test_st_shape.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)

@@ -315,6 +315,7 @@ Read **only** by `c/kimi_k3.c`. The K3 engine has its own loader, cache and quan
 | `K3_BITS` | `4` | Expert quantization width. Setting it at all also pins the choice (the engine otherwise infers it from the container). |
 | `K3_MLA_BITS` | `8` | Quantization width for the MLA attention tensors. |
 | `K3_HEAD_BITS` | `8` | Quantization width for the LM head. |
+| `K3_MMAP` | `0` (off) | Map fully prepared U8 matrices and F32 sidecars read-only. CPU-only; refuses conversion and enabled GPU backends rather than falling back. |
 | `K3_EXPERT_GB` | `8.0` | RAM budget (GB) for the expert LRU cache; per-layer slots are derived from it. |
 | `K3_LAYERS` | `0` (all) | Load only the first N layers — for smoke tests and trace-only runs. |
 | `K3_MAXT` | `np + ngen` one-shot, `8192` in serve | KV cache capacity in tokens. In serve mode it is also the prompt-rejection bound. |
