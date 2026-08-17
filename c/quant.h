@@ -1453,13 +1453,18 @@ static void matmul_mxfp4(float *y, const float *x, const uint8_t *q4, const uint
  *     y = sum_g idot_g * (2^(e8-127) * 0.5) * xscale_g
  * Activation-quant noise (~0.4%/group) rides on top of the e2m1 grid; gate
  * with K3_IDOT=0 in the K3 engine for exact-float A/B. */
-static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
-                            int S, int I, int O){
-    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
-    int rb=I/2, ng=I/32;
-    int8_t *xq=(int8_t*)malloc((size_t)S*I);
-    float *xsc=(float*)malloc((size_t)S*ng*sizeof(float));
-    if(!xq||!xsc){ fprintf(stderr,"OOM mxfp4 idot scratch\n"); exit(1); }
+/* Quantizzazione int8 per-gruppo-di-32 delle attivazioni per l'IDOT mxfp4.
+ * Estratta da matmul_mxfp4_i8 (ordine dei loop IDENTICO -> stessi byte) così i
+ * chiamanti possono sollevarla a livello layer: in kimi_k3 gate e up consumano
+ * lo stesso z, e ogni expert del layer consuma le stesse righe — prima ogni
+ * chiamata riquantizzava da capo, con un malloc/free a giro (issue del PR #1071
+ * per colibri.c; qui è la stessa malattia in forma mxfp4).
+ * EN: per-32-group int8 activation quantization for the mxfp4 IDOT kernel.
+ * Extracted with the loop order unchanged (bit-identical) so callers can hoist
+ * it to layer level: gate/up share one z, and every expert of the layer
+ * consumes the same rows. */
+static void mxfp4_qx(const float *x, int S, int I, int8_t *xq, float *xsc){
+    int ng=I/32;
     for(int s=0;s<S;s++)
         for(int g=0;g<ng;g++){
             const float *xg=x+(int64_t)s*I+g*32;
@@ -1472,6 +1477,14 @@ static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const u
                 if(v>127)v=127; if(v<-127)v=-127; qg[i]=(int8_t)v;
             }
         }
+}
+
+/* Compute su attivazioni GIA' quantizzate (xq/xsc da mxfp4_qx). Contratto: I%32==0.
+ * EN: compute on pre-quantized activations. Contract: I%32==0. */
+static void matmul_mxfp4_i8_pre(float *y, const int8_t *xq, const float *xsc,
+                                const uint8_t *q4, const uint8_t *e8s,
+                                int S, int I, int O){
+    int rb=I/2, ng=I/32;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){
         const uint8_t *w=q4+(int64_t)o*rb;
@@ -1518,7 +1531,20 @@ static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const u
             }
         }
     }
-    free(xq); free(xsc);
+}
+
+/* Wrapper storico: quantizza in scratch _Thread_local (niente più malloc/free
+ * per chiamata) e delega al kernel _pre. Stessi valori, stessi ordini.
+ * EN: historical entry point — quantize into the growable thread-local scratch
+ * (no more per-call malloc/free) and delegate to the _pre kernel. */
+static void matmul_mxfp4_i8(float *y, const float *x, const uint8_t *q4, const uint8_t *e8s,
+                            int S, int I, int O){
+    if(I%32){ matmul_mxfp4(y,x,q4,e8s,S,I,O); return; }
+    int ng=I/32;
+    int8_t *xq; float *xsc;
+    quant_scratch((size_t)S*I,(size_t)S*ng,&xq,&xsc);
+    mxfp4_qx(x,S,I,xq,xsc);
+    matmul_mxfp4_i8_pre(y,xq,xsc,q4,e8s,S,I,O);
 }
 
 #ifdef __ARM_NEON
