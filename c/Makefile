@@ -894,6 +894,9 @@ iobench$(EXE): iobench.c compat.h
 tests/test_serve_sentinel$(EXE): tests/test_serve_sentinel.c compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_cluster_protocol$(EXE): tests/test_cluster_protocol.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_ue8m0$(EXE): tests/test_ue8m0.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1244,7 +1247,7 @@ install: colibri$(EXE) inkling$(EXE) kimi_k3$(EXE) olmoe$(EXE) \
 	  $(INSTALL) -m 755 deepseek_v4$(EXE) $(DESTDIR)$(LIBEXECDIR)/deepseek_v4$(EXE); \
 	fi
 	$(INSTALL) -m 644 family_registry.py resource_plan.py doctor.py autotune.py \
-		openai_server.py v4_dsml.py version.py $(DESTDIR)$(LIBEXECDIR)/
+		openai_server.py cluster.py v4_dsml.py version.py $(DESTDIR)$(LIBEXECDIR)/
 	$(INSTALL) -m 644 tools/*.py $(DESTDIR)$(LIBEXECDIR)/tools/
 	@# The dashboard is an optional build artifact (cd web && npm run build), so install
 	@# it only when it exists. It goes NEXT TO openai_server.py, which probes ./web/dist.
