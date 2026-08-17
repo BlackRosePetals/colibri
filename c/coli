@@ -342,8 +342,9 @@ def require_model(model, file="tokenizer.json", engine=None, target="", build="c
         sys.exit(f"{C.yel}{label}engine is not built.{C.r} Run: {build}")
 
 def need_model(model, engine=None):
-    if not model:
-        sys.exit(f"{C.yel}no model directory given.{C.r}\n  {NO_MODEL_HINT}")
+    # Directory/file checks come FIRST: resolving the family reads config.json,
+    # and a missing model dir must say "model not found", not "unsupported model".
+    require_model(model, file="tokenizer.json")
     engine = engine or engine_for(model)
     target = resolve_model(model).descriptor.build_target
     require_model(model, file="tokenizer.json", engine=engine, target=target,
