@@ -69,7 +69,7 @@ except ModuleNotFoundError:
         _version = "unknown"
 
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
-                             family_by_id, resolve_model)
+                             family_by_id, resolve_model, tuning_replay_prompt)
 
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
@@ -973,19 +973,15 @@ def cmd_tune(a):
     # family it then mis-dispatched.
     family=resolve_model(a.model).descriptor
     arch=family.id
-    if family.gateway_adapter not in ("glm","inkling","kimi","olmoe","deepseek_v4"):
-        sys.exit(f"{family.display_name}: gateway adapter {family.gateway_adapter!r} is not wired")
+    if not family.has_gateway_adapter:
+        sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
     base_env=env_for_engine(a,arch) if arch!="glm" else env_for(a)
     # The replay prompt has to be the engine's own template: GLM's [gMASK]<sop>
     # markers are ordinary text to every other tokenizer, so the sweep would have
     # measured a different workload than the one users run.
-    prompt=({"glm":     f"[gMASK]<sop><|user|>{a.prompt}<|assistant|><think></think>",
-             "inkling": f"<|user|>{a.prompt}<|assistant|>",
-             "kimi":    f"K3CHAT1\nM user {len(a.prompt)}\n{a.prompt}G 0\n\n",
-             "olmoe":   f"<|user|>\n{a.prompt}\n<|assistant|>\n",
-            }.get(arch, a.prompt))
+    prompt=tuning_replay_prompt(family,a.prompt)
     banner("tune · measured execution profile", model=a.model)
     print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
     print("  only quality-preserving scheduling knobs are eligible\n")
@@ -1018,7 +1014,7 @@ def cmd_run(a):
     need_model(a.model,engine)
     prompt=" ".join(a.prompt) if a.prompt else sys.exit('usage: coli run "your prompt"')
     banner("run", model=a.model)
-    if family.cli_adapter not in ("glm","deepseek_v4","olmoe"):
+    if not family.has_cli_adapter:
         sys.exit(f"{C.yel}coli run is not wired for {family.display_name};{C.r} "
                  f"use coli chat or coli serve")
     if arch=="deepseek_v4":
@@ -1228,8 +1224,8 @@ def cmd_chat(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
     arch=family.id
-    if family.gateway_adapter not in ("glm","inkling","kimi","olmoe","deepseek_v4"):
-        sys.exit(f"{family.display_name}: gateway adapter {family.gateway_adapter!r} is not wired")
+    if not family.has_gateway_adapter:
+        sys.exit(f"{family.display_name}: gateway adapter is not wired")
     if arch!="glm":
         engine=engine_for(a.model)
         need_model(a.model,engine)
@@ -1421,8 +1417,8 @@ def cmd_serve(a):
     need_model(a.model)
     family=resolve_model(a.model).descriptor
     arch=family.id
-    if family.gateway_adapter not in ("glm","inkling","kimi","olmoe","deepseek_v4"):
-        sys.exit(f"{family.display_name}: gateway adapter {family.gateway_adapter!r} is not wired")
+    if not family.has_gateway_adapter:
+        sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
     if a.kv_slots>family.limits.max_kv_slots:
