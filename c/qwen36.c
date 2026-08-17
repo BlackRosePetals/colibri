@@ -917,6 +917,70 @@ static void load_cfg(Cfg *c, const char *snap) {
  * Phase-1 defaults with the real model dimensions. The converter derives the
  * head dims from the actual weight shapes, so these are authoritative. Falls
  * back silently to the i%4==3 pattern and defaults if the file is absent. */
+
+/* Every dimension the forward pass indexes with, checked once against the
+ * buffers that actually exist. Both config.json and qwen36_meta.json ship
+ * INSIDE the container, so a mismatched or hostile pair is a supply-chain
+ * input, not a programmer error -- and the repo just spent six advisories
+ * removing this bug class (unvalidated config -> heap OOB). Pattern follows
+ * kimi_k3.c: one guarded expression per dimension, exit with a clear message.
+ *
+ * The fixed-size buffers below are the reason the ceilings are what they are;
+ * raising one means raising the buffer with it:
+ *   moe()      uint8_t keep[1024]        -> n_experts <= 1024
+ *   moe()      int idx[256], val[256]    -> topk      <= 256
+ *   deltanet() float kvl[512], dl[512]   -> dn_vdim   <= 512   (OpenMP region)
+ */
+#define CFG_NEED(cond, ...) do { if (!(cond)) {         fprintf(stderr, "[cfg] "); fprintf(stderr, __VA_ARGS__);         fprintf(stderr, " -- refusing\n"); exit(1); } } while (0)
+
+static void validate_cfg(const Cfg *c, int n_layers_from_config) {
+    CFG_NEED(c->n_layers > 0 && c->n_layers <= 512,
+             "n_layers %d out of range 1..512", c->n_layers);
+    /* A layer count that disagrees between the two files is a broken container:
+     * is_attn was sized from config.json before meta could override n_layers. */
+    CFG_NEED(c->n_layers == n_layers_from_config,
+             "config.json says %d layers, qwen36_meta.json says %d",
+             n_layers_from_config, c->n_layers);
+    CFG_NEED(c->hidden > 0 && c->hidden <= 65536, "hidden %d out of range", c->hidden);
+    CFG_NEED(c->vocab > 0, "vocab %d must be positive", c->vocab);
+    CFG_NEED(c->n_experts > 0 && c->n_experts <= 1024,
+             "num_experts %d out of range 1..1024 (keep[] in moe())", c->n_experts);
+    CFG_NEED(c->topk > 0 && c->topk <= 256,
+             "topk %d out of range 1..256 (idx[]/val[] in moe())", c->topk);
+    CFG_NEED(c->topk <= c->n_experts, "topk %d exceeds num_experts %d",
+             c->topk, c->n_experts);
+    CFG_NEED(c->inter > 0 && c->shared_inter > 0,
+             "moe_inter %d / shared_inter %d must be positive", c->inter, c->shared_inter);
+    CFG_NEED(c->q_heads > 0 && c->kv_heads > 0 && c->head_dim > 0,
+             "attention dims q_heads=%d kv_heads=%d head_dim=%d must be positive",
+             c->q_heads, c->kv_heads, c->head_dim);
+    CFG_NEED(c->q_heads % c->kv_heads == 0,
+             "q_heads %d is not a multiple of kv_heads %d (GQA grouping)",
+             c->q_heads, c->kv_heads);
+    CFG_NEED(c->k_head_dim > 0 && c->v_head_dim > 0 && c->q_head_dim > 0,
+             "per-head dims must be positive");
+    /* DeltaNet: every one of these indexes a buffer or divides. */
+    if (c->n_active < c->n_layers) {          /* at least one DeltaNet layer */
+        CFG_NEED(c->dn_vheads > 0 && c->dn_kheads > 0,
+                 "dn_vheads %d / dn_kheads %d must be positive (rep = vh / vk)",
+                 c->dn_vheads, c->dn_kheads);
+        CFG_NEED(c->dn_vheads % c->dn_kheads == 0,
+                 "dn_vheads %d is not a multiple of dn_kheads %d",
+                 c->dn_vheads, c->dn_kheads);
+        CFG_NEED(c->dn_kdim > 0, "dn_kdim %d must be positive", c->dn_kdim);
+        CFG_NEED(c->dn_vdim > 0 && c->dn_vdim <= 512,
+                 "dn_vdim %d out of range 1..512 (kvl[]/dl[] in deltanet())",
+                 c->dn_vdim);
+        CFG_NEED(c->dn_convk >= 2, "dn_convk %d must be >= 2 (conv ring is convk-1)",
+                 c->dn_convk);
+        CFG_NEED(c->dn_conv_dim ==
+                 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim,
+                 "dn_conv_dim %d != 2*kheads*kdim + vheads*vdim (%d)",
+                 c->dn_conv_dim,
+                 2 * c->dn_kheads * c->dn_kdim + c->dn_vheads * c->dn_vdim);
+    }
+}
+
 static void load_meta(Cfg *c, const char *snap) {
     char path[2048]; snprintf(path, sizeof(path), "%s/qwen36_meta.json", snap);
     FILE *f = fopen(path, "rb"); if (!f) { printf("[meta] %s not found; using i%%4==3 + defaults\n", path); return; }
@@ -988,7 +1052,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
+    int n_layers_from_config = m->c.n_layers;
     load_meta(&m->c, snap);
+    validate_cfg(&m->c, n_layers_from_config);
     if (m->c.rotary_dim > m->c.head_dim || m->c.rotary_dim % 2 != 0) {
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }

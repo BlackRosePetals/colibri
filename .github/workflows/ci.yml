@@ -382,10 +382,32 @@ jobs:
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
             COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
             ./qwen36 1 8 qwen36_tiny/ref_full.json
-          # TODO once A1/A2 land: add a malformed-container case here (config.json
-          # and qwen36_meta.json disagreeing on the layer count) and assert the
-          # engine REFUSES it. That is the case ASan caught, and a well-formed
-          # fixture cannot reproduce it -- this step guards the happy path only.
+      - name: A malformed container is refused, not read
+        run: |
+          cd c
+          # The case ASan caught in review: config.json and qwen36_meta.json ship
+          # in the same container and disagreed on the layer count, so is_attn was
+          # sized from one and written from the other. Reproduced without the
+          # guard as a heap-buffer-overflow WRITE at load_meta; with it the engine
+          # refuses. A well-formed fixture cannot cover this, which is why it gets
+          # its own step -- and it asserts the REFUSAL, so a guard that silently
+          # stops guarding fails here.
+          cp -r qwen36_tiny_c qwen36_tiny_bad
+          python3 - <<'PY'
+          import json
+          p = "qwen36_tiny_bad/config.json"
+          cfg = json.load(open(p))
+          cfg["num_hidden_layers"] = 4          # meta says 8
+          json.dump(cfg, open(p, "w"))
+          PY
+          if COLI_DENSE_I8=0 SNAP=qwen36_tiny_bad ./qwen36 8 8 \
+               qwen36_tiny/ref_full.json > bad.log 2>&1; then
+            echo "FAIL: engine accepted a container whose two config files disagree"
+            cat bad.log; exit 1
+          fi
+          grep -q "config.json says 4 layers" bad.log || {
+            echo "FAIL: refused, but not for the reason under test"; cat bad.log; exit 1; }
+          echo "refused as expected:"; grep '^\[cfg\]' bad.log
 
   inkling-oracle:
     name: Inkling oracle (token-exact vs transformers)
