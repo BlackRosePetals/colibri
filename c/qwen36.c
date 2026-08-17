@@ -718,8 +718,14 @@ static inline int32_t dot_i8_16(const int8_t *a, const int8_t *b) {
 #endif
 static void matmul_q(float *y, const float *x, const int8_t *q, const float *scale, int I, int O) {
 #if defined(__ARM_NEON)
+    /* IDOT is opt-in, not default-on: this path quantizes the ACTIVATIONS to
+     * Q8_0 per 16-element block, which the scalar path does not, so the two are
+     * not numerically equivalent. olmoe shipped it default-on and it cost
+     * token-exactness end to end (#1044, fixed in af48fe8 by making it opt-in);
+     * qwen36 inherited the same default from the same family of kernels. The
+     * tiny-oracle gate would not have caught it -- that job runs on x86. */
     static int idot = -1;
-    if (idot < 0) { const char *e = getenv("IDOT"); idot = !(e && *e == '0'); }
+    if (idot < 0) { const char *e = getenv("IDOT"); idot = (e && atoi(e)); }
     if (idot && I % 16 == 0 && I <= 4096) {
         int nb = I / 16; int8_t xi[4096]; float xs[256];
         for (int b = 0; b < nb; b++) {
@@ -1040,9 +1046,18 @@ static void load_meta(Cfg *c, const char *snap) {
                c->dn_vheads, c->dn_kheads, c->dn_kdim, c->dn_vdim, c->dn_convk, c->dn_conv_dim);
 }
 
-static float *load_t(Model *m, const char *name) {
+/* `want` is the element count the forward pass will index with. The container
+ * is a file, not an invariant: this used to allocate whatever st_numel reported
+ * while every read afterwards used CONFIG dims, so a short tensor was a plain
+ * heap OOB read (embed is indexed as m->embed + ids[s]*D). The expert path
+ * already refuses a wrong size; this is the same discipline for the dense set. */
+static float *load_t_n(Model *m, const char *name, int64_t want) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
+    if (want > 0 && n != want) {
+        fprintf(stderr, "%s: %lld elements, config implies %lld -- refusing\n",
+                name, (long long)n, (long long)want); exit(1);
+    }
     float *p = falloc(n);
     st_read_f32(&m->S, name, p, 0);
     return p;
@@ -1061,9 +1076,9 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     st_init(&m->S, snap);
     Cfg *c = &m->c;
     double t0 = now_s();
-    m->embed      = load_t(m, "model.embed_tokens.weight");
-    m->lm_head    = load_t(m, "lm_head.weight");
-    m->final_norm = load_t(m, "model.norm.weight");
+    m->embed      = load_t_n(m, "model.embed_tokens.weight", (int64_t)c->vocab * c->hidden);
+    m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
+    m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     m->L = calloc(c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
      * under its OWN original index model.layers.{i}. So active_of is the identity
@@ -1075,46 +1090,55 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
         int ai = m->active_of[i];        /* == i for Phase 2 */
         Layer *l = &m->L[i];
         /* input/post layernorms + MoE exist for every layer */
-        #define LD(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t(m,nm)
-        LD(in_ln,  "input_layernorm.weight");
-        LD(post_ln,"post_attention_layernorm.weight");
-        LD(gate, "mlp.gate.weight");
+        #define LD(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d." suffix,ai); l->field = load_t_n(m,nm,(want))
+        LD(in_ln,  "input_layernorm.weight", c->hidden);
+        LD(post_ln,"post_attention_layernorm.weight", c->hidden);
+        LD(gate, "mlp.gate.weight", (int64_t)c->n_experts * c->hidden);
         #undef LD
         /* q/k norms are per-head [head_dim]; only on attention layers, load if present */
         if (c->has_qk_norm) {
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.q_norm.weight", ai);
-            l->qn = st_has(&m->S, nm) ? load_t(m, nm) : NULL;
+            l->qn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
             snprintf(nm,sizeof(nm),"model.layers.%d.self_attn.k_norm.weight", ai);
-            l->kn = st_has(&m->S, nm) ? load_t(m, nm) : NULL;
+            l->kn = st_has(&m->S, nm) ? load_t_n(m, nm, c->head_dim) : NULL;
         } else { l->qn = NULL; l->kn = NULL; }
         /* router correction bias (optional) */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.gate.e_score_correction_bias", ai);
         if (st_has(&m->S, nm)) { l->gate_bias = falloc(c->n_experts); st_read_f32(&m->S, nm, l->gate_bias, 0); }
         else l->gate_bias = NULL;
         /* shared expert (dense f32) */
-        #define LD2(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert." suffix,ai); l->field = load_t(m,nm)
-        LD2(sh_g, "gate_proj.weight"); LD2(sh_u, "up_proj.weight"); LD2(sh_d, "down_proj.weight");
+        #define LD2(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert." suffix,ai); l->field = load_t_n(m,nm,(want))
+        LD2(sh_g, "gate_proj.weight", (int64_t)c->shared_inter * c->hidden);
+        LD2(sh_u, "up_proj.weight",   (int64_t)c->shared_inter * c->hidden);
+        LD2(sh_d, "down_proj.weight", (int64_t)c->hidden * c->shared_inter);
         #undef LD2
         /* shared_expert_gate: Linear(hidden -> 1), sigmoid-gated shared expert */
         snprintf(nm,sizeof(nm),"model.layers.%d.mlp.shared_expert_gate.weight", ai);
-        l->sh_gate = st_has(&m->S, nm) ? load_t(m, nm) : NULL;
+        l->sh_gate = st_has(&m->S, nm) ? load_t_n(m, nm, c->hidden) : NULL;
         if (c->is_attn[i]) {
             /* Gated Attention (full_attention) layer */
-            #define LD3(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d.self_attn." suffix,ai); l->field = load_t(m,nm)
-            LD3(q, "q_proj.weight"); LD3(k, "k_proj.weight");
-            LD3(v, "v_proj.weight"); LD3(o, "o_proj.weight");
+            #define LD3(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.self_attn." suffix,ai); l->field = load_t_n(m,nm,(want))
+            LD3(q, "q_proj.weight", (int64_t)c->q_heads * c->q_head_dim * c->hidden);
+            LD3(k, "k_proj.weight", (int64_t)c->kv_heads * c->k_head_dim * c->hidden);
+            LD3(v, "v_proj.weight", (int64_t)c->kv_heads * c->v_head_dim * c->hidden);
+            LD3(o, "o_proj.weight", (int64_t)c->hidden * c->o_in);
             #undef LD3
             l->dn_qkv=l->dn_z=l->dn_b=l->dn_a=l->dn_conv=NULL;
             l->dn_dtbias=l->dn_alog=l->dn_norm=l->dn_out=NULL;
         } else {
             /* Gated DeltaNet (linear_attention) layer */
             l->q=l->k=l->v=l->o=NULL;
-            #define LD4(field, suffix) snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn." suffix,ai); l->field = load_t(m,nm)
-            LD4(dn_qkv, "in_proj_qkv.weight"); LD4(dn_z, "in_proj_z.weight");
-            LD4(dn_b,   "in_proj_b.weight");    LD4(dn_a, "in_proj_a.weight");
-            LD4(dn_conv,"conv1d.weight");       LD4(dn_dtbias, "dt_bias");
-            LD4(dn_alog,"A_log");               LD4(dn_norm, "norm.weight");
-            LD4(dn_out, "out_proj.weight");
+            #define LD4(field, suffix, want) snprintf(nm,sizeof(nm),"model.layers.%d.linear_attn." suffix,ai); l->field = load_t_n(m,nm,(want))
+            int64_t vdim_tot = (int64_t)c->dn_vheads * c->dn_vdim;
+            LD4(dn_qkv, "in_proj_qkv.weight", (int64_t)c->dn_conv_dim * c->hidden);
+            LD4(dn_z,   "in_proj_z.weight",   vdim_tot * c->hidden);
+            LD4(dn_b,   "in_proj_b.weight",   (int64_t)c->dn_vheads * c->hidden);
+            LD4(dn_a,   "in_proj_a.weight",   (int64_t)c->dn_vheads * c->hidden);
+            LD4(dn_conv,"conv1d.weight",      (int64_t)c->dn_conv_dim * c->dn_convk);
+            LD4(dn_dtbias, "dt_bias",         c->dn_vheads);
+            LD4(dn_alog,"A_log",              c->dn_vheads);
+            LD4(dn_norm, "norm.weight",       c->dn_vdim);
+            LD4(dn_out, "out_proj.weight",    (int64_t)c->hidden * vdim_tot);
             #undef LD4
         }
     }
@@ -1775,7 +1799,18 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
         pthread_mutex_unlock(&g_pilot_mx);
     }
     float *x = falloc((int64_t)S*D);
-    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    for (int s = 0; s < S; s++) {
+        /* The gather indexes embed by token id, so an id outside the vocabulary
+         * reads off the end. Ids reach here from the tokenizer, from a serve
+         * request and from the engine's own sampler -- three sources, one of
+         * which is remote, and none of them checked until now. */
+        if (ids[s] < 0 || ids[s] >= c->vocab) {
+            fprintf(stderr, "token id %d out of range 0..%d -- refusing\n",
+                    ids[s], c->vocab - 1);
+            exit(1);
+        }
+        memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    }
     float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
     for (int i = 0; i < c->n_layers; i++) {
         Layer *l = &m->L[i];
