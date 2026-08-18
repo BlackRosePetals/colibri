@@ -291,4 +291,15 @@ static inline int coli_serve_write_done(
     return fflush(output) == 0;
 }
 
+static inline int coli_serve_format_done(
+    char *output, size_t capacity, const char *id, const ColiServeDone *done)
+{
+    int count = snprintf(output, capacity,
+                         "DONE %s STAT %d %.3f %.1f %.2f %d %d\n", id,
+                         done->completion_tokens, done->tokens_per_second,
+                         done->cache_hit_percent, done->rss_gb,
+                         done->prompt_tokens, done->length_limited);
+    return count >= 0 && (size_t)count < capacity ? count : -1;
+}
+
 #endif

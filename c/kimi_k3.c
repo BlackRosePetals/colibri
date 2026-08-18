@@ -92,6 +92,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                    /* KV prefix reuse (shared) */
+#include "serve_codec.h"
 
 /* ---------- config ---------- */
 typedef struct {
@@ -1870,6 +1871,14 @@ typedef struct {
     int plen;
 } ServeReq;
 
+static const ColiServeWireProfile kimi_wire={
+    .max_header_bytes=511,
+    .max_payload_bytes=1u<<24,
+    .max_tokens=1<<20,
+    .require_exact_lf=1,
+    .require_finite_sampling=0,
+};
+
 static void model_state_reset(Model *m){
     Cfg *c=&m->c;
     kv_prefix_clear(&m->kvp);   /* the record describes the state we are dropping */
@@ -1905,42 +1914,52 @@ static int serve_stdin_readable(void){
     return coli_stdin_readable();
 }
 
-static int serve_read_req(ServeReq *q, const char *active){
-    char line[512], cmd[16], id[64];
-    if(!fgets(line,sizeof(line),stdin)) return -1;
-    if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
-    if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return active&&!strcmp(active,id);
-    if(strcmp(cmd,"SUBMIT")) return 0;
-    int slot, plen, max_tok; float temp, top_p;
-    if(sscanf(line,"%*s %*s %d %d %d %f %f",&slot,&plen,&max_tok,&temp,&top_p)!=5||
-       plen<0||plen>(1<<24)||max_tok<1||max_tok>(1<<20)){
+static int serve_read_req(FILE *in, FILE *out, ServeReq *q, const char *active){
+    ColiServeCommand command;
+    ColiServeReadResult result=coli_serve_read_command(in,&kimi_wire,&command);
+    if(result==COLI_SERVE_READ_EOF) return -1;
+    if(result==COLI_SERVE_READ_BAD_FRAME) return -2;
+    if(result==COLI_SERVE_READ_NOMEM){
+        coli_serve_write_error(out,command.id,"out of memory"); return -2;
+    }
+    if(result==COLI_SERVE_READ_BAD_REQUEST&&
+       command.kind==COLI_SERVE_COMMAND_SUBMIT){
         /* SEC (GHSA-gf38): max_tok needs an upper bound too. INT_MAX wrapped the
          * signed np+max_tok context check below and made the kv_alloc size
          * negative, so kv_alloc's early-return kept the previous request's small
          * KV buffers and the generation loop wrote past them (heap OOB write). */
-        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
+        coli_serve_write_error(out,command.id,"bad submit header"); return -2;
     }
-    (void)slot;
-    char *payload=malloc((size_t)plen+1);
-    if(!payload){ printf("ERROR %s out of memory\n",id); fflush(stdout); return 0; }
-    if(fread(payload,1,(size_t)plen,stdin)!=(size_t)plen){ free(payload); return -1; }
-    (void)fgetc(stdin); payload[plen]=0;
-    snprintf(q->id,sizeof(q->id),"%s",id);
-    q->max_tok=max_tok; q->temp=temp; q->top_p=top_p;
-    q->payload=payload; q->plen=plen;
+    if(result!=COLI_SERVE_READ_OK) return 0;
+    if(command.kind==COLI_SERVE_COMMAND_STOP||
+       command.kind==COLI_SERVE_COMMAND_CANCEL){
+        int matched=active&&!strcmp(active,command.id);
+        coli_serve_command_dispose(&command); return matched;
+    }
+    if(command.kind!=COLI_SERVE_COMMAND_SUBMIT){
+        coli_serve_command_dispose(&command); return 0;
+    }
+    snprintf(q->id,sizeof(q->id),"%s",command.id);
+    q->max_tok=command.max_tokens; q->temp=command.temperature; q->top_p=command.top_p;
+    q->payload=(char*)coli_serve_command_take_payload(&command);
+    q->plen=(int)command.payload_bytes;
+    coli_serve_command_dispose(&command);
     return 2;
 }
 
 /* Drain only commands that can arrive while one request owns the engine. A
  * second SUBMIT is refused without stealing the active request's state. */
+typedef struct { const char *active; int fatal; } K3ServePoll;
+
 static int k3_serve_poll_cancel(void *context){
-    const char *active=context;
+    K3ServePoll *poll=context;
     int cancelled=0;
     while(serve_stdin_readable()){
-        ServeReq queued={0}; int r=serve_read_req(&queued,active);
-        if(r<0||r==1) cancelled=1;
+        ServeReq queued={0}; int r=serve_read_req(stdin,stdout,&queued,poll->active);
+        if(r<0){ if(r==-2) poll->fatal=1; return 1; }
+        if(r==1) cancelled=1;
         if(r==2){
-            printf("ERROR %s engine busy\n",queued.id); fflush(stdout);
+            coli_serve_write_error(stdout,queued.id,"engine busy");
             free(queued.payload);
         }
     }
@@ -1955,13 +1974,12 @@ static void k3_cancel_unpublished_state(Model *m){
 
 static void serve_data(const char *id, const char *p, int n){
     if(n<=0) return;
-    printf("DATA %s %d\n",id,n);
-    fwrite(p,1,(size_t)n,stdout); fputc('\n',stdout); fflush(stdout);
+    coli_serve_write_data(stdout,id,p,(size_t)n);
 }
 
-static void serve_one(Model *m, Tok *T, ServeReq *q){
+static int serve_one(Model *m, Tok *T, ServeReq *q){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
-    if(!ids){ printf("ERROR %s out of memory\n",q->id); fflush(stdout); return; }
+    if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
     int sp[4]={-1,-1,-1,-1}, chat=0, thinking=0;
     if(m->c.bos>=0) ids[np++]=m->c.bos;
     if(q->plen>=8&&!memcmp(q->payload,"K3CHAT1\n",8)){
@@ -1970,25 +1988,27 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
             /* Not the request's fault: this snapshot's tokenizer.json has no
              * <|open|>/<|close|>/<|sep|>/<|end_of_msg|>, so no chat turn can be
              * built from it. Say that, and say where a usable one comes from. */
-            printf("ERROR %s tokenizer.json has no XTML chat tokens "
-                   "(<|open|> <|close|> <|sep|> <|end_of_msg|>); "
-                   "regenerate it with tools/k3_tokenizer.py\n",q->id);
-            fflush(stdout);
+            coli_serve_write_error(stdout,q->id,
+                "tokenizer.json has no XTML chat tokens "
+                "(<|open|> <|close|> <|sep|> <|end_of_msg|>); "
+                "regenerate it with tools/k3_tokenizer.py");
             fprintf(stderr,"[K3] chat: XTML special tokens not in tokenizer.json — "
                            "regenerate with tools/k3_tokenizer.py\n");
-            free(ids); return; }
-        if(n<0){ printf("ERROR %s invalid K3 chat payload\n",q->id); fflush(stdout); free(ids); return; }
+            free(ids); return 0; }
+        if(n<0){ coli_serve_write_error(stdout,q->id,"invalid K3 chat payload"); free(ids); return 0; }
         np+=n; chat=1;
     } else {
         np+=tok_encode(T,q->payload,q->plen,ids+np,cap-np);
     }
     int max_ctx=getenv("K3_MAXT")?atoi(getenv("K3_MAXT")):8192;
     if(np<1||(int64_t)np+q->max_tok>max_ctx){ /* SEC (GHSA-gf38): int64 so np+max_tok can't wrap negative */
-        printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",
-               q->id,np,q->max_tok,max_ctx);
-        fflush(stdout); free(ids); return;
+        char message[160];
+        snprintf(message,sizeof(message),
+                 "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+                 np,q->max_tok,max_ctx);
+        coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
-    printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+    coli_serve_write_accept(stdout,q->id,np);
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
      * re-process turns 1..N-1 from scratch — the cost of a message grew with
@@ -2022,15 +2042,17 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     /* `i` is the ABSOLUTE position: attention and the MLA Lc/Rc slots are
      * position-indexed, so the loop starts at `reuse`, not at 0. */
     int prefill_cancelled=0;
+    K3ServePoll poll={q->id,0};
     for(int i=reuse;i<np;i+=chunk){
         int C=np-i<chunk?np-i:chunk;
-        free(lo); lo=step_chunk_ex(m,ids+i,i,C,k3_serve_poll_cancel,q->id,
+        free(lo); lo=step_chunk_ex(m,ids+i,i,C,k3_serve_poll_cancel,&poll,
                                    &prefill_cancelled);
         if(prefill_cancelled) break;
     }
     if(prefill_cancelled){
         free(lo); k3_cancel_unpublished_state(m); free(ids);
-        printf("ERROR %s CANCELLED\n",q->id); fflush(stdout); return;
+        if(!poll.fatal) coli_serve_write_error(stdout,q->id,"CANCELLED");
+        return poll.fatal?-1:0;
     }
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
     char buf[512], xtag[64];
@@ -2063,22 +2085,27 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         if(!eos) gen++;
         while(serve_stdin_readable()){
             ServeReq queued={0};
-            int r=serve_read_req(&queued,q->id);
+            int r=serve_read_req(stdin,stdout,&queued,q->id);
+            if(r==-2){ poll.fatal=1; cancelled=1; break; }
             if(r<0){ cancelled=1; break; }
             if(r==1) cancelled=1;
             if(r==2){
-                printf("ERROR %s engine busy\n",queued.id); fflush(stdout); free(queued.payload);
+                coli_serve_write_error(stdout,queued.id,"engine busy"); free(queued.payload);
             }
         }
         if(cancelled){ limited=0; break; }
         if(eos){ limited=0; break; }
         if(s+1<q->max_tok) lo=step_chunk(m,&tk,np+s,1);
     }
+    if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
     double dt=now_s()-t0, decode=now_s()-tg;
     uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
-           decode>0?gen/decode:0.0,total?100.0*hits/total:0.0,rss_gb(),np,limited);
+    ColiServeDone done={gen,decode>0?gen/decode:0.0,
+                        total?100.0*hits/total:0.0,rss_gb(),np,limited};
+    char done_line[256];
+    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),q->id,&done);
+    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     double moe=m->t_moe-e0, disk=m->t_eload-d0;
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n",
            dt,np,gen,disk,0.0,moe>disk?moe-disk:moe,m->t_attn-a0,m->t_head-h0,gen+1);
@@ -2087,6 +2114,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
     if(g_k3_vk) fprintf(stderr,"[K3-VK] routed tier: %ld resident, %ld GPU hits so far\n",
                         g_vk_res,g_vk_hit);
 #endif
+    return 0;
 }
 
 static void serve_loop(Model *m, Tok *T){
@@ -2094,16 +2122,13 @@ static void serve_loop(Model *m, Tok *T){
      * finale in \r\n, il gateway non lo riconosce e resta in attesa per sempre
      * (#748). Vive in compat.h perche' colibri.c ce l'ha da #195 e questo motore
      * e' nato senza. */
-    coli_serve_binary_mode();
-    setvbuf(stdin,NULL,_IONBF,0);
-    fputs("\x01\x01READY\x01\x01\n",stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n",rss_gb());
-    fflush(stdout);
+    coli_serve_stdio_init();
+    coli_serve_write_ready(stdout,rss_gb());
     for(;;){
         ServeReq q={0}; int r;
-        do r=serve_read_req(&q,NULL); while(r==0);
+        do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0) return;
-        if(r==2){ serve_one(m,T,&q); free(q.payload); }
+        if(r==2){ int fatal=serve_one(m,T,&q); free(q.payload); if(fatal<0) return; }
     }
 }
 
