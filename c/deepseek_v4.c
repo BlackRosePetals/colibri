@@ -12598,10 +12598,11 @@ static void v4_prof_emit(double wall_s, int prompt_tokens, int completion,
     fflush(stdout);
 }
 
-static int v4_serve_read_request(V4ServeRequest *request,
+static int v4_serve_read_request(FILE *input, FILE *output,
+                                 V4ServeRequest *request,
                                  const char *active_id) {
     char line[512], command[16], id[64];
-    if (!fgets(line, sizeof(line), stdin)) return -1;
+    if (!fgets(line, sizeof(line), input)) return -1;
     if (sscanf(line, "%15s %63s", command, id) < 2) return 0;
     if (!strcmp(command, "CANCEL") || !strcmp(command, "STOP"))
         return active_id && !strcmp(active_id, id);
@@ -12620,22 +12621,22 @@ static int v4_serve_read_request(V4ServeRequest *request,
     if (fields < 5 || slot != 0 || prompt_bytes < 0 ||
         prompt_bytes > (1 << 24) || max_tokens < 1 ||
         extension_bytes < 0 || extension_bytes > (1 << 24)) {
-        printf("ERROR %s bad submit header\n", id);
-        fflush(stdout);
+        fprintf(output, "ERROR %s bad submit header\n", id);
+        fflush(output);
         return 0;
     }
     size_t total = (size_t)prompt_bytes + (size_t)extension_bytes;
     char *payload = malloc(total + 1);
     if (!payload) {
-        printf("ERROR %s out of memory\n", id);
-        fflush(stdout);
+        fprintf(output, "ERROR %s out of memory\n", id);
+        fflush(output);
         return 0;
     }
-    if (fread(payload, 1, total, stdin) != total) {
+    if (fread(payload, 1, total, input) != total) {
         free(payload);
         return -1;
     }
-    (void)fgetc(stdin);
+    (void)fgetc(input);
     payload[prompt_bytes] = 0;
     memset(request, 0, sizeof(*request));
     snprintf(request->id, sizeof(request->id), "%s", id);
@@ -12649,12 +12650,13 @@ static int v4_serve_read_request(V4ServeRequest *request,
     return 2;
 }
 
-static void v4_serve_data(const char *id, const char *data, int bytes) {
+static void v4_serve_data(FILE *output, const char *id,
+                          const char *data, int bytes) {
     if (bytes <= 0) return;
-    printf("DATA %s %d\n", id, bytes);
-    fwrite(data, 1, (size_t)bytes, stdout);
-    fputc('\n', stdout);
-    fflush(stdout);
+    fprintf(output, "DATA %s %d\n", id, bytes);
+    fwrite(data, 1, (size_t)bytes, output);
+    fputc('\n', output);
+    fflush(output);
 }
 
 /* Drain gateway commands queued behind an active request: CANCEL/STOP for the
@@ -12664,7 +12666,7 @@ static void v4_serve_data(const char *id, const char *data, int bytes) {
 static int v4_serve_drain_commands(const char *active_id) {
     while (coli_stdin_readable()) {
         V4ServeRequest queued = {0};
-        int result = v4_serve_read_request(&queued, active_id);
+        int result = v4_serve_read_request(stdin, stdout, &queued, active_id);
         if (result < 0 || result == 1) {
             free(queued.prompt);
             return 1;
@@ -12688,7 +12690,7 @@ static int v4_serve_token(void *user_data, int token, float logit,
         char piece[1024];
         int bytes = tok_decode(&stream->session->tokenizer, &token, 1,
                                piece, (int)sizeof(piece) - 1);
-        v4_serve_data(stream->request_id, piece, bytes);
+        v4_serve_data(stdout, stream->request_id, piece, bytes);
     }
     if (v4_serve_drain_commands(stream->request_id)) {
         stream->cancelled = 1;
@@ -12711,19 +12713,29 @@ static int v4_serve_abort(void *user_data) {
     return 0;
 }
 
-static void v4_serve_error(const char *id, const char *message) {
+static void v4_serve_error(FILE *output, const char *id, const char *message) {
     char clean[512];
     snprintf(clean, sizeof(clean), "%s", message && *message ? message : "engine request failed");
     for (char *p = clean; *p; p++)
         if (*p == '\r' || *p == '\n') *p = ' ';
-    printf("ERROR %s %s\n", id, clean);
-    fflush(stdout);
+    fprintf(output, "ERROR %s %s\n", id, clean);
+    fflush(output);
+}
+
+static void v4_serve_done(FILE *output, const char *id, int completion,
+                          double tokens_per_second, double hit_rate,
+                          double rss, int prompt_tokens, int length_limited,
+                          int prefix_reused) {
+    fprintf(output, "DONE %s STAT %d %.3f %.1f %.2f %d %d %d\n",
+            id, completion, tokens_per_second, hit_rate, rss, prompt_tokens,
+            length_limited, prefix_reused);
+    fflush(output);
 }
 
 static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
                          V4ServeRequest *request) {
     if (request->extension_bytes) {
-        v4_serve_error(request->id, "unsupported request extension");
+        v4_serve_error(stdout, request->id, "unsupported request extension");
         return;
     }
     if (request->temperature != 0.0f)
@@ -12754,7 +12766,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         char message[256];
         snprintf(message, sizeof(message), "CONTEXT_EXCEEDED %d %d",
                  prompt_count, prompt_capacity);
-        v4_serve_error(request->id, message);
+        v4_serve_error(stdout, request->id, message);
         return;
     }
     /* max_tokens is a CEILING, not a target (#260/#382): generation ends at
@@ -12797,7 +12809,7 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         v4_serve_token, &stream, &stats, error, sizeof(error));
     double elapsed = spec_now() - started;
     if (result) {
-        v4_serve_error(request->id, error);
+        v4_serve_error(stdout, request->id, error);
         return;
     }
     if (engine->experts && engine->experts->ops && engine->experts->ops->stats)
@@ -12814,12 +12826,10 @@ static void v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
      * state instead of being prefilled again. Appended rather than inserted --
      * openai_server.py accepts `len(fields) >= 7`, so an older reader ignores
      * it and a newer one can report it. */
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d %d\n",
-           request->id, completion,
-           decode > 0.0 ? completion / decode : 0.0,
-           hit_rate, v4_serve_rss_gb(), stats.prompt_tokens, length_limited,
-           session->prefix_reused);
-    fflush(stdout);
+    v4_serve_done(stdout, request->id, completion,
+                  decode > 0.0 ? completion / decode : 0.0,
+                  hit_rate, v4_serve_rss_gb(), stats.prompt_tokens,
+                  length_limited, session->prefix_reused);
     double expert_disk_s = engine->experts
         ? coli_v4_expert_store_disk_sec(engine->experts) - disk_before
         : 0.0;
@@ -12916,7 +12926,8 @@ static int v4_serve_main(void) {
     for (;;) {
         V4ServeRequest request = {0};
         int result;
-        do result = v4_serve_read_request(&request, NULL); while (result == 0);
+        do result = v4_serve_read_request(stdin, stdout, &request, NULL);
+        while (result == 0);
         if (result < 0) break;
         if (result == 2) {
             v4_serve_one(engine, session, &request);

@@ -167,6 +167,8 @@ TARGET_OBJS = $(addsuffix .o,$(V4_TARGET_UNITS))
 TEST_UNIT_OBJS = $(addsuffix .o,$(V4_TEST_UNITS))
 V4_OBJS = $(TARGET_OBJS) $(V4_WIN_EXTRA_OBJS) $(REGISTRY_OBJ)
 REGISTRY_OBJ = expert_store_registry.o
+V4_SERVE_TEST := tests/test_v4_serve_framing$(if $(IS_WIN),.exe,)
+V4_SERVE_TEST_OBJS := $(filter-out COLI_V4_UNIT_GENERATE_STATS.o,$(V4_OBJS))
 
 .PHONY: deepseek-v4 deepseek-v4-objs deepseek-v4-clean deepseek-v4-test-objs \
 	deepseek-v4-test-registry print-v4-objs
@@ -197,6 +199,10 @@ $(TARGET_OBJS) $(TEST_UNIT_OBJS): %.o: deepseek_v4.c deepseek_v4.h \
 	native_quant_fp4_rows16.h expert_store_registry.h
 	$(CC) $(CFLAGS) -D$* -c deepseek_v4.c -o $@
 
+$(V4_SERVE_TEST): tests/test_v4_serve_framing.c deepseek_v4.c deepseek_v4.h \
+		deepseek_v4_internal.h $(V4_SERVE_TEST_OBJS)
+	$(CC) $(CFLAGS) $< $(V4_SERVE_TEST_OBJS) -o $@ $(LDFLAGS)
+
 # The CUDA tier loader object. Compiled only on Windows, where it is appended
 # to V4_OBJS and resolves the MSVC-built coli_cuda_dsv4.dll at runtime. On
 # Linux it is empty so the engine links without it.
@@ -222,4 +228,4 @@ test_expert_store_registry: test_expert_store_registry.c expert_store_registry.c
 	$(CC) -O2 -Wall -Wextra test_expert_store_registry.c expert_store_registry.c -o $@
 
 deepseek-v4-clean:
-	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) test_expert_store_registry
+	rm -f $(V4_BINARY) $(V4_OBJS) $(TEST_UNIT_OBJS) $(V4_SERVE_TEST) test_expert_store_registry

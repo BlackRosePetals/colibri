@@ -37,6 +37,7 @@ tests/test_tok_o200k
 tests/test_pipe_block
 tests/test_kimi_request_state
 tests/test_kimi_serve_framing
+tests/test_v4_serve_framing
 *.o
 *.dll
 cublasLt64*.dll

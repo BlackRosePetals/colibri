@@ -472,6 +472,34 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_v4_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<｜begin▁of▁sentence｜>System<｜User｜>Hello<｜Assistant｜>"
+        payload = prompt.encode("utf-8")
+        prefix = len("<｜begin▁of▁sentence｜>System".encode("utf-8"))
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 0 {prefix}\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0 17\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "deepseek_v4"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("deepseek_v4", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
     def test_kimi_request_and_response_transcript_is_byte_exact(self):
         prompt = render_chat_kimi([
             {"role": "system", "content": "Be precise."},
