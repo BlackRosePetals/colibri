@@ -385,6 +385,40 @@ enforcing it, containers declare and nothing checks — so the stamp-loss hole
 stays open in that interval. That is no worse than the status quo, which has no
 declaration at all.
 
+### Full-family emission and the `kv_b_proj` decode constraint
+
+`repack_fp8_passthrough.py` emits the **full tensor family**, making its
+`--outdir` a standalone-loadable model directory rather than a partial overlay:
+
+- **fp8-repacked** (byte-preserved weight + renamed `.qs` scale sidecar):
+  routed experts (unstamped, see above) and the resident projections —
+  `o_proj`, `q_a`/`q_b`/`kv_a`, `kv_b_proj`, shared-expert and dense-MLP
+  weights (stamped).
+- **Raw pass-through** (byte-identical copy, original BF16/F32 dtype, no
+  `.qs`, no stamp): norms, router (`mlp.gate.weight`), `e_score_correction_bias`,
+  `embed_tokens`, `lm_head`. This exercises nothing new on the read side — it
+  is exactly the plain `st_read_f32` fallback path `qt_from_disk` already takes
+  for any tensor without a `.qs` sidecar.
+- **Non-tensor files**: `config.json` and `tokenizer.json` are copied from
+  `--indir` (both are mandatory — the engine `exit(1)`s without either, so the
+  tool refuses to mint if `--indir` lacks them); `generation_config.json` is
+  copied best-effort, matching `load_cfg`'s own optional handling. No
+  `model.safetensors.index.json` is copied or needed: `st_init_multi` globs
+  `*.safetensors` and builds its own index, and a copied index would describe
+  the *source* shard layout, not the minted one.
+
+**Decode constraint on the minted `kv_b_proj`:** the container-side work is
+deliberately ahead of the engine-side work. A minted `kv_b_proj` **loads**
+today exactly like `o_proj` (same `qt_from_disk` path, same stamp), but the
+MLA-absorption paths that consume it — `qt_addrow`/`qt_matvec_rows` on CPU and
+the CUDA absorb kernels — have **no `fmt=8` case yet**; that support is being
+built in parallel on `f8/absorb-fmt8`. Until it lands, a container minted with
+`kv_b_proj` must not be used for decode that reaches the batched
+(`kvs`-non-NULL) serving path. The failure mode is a **loud crash, not a
+silent misread** (`ABSORB=0` cannot bypass absorb there), and sequencing —
+engine support before such a container serves decode — is release-gate work,
+not something the tool can enforce from the write side.
+
 ### Duplicate claims, locality, coverage
 
 Three rules complete the stamp's container-wide semantics (user-ratified
