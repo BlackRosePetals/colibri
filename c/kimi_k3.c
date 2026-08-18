@@ -1905,9 +1905,9 @@ static int serve_stdin_readable(void){
     return coli_stdin_readable();
 }
 
-static int serve_read_req(ServeReq *q, const char *active){
+static int serve_read_req(FILE *in, FILE *out, ServeReq *q, const char *active){
     char line[512], cmd[16], id[64];
-    if(!fgets(line,sizeof(line),stdin)) return -1;
+    if(!fgets(line,sizeof(line),in)) return -1;
     if(sscanf(line,"%15s %63s",cmd,id)<2) return 0;
     if(!strcmp(cmd,"CANCEL")||!strcmp(cmd,"STOP")) return active&&!strcmp(active,id);
     if(strcmp(cmd,"SUBMIT")) return 0;
@@ -1918,13 +1918,13 @@ static int serve_read_req(ServeReq *q, const char *active){
          * signed np+max_tok context check below and made the kv_alloc size
          * negative, so kv_alloc's early-return kept the previous request's small
          * KV buffers and the generation loop wrote past them (heap OOB write). */
-        printf("ERROR %s bad submit header\n",id); fflush(stdout); return 0;
+        fprintf(out,"ERROR %s bad submit header\n",id); fflush(out); return 0;
     }
     (void)slot;
     char *payload=malloc((size_t)plen+1);
-    if(!payload){ printf("ERROR %s out of memory\n",id); fflush(stdout); return 0; }
-    if(fread(payload,1,(size_t)plen,stdin)!=(size_t)plen){ free(payload); return -1; }
-    (void)fgetc(stdin); payload[plen]=0;
+    if(!payload){ fprintf(out,"ERROR %s out of memory\n",id); fflush(out); return 0; }
+    if(fread(payload,1,(size_t)plen,in)!=(size_t)plen){ free(payload); return -1; }
+    (void)fgetc(in); payload[plen]=0;
     snprintf(q->id,sizeof(q->id),"%s",id);
     q->max_tok=max_tok; q->temp=temp; q->top_p=top_p;
     q->payload=payload; q->plen=plen;
@@ -1937,7 +1937,7 @@ static int k3_serve_poll_cancel(void *context){
     const char *active=context;
     int cancelled=0;
     while(serve_stdin_readable()){
-        ServeReq queued={0}; int r=serve_read_req(&queued,active);
+        ServeReq queued={0}; int r=serve_read_req(stdin,stdout,&queued,active);
         if(r<0||r==1) cancelled=1;
         if(r==2){
             printf("ERROR %s engine busy\n",queued.id); fflush(stdout);
@@ -2063,7 +2063,7 @@ static void serve_one(Model *m, Tok *T, ServeReq *q){
         if(!eos) gen++;
         while(serve_stdin_readable()){
             ServeReq queued={0};
-            int r=serve_read_req(&queued,q->id);
+            int r=serve_read_req(stdin,stdout,&queued,q->id);
             if(r<0){ cancelled=1; break; }
             if(r==1) cancelled=1;
             if(r==2){
@@ -2101,7 +2101,7 @@ static void serve_loop(Model *m, Tok *T){
     fflush(stdout);
     for(;;){
         ServeReq q={0}; int r;
-        do r=serve_read_req(&q,NULL); while(r==0);
+        do r=serve_read_req(stdin,stdout,&q,NULL); while(r==0);
         if(r<0) return;
         if(r==2){ serve_one(m,T,&q); free(q.payload); }
     }

@@ -995,6 +995,9 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 tests/test_serve_codec$(EXE): tests/test_serve_codec.c serve_codec.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
+tests/test_kimi_serve_framing$(EXE): tests/test_kimi_serve_framing.c kimi_k3.c kv_prefix.h st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h quant.h omp_tune.h route_trace.h
+	$(CC) $(NOCUDA_CFLAGS) $< $(VK_OBJ) -o $@ $(NOCUDA_LDFLAGS)
+
 # olmoe's matmul_q, not colibri's: compares the IDOT path against FP32
 # ACTIVATIONS rather than an integer reference. NOCUDA_* for the same reason
 # the olmoe target uses it -- olmoe.c contains no COLI_CUDA code.
