@@ -1364,8 +1364,55 @@ static inline float siluf(float x){ return x/(1.f+expf(-x)); }
  * expert, vedi il commento MB_BUILD) e' la correzione di un bug latente, NON un no-op. */
 static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, QT *u, QT *d, int nr, int I){
     expert_gate_up(gg,uu,xg,g,u,nr);
+    /* K3: silu*up in parallelo — per-elemento, nessun ordine condiviso: gli
+     * stessi bit in qualunque schedulazione. Sotto soglia resta seriale (il
+     * fork/join costerebbe piu' del loop).
+     * EN: elementwise silu*up, parallel above a size threshold; per-element
+     * math has no shared accumulation order, so bits are unchanged. */
+    #pragma omp parallel for schedule(static) if((int64_t)nr*I>=16384)
     for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
     if(d->fmt==6) e8_rot_rows(gg,nr,I);   /* down input is per-expert — rotate here */
+#if !defined(COLI_CUDA)&&!defined(COLI_METAL)&&!defined(COLI_VULKAN)
+    /* K3: la meta' mancante di #1071 — la 0.1 sollevo' la quantizzazione della
+     * x di gate/up; la h del down restava SERIALE dentro matmul_qt_ex, una
+     * volta per expert. Se il down prendera' l'IDOT, quantizza h QUI (righe in
+     * parallelo, stessa qrow_i8: byte identici) e pubblica il contesto g_pq
+     * che matmul_qt_ex gia' consuma. Azzerato subito dopo: gg viene riscritto
+     * dal prossimo expert e un match stantio leggerebbe spazzatura.
+     * EN: the down-side half of #1071. If the down matmul will take the IDOT
+     * branch, quantize h here (rows in parallel, same qrow_i8 -> identical
+     * bytes) and publish the g_pq context matmul_qt_ex already consumes;
+     * cleared right after so no stale match can outlive this call. */
+    if(g_idot && (d->fmt==1 || (d->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)))){
+        static _Thread_local int8_t *hq; static _Thread_local size_t hq_cap;
+        static _Thread_local float *hsx; static _Thread_local int32_t *hxs;
+        static _Thread_local size_t hrow_cap;
+        if((size_t)nr*I>hq_cap){ free(hq); hq=malloc((size_t)nr*I);
+            hq_cap=hq?(size_t)nr*I:0; }
+        if((size_t)nr>hrow_cap){ free(hsx); free(hxs);
+            hsx=malloc((size_t)nr*sizeof(float)); hxs=malloc((size_t)nr*sizeof(int32_t));
+            hrow_cap=(hsx&&hxs)?(size_t)nr:0; }
+        if(hq && hrow_cap>=(size_t)nr){
+            /* copie locali PRIMA della regione: dentro l'omp parallel ogni
+             * worker risolve la PROPRIA _Thread_local (NULL), non quella del
+             * master — referenziarle direttamente li' segfaulta.
+             * EN: locals before the region — TLS variables are re-resolved
+             * per thread inside omp parallel; workers would see NULL. */
+            int8_t *hq_=hq; float *hsx_=hsx; int32_t *hxs_=hxs;
+            #pragma omp parallel for schedule(static) if(nr>=4)
+            for(int r=0;r<nr;r++){
+                hsx_[r]=qrow_i8(gg+(int64_t)r*I, hq_+(int64_t)r*I, I);
+                int32_t t=0; const int8_t *row=hq_+(int64_t)r*I;
+                for(int i=0;i<I;i++) t+=row[i];
+                hxs_[r]=t;
+            }
+            g_pq.x=gg; g_pq.S=nr; g_pq.I=I; g_pq.xq=hq; g_pq.sx=hsx; g_pq.xsum=hxs;
+            matmul_qt(hh, gg, d, nr);
+            g_pq.x=NULL;
+            return;
+        }
+    }
+#endif
     matmul_qt(hh, gg, d, nr);
 }
 
