@@ -62,6 +62,21 @@ static void test_submit_and_controls(void)
     coli_serve_command_dispose(&command);
     fclose(input);
 
+    ColiServeWireProfile extended_profile = profile;
+    extended_profile.max_extension_bytes = 4;
+    extended_profile.allow_extension_bytes = 1;
+    extended_profile.allow_prefix_hint = 1;
+    static const char extended[] = "SUBMIT req-v4 0 3 4 0 1 4 2\nabcWXYZ\n";
+    input = bytes_input(extended, sizeof(extended) - 1);
+    assert(coli_serve_read_command(input, &extended_profile, &command) ==
+           COLI_SERVE_READ_OK);
+    assert(command.payload_bytes == 3 && command.extension_bytes == 4);
+    assert(command.prefix_bytes == 2);
+    assert(memcmp(command.payload, "abc", 3) == 0 && command.payload[3] == 0);
+    assert(memcmp(coli_serve_command_extension(&command), "WXYZ", 4) == 0);
+    coli_serve_command_dispose(&command);
+    fclose(input);
+
     static const char subnormal[] = "SUBMIT req-8 0 1 1 1e-40 0.95\nx\n";
     input = bytes_input(subnormal, sizeof(subnormal) - 1);
     assert(coli_serve_read_command(input, &profile, &command) == COLI_SERVE_READ_OK);
@@ -161,13 +176,16 @@ static void test_writer_golden_bytes(void)
     assert(coli_serve_format_done(done_line, sizeof(done_line), "req-7", &done) ==
            (int)strlen("DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n"));
     assert(strcmp(done_line, "DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n") == 0);
+    int suffix = 5;
+    assert(coli_serve_write_done_i32_suffix(output, "req-v4", &done, &suffix, 1));
 
     static const unsigned char expected[] =
         "\x01\x01READY\x01\x01\nSTAT 0 0.0 0.0 1.25 0 0\n"
         "ACCEPT req-7 12\n"
         "DATA req-7 4\nA\n\0B\n"
         "ERROR req-7 bad  frame\n"
-        "DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n";
+        "DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n"
+        "DONE req-v4 STAT 3 1.250 50.0 1.25 7 1 5\n";
     unsigned char actual[sizeof(expected) + 16];
     size_t count = read_output(output, actual, sizeof(actual));
     assert(count == sizeof(expected) - 1);
