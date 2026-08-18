@@ -41,7 +41,7 @@ stderr naming the condition), not exit 0 having emitted nothing -- an empty
 "container" nobody asked for; --dry-run's own "0 selected" report is
 unaffected (that IS the loud, honest answer dry-run exists to give).
 """
-import glob, json, os, re, struct, subprocess, sys, tempfile, unittest
+import glob, hashlib, json, os, re, struct, subprocess, sys, tempfile, unittest
 
 try:
     import torch
@@ -836,6 +836,238 @@ class ZeroTargetRefusalTest(unittest.TestCase):
         proc = self._run(["--dry-run"])
         self.assertEqual(proc.returncode, 0)
         self.assertIn("0 tensor(s) selected", proc.stdout)
+
+
+def _sha(path):
+    return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+class MalformedRepackTensorTest(unittest.TestCase):
+    """U5 fix round, finding 2: a repack-KIND tensor with the wrong dtype or a
+    missing `_scale_inv` sidecar used to fall through BOTH selection
+    predicates (not repackable, kind not in PASSTHROUGH_KINDS) and was
+    silently DROPPED from the container -- an exit-0 mint with a missing
+    weight. It must instead refuse loudly, naming the tensor and the exact
+    defect (MalformedRepackTensorError), with a nonzero exit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.indir = os.path.join(self.tmp.name, "fp8src")
+        os.makedirs(self.indir)
+        self.shard = os.path.join(self.indir, "model-00001-of-00001.safetensors")
+        self.tool = os.path.join(os.path.dirname(__file__), "..", "tools",
+                                 "repack_fp8_passthrough.py")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_shard(self, sd):
+        save_file(sd, self.shard)
+
+    def _fp8_pair(self, name, O=256, I_=256):
+        from glm_fp8_emit import fp8_block_quantize
+        torch.manual_seed(1)
+        w_fp8, scale = fp8_block_quantize(torch.randn(O, I_) * 0.02)
+        return {name: w_fp8, name + "_scale_inv": scale}
+
+    def test_missing_sidecar_refused_with_name_and_defect(self):
+        name = "model.layers.0.self_attn.o_proj.weight"
+        sd = self._fp8_pair(name)
+        del sd[name + "_scale_inv"]
+        # a well-formed tensor alongside, so the refusal is provably about the
+        # malformed one and not about an otherwise-empty shard
+        sd.update(self._fp8_pair("model.layers.0.self_attn.q_a_proj.weight"))
+        self._write_shard(sd)
+        for fn in (rp.repack_shard, rp.shard_inventory):    # real mode AND --dry-run
+            with self.assertRaises(rp.MalformedRepackTensorError) as cm:
+                fn(self.shard, 5)
+            self.assertIn(name, str(cm.exception))
+            self.assertIn("_scale_inv", str(cm.exception))
+
+    def test_wrong_dtype_refused_with_name_and_dtype(self):
+        name = "model.layers.0.self_attn.kv_b_proj.weight"
+        sd = self._fp8_pair("model.layers.0.self_attn.o_proj.weight")
+        sd[name] = (torch.randn(256, 256) * 0.02).to(torch.bfloat16)
+        self._write_shard(sd)
+        with self.assertRaises(rp.MalformedRepackTensorError) as cm:
+            rp.repack_shard(self.shard, 5)
+        self.assertIn(name, str(cm.exception))
+        self.assertIn("BF16", str(cm.exception))
+
+    def test_cli_exits_nonzero_and_names_the_tensor(self):
+        name = "model.layers.0.self_attn.o_proj.weight"
+        sd = self._fp8_pair(name)
+        del sd[name + "_scale_inv"]
+        self._write_shard(sd)
+        with open(os.path.join(self.indir, "config.json"), "w") as fh:
+            json.dump({"model_type": "glm_moe_dsa_test_fixture"}, fh)
+        with open(os.path.join(self.indir, "tokenizer.json"), "w") as fh:
+            json.dump({"model": {"vocab": {"<|endoftext|>": 0}, "merges": []}}, fh)
+        proc = subprocess.run(
+            [sys.executable, self.tool, "--indir", self.indir,
+             "--outdir", os.path.join(self.tmp.name, "out"), "--n-layers", "5"],
+            capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a malformed repack-kind tensor must refuse, not drop silently")
+        self.assertIn("MalformedRepackTensorError", proc.stderr)
+        self.assertIn(name, proc.stderr)
+
+    def test_control_wellformed_fixture_still_repacks(self):
+        """Proof-of-bite control: the same shapes WITH their sidecars mint."""
+        sd = self._fp8_pair("model.layers.0.self_attn.o_proj.weight")
+        sd.update(self._fp8_pair("model.layers.0.self_attn.kv_b_proj.weight"))
+        self._write_shard(sd)
+        out, inv, fmt_map = rp.repack_shard(self.shard, 5)
+        self.assertEqual(len(inv), 2)
+        self.assertIn("model.layers.0.self_attn.o_proj.weight", out)
+        self.assertIn("model.layers.0.self_attn.kv_b_proj.weight", out)
+
+
+class ResumeContentValidationTest(unittest.TestCase):
+    """U5 fix round, finding 1: the resume manifest used to trust
+    os.path.exists -- a truncated or mutated output shard resumed as "done",
+    and an input mutated between runs went undetected. Resume must validate
+    CONTENT: recorded size+sha256 per completed output (re-emit on mismatch),
+    and a recorded input fingerprint whose mismatch aborts with
+    InputChangedError."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.indir = os.path.join(self.tmp.name, "fp8src")
+        os.makedirs(self.indir)
+        self.shard = os.path.join(self.indir, "model-00001-of-00001.safetensors")
+        _make_fixture(self.shard)
+        with open(os.path.join(self.indir, "config.json"), "w") as fh:
+            json.dump({"model_type": "glm_moe_dsa_test_fixture"}, fh)
+        with open(os.path.join(self.indir, "tokenizer.json"), "w") as fh:
+            json.dump({"model": {"vocab": {"<|endoftext|>": 0}, "merges": []}}, fh)
+        self.outdir = os.path.join(self.tmp.name, "out")
+        self.tool = os.path.join(os.path.dirname(__file__), "..", "tools",
+                                 "repack_fp8_passthrough.py")
+        self.prog = os.path.join(self.outdir, ".fp8pass-progress.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self):
+        return subprocess.run(
+            [sys.executable, self.tool, "--indir", self.indir, "--outdir",
+             self.outdir, "--n-layers", "5"], capture_output=True, text=True)
+
+    def _out_shard(self):
+        outs = glob.glob(os.path.join(self.outdir, "out-fp8pass-*.safetensors"))
+        self.assertEqual(len(outs), 1)
+        return outs[0]
+
+    def test_truncated_output_reemitted_byte_identical(self):
+        self.assertEqual(self._run().returncode, 0)
+        out = self._out_shard()
+        good = _sha(out)
+        stamped_before = json.loads(open(self.prog).read())["stamped"]
+        with open(out, "r+b") as f:
+            f.truncate(os.path.getsize(out) // 2)
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("failed content validation", proc.stdout)
+        self.assertIn("truncated", proc.stdout)
+        self.assertEqual(_sha(out), good,
+                         "a truncated 'completed' shard must be re-emitted, byte-identical")
+        # the re-emit hands its stamp share back before re-counting: no doubling
+        self.assertEqual(json.loads(open(self.prog).read())["stamped"], stamped_before)
+
+    def test_same_size_output_mutation_reemitted(self):
+        """Size alone cannot catch a same-size byte flip -- sha256 must."""
+        self.assertEqual(self._run().returncode, 0)
+        out = self._out_shard()
+        good = _sha(out)
+        with open(out, "r+b") as f:
+            f.seek(-1, 2)
+            b = f.read(1)
+            f.seek(-1, 2)
+            f.write(bytes([b[0] ^ 0xFF]))
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("sha256", proc.stdout)
+        self.assertEqual(_sha(out), good)
+
+    def test_mutated_input_refuses_with_named_error(self):
+        self.assertEqual(self._run().returncode, 0)
+        os.utime(self.shard)                # content untouched; fingerprint (mtime_ns) moves
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0,
+                            "an input that changed between runs must abort the resume")
+        self.assertIn("InputChangedError", proc.stderr)
+        self.assertIn("INPUT CHANGED", proc.stderr)
+        self.assertIn("model-00001-of-00001.safetensors", proc.stderr)
+
+    def test_legacy_string_manifest_refused(self):
+        """A pre-fix manifest (string entries, no content records) has nothing
+        to validate against; trusting it is the exact hole this fix closes."""
+        self.assertEqual(self._run().returncode, 0)
+        out_name = os.path.basename(self._out_shard())
+        with open(self.prog, "w") as fh:
+            json.dump({"shards": {"model-00001-of-00001.safetensors": out_name},
+                       "stamped": 5}, fh)
+        proc = self._run()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("ResumeManifestError", proc.stderr)
+        self.assertIn("content-validated", proc.stderr)
+
+    def test_untouched_resume_still_skips_without_rewrite(self):
+        self.assertEqual(self._run().returncode, 0)
+        out = self._out_shard()
+        mtime = os.path.getmtime(out)
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0)
+        self.assertIn("[RESUME] 1 shard(s) already done", proc.stdout)
+        self.assertEqual(os.path.getmtime(out), mtime,
+                         "content validation must not rewrite a valid shard")
+
+
+class CanonicalizerSlotFitTest(unittest.TestCase):
+    """U5 fix round, finding 4: _canonicalize_metadata_order's slot-fit guard
+    was a bare assert -- compiled out under python -O, where an oversized
+    header rewrite (non-ASCII bytes json.dumps re-escapes longer) silently
+    overwrote tensor payload bytes. It must be a real, always-on exception."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "shard.safetensors")
+        # non-ASCII metadata VALUE: the Rust writer stores it raw UTF-8; the
+        # canonicalizer's json.dumps re-escapes it to \\uXXXX, inflating the
+        # header past its slot.
+        save_file({"w": torch.zeros(4, 4)}, self.path,
+                  metadata={"colibri.fmt": '{"pésééééééé": "x"}',
+                            "colibri.container.formats": '["fp8-e4m3-b128"]'})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_slot_fit_violation_raises_real_exception(self):
+        before = _sha(self.path)
+        with self.assertRaises(ValueError) as cm:
+            rp._canonicalize_metadata_order(self.path)
+        self.assertNotIsInstance(cm.exception, AssertionError)
+        self.assertIn("HEADER SLOT-FIT", str(cm.exception))
+        self.assertEqual(_sha(self.path), before, "the refusal must not touch the file")
+
+    def test_slot_fit_guard_survives_python_dash_O(self):
+        """The exact pre-fix failure: under -O the assert vanished and the file
+        was corrupted silently. The guard must fire under -O too."""
+        before = _sha(self.path)
+        tools = os.path.join(os.path.dirname(__file__), "..", "tools")
+        proc = subprocess.run(
+            [sys.executable, "-O", "-c",
+             "import sys; sys.path.insert(0, sys.argv[1]); "
+             "import repack_fp8_passthrough as rp; "
+             "rp._canonicalize_metadata_order(sys.argv[2])",
+             tools, self.path],
+            capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0,
+                            "the slot-fit guard must survive python -O")
+        self.assertIn("HEADER SLOT-FIT", proc.stderr)
+        self.assertEqual(_sha(self.path), before,
+                         "under -O the file must stay untouched, not silently corrupt")
 
 
 if __name__ == "__main__":

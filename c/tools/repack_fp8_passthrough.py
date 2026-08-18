@@ -212,7 +212,7 @@ Usage (synthetic fixtures / local testing only):
   python3 tools/repack_fp8_passthrough.py --indir <fp8_dir> --outdir <out> --n-layers 78
   python3 tools/repack_fp8_passthrough.py --indir <fp8_dir> --outdir <out> --n-layers 78 --mtp
 """
-import argparse, glob, json, os, shutil, struct, sys
+import argparse, glob, hashlib, json, os, shutil, struct, sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 from convert_fp8_to_int4 import classify, check_or_record_params  # reuse: same taxonomy,
@@ -336,6 +336,62 @@ def is_passthrough_target(name, n_layers, keep_mtp=False):
     PASSTHROUGH_KINDS."""
     kind = classify(name, n_layers, keep_mtp=keep_mtp)
     return kind in PASSTHROUGH_KINDS
+
+
+class MalformedRepackTensorError(ValueError):
+    """A repack-kind tensor (REPACK_KINDS) that CANNOT be repacked: wrong dtype
+    for the fp8 path, or no `_scale_inv` sidecar. Named so the refusal is
+    grep-able; raised instead of silently dropping the tensor (see
+    _repack_defect)."""
+
+
+class InputChangedError(ValueError):
+    """A source shard recorded done in the resume manifest no longer matches
+    its recorded fingerprint (size + mtime_ns): the input changed between
+    runs, and a resumed mint over it would emit a container silently mixing
+    two different sources."""
+
+
+class ResumeManifestError(ValueError):
+    """The resume manifest cannot be trusted as-is -- e.g. its entries predate
+    content-validated resume and carry no size/sha256/fingerprint records to
+    verify against."""
+
+
+def _repack_defect(name, dtype, keys, n_layers, keep_mtp=False):
+    """The exact defect string if `name` is a repack-kind tensor (REPACK_KINDS)
+    that CANNOT be repacked -- wrong dtype for the fp8 path, or a missing
+    `_scale_inv` sidecar -- else None.
+
+    This is the loud counterpart to is_repack_target's False: before this
+    check existed, a repack-KIND tensor that failed the dtype or sidecar test
+    fell through BOTH selection predicates (its kind is not in
+    PASSTHROUGH_KINDS either) and was silently DROPPED from the container --
+    an o_proj missing its scale sidecar produced an exit-0 mint with that
+    weight absent, discovered only at engine load time (or worse, not at
+    all on a checkpoint variant nobody loads immediately). Same "refuse
+    rather than guess" discipline as _check_geometry, applied one step
+    earlier: a malformed SOURCE tensor is caught at selection time with its
+    name and the exact defect, instead of vanishing.
+
+    `_scale_inv` sidecars themselves and non-repack kinds are None (not this
+    check's concern -- sidecars are consumed with their weight, and
+    passthrough/skip kinds have their own paths)."""
+    if name.endswith("_scale_inv"):
+        return None
+    kind = classify(name, n_layers, keep_mtp=keep_mtp)
+    if kind not in REPACK_KINDS:
+        return None
+    if dtype not in ("F8_E4M3", "float8_e4m3fn"):
+        return (f"{name}: repack-kind ('{kind}') tensor has dtype {dtype}, not FP8 "
+                f"e4m3 -- this tool byte-preserves FP8 weights only, and silently "
+                f"dropping it would mint a container with a MISSING weight; refusing")
+    if (name + "_scale_inv") not in keys:
+        return (f"{name}: FP8 repack-kind ('{kind}') tensor has no "
+                f"'{name}_scale_inv' block-scale sidecar in its shard -- an fmt=8 "
+                f"tensor cannot be minted without its `.qs` scales, and silently "
+                f"dropping it would mint a container with a MISSING weight; refusing")
+    return None
 
 
 def _stampable(kind):
@@ -565,10 +621,23 @@ def _canonicalize_metadata_order(path):
         return
     hdr["__metadata__"] = dict(sorted(meta.items()))
     new = json.dumps(hdr, separators=(",", ":")).encode()
-    assert len(new) <= hlen, (
-        f"{path}: canonicalized header ({len(new)} bytes) no longer fits "
-        f"the original slot ({hlen} bytes) -- a same-keys/same-values "
-        f"reorder should never change length; something else changed")
+    # SLOT-FIT guard. A real exception, NOT an assert: python -O compiles
+    # asserts out, and with this check gone an oversized rewrite seeks to
+    # offset 8 and overwrites the first tensor's payload bytes -- a silently
+    # corrupted container from the one function whose whole job is byte
+    # determinism. The known way to oversize: a non-ASCII name/metadata byte
+    # the original writer stored as raw UTF-8 (2-4 bytes) that json.dumps
+    # re-escapes as \\uXXXX (6 bytes), so "same keys, same values" is only
+    # length-preserving for the ASCII headers this tool itself emits.
+    if len(new) > hlen:
+        raise ValueError(
+            f"{path}: HEADER SLOT-FIT check failed -- canonicalized header "
+            f"({len(new)} bytes) no longer fits the original {hlen}-byte slot. "
+            f"A same-keys/same-values reorder is length-preserving only for "
+            f"pure-ASCII headers; a non-ASCII tensor name or metadata byte "
+            f"re-escapes longer under json.dumps. Writing it would overwrite "
+            f"tensor payload bytes at offset 8+{hlen}; refusing to corrupt "
+            f"{path}")
     new += b" " * (hlen - len(new))
     with open(path, "r+b") as f:
         f.seek(8)
@@ -617,6 +686,79 @@ def _stamps_from_other_passes(outdir, prog_name):
     return total
 
 
+def _sha256_file(path, bufsize=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(bufsize), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _input_fingerprint(path):
+    """Fingerprint of a SOURCE shard for the resume manifest: size + mtime_ns.
+
+    Deliberately NOT a content hash: inputs are the part of a real mint that
+    is hundreds of GB, and they are re-checked on EVERY resume for EVERY
+    shard (including the completed ones), so an input hash would turn each
+    resume into a full re-read of the source checkpoint. size+mtime_ns is the
+    same class of evidence rsync/make trust for "unchanged", catches every
+    normal mutation path (a re-download, an edit, a different checkpoint
+    symlinked into place all change at least one of the two), and the failure
+    mode it cannot catch -- a byte-level mutation that preserves size AND
+    resets mtime_ns to the nanosecond -- requires deliberate forgery, against
+    which the OUTPUT-side sha256 in the same manifest still bounds the blast
+    radius to shards not yet minted. The output side hashes precisely because
+    this reasoning does not apply there: outputs are validated one at a time
+    and only when recorded done."""
+    st = os.stat(path)
+    return {"in_size": st.st_size, "in_mtime_ns": st.st_mtime_ns}
+
+
+def _require_content_records(done, prog_path):
+    """CONTENT-VALIDATED RESUME: refuse a manifest whose entries predate the
+    content records (plain string values, the pre-fix schema) -- there is
+    nothing in such an entry to validate a "completed" output against, and
+    resuming on trust is exactly the hole this fix closes. Refusing (rather
+    than silently re-minting) keeps the operator in the loop: deleting the
+    manifest is a one-line, safe reset (shards re-emit deterministically,
+    byte-identical for byte-identical inputs)."""
+    legacy = sorted(k for k, v in done.items() if not isinstance(v, dict))
+    if legacy:
+        raise ResumeManifestError(
+            f"{prog_path}: {len(legacy)} manifest entr"
+            f"{'y' if len(legacy) == 1 else 'ies'} (first: '{legacy[0]}') "
+            f"predate content-validated resume -- no output size/sha256 and no "
+            f"input fingerprint to verify against, so 'done' cannot be "
+            f"trusted. Delete {prog_path} to re-mint; output shards re-emit "
+            f"deterministically from unchanged inputs")
+
+
+def _resume_output_problem(entry, outdir):
+    """Why a shard recorded done canNOT be trusted as done, or None if its
+    recorded output validates. Content validation, not existence: the size
+    check (a stat) catches truncation/partial writes first and cheaply, then
+    sha256 catches same-size mutation. Whole-file sha256 is the same evidence
+    class tools/repack_rans.py's manifest records per emitted shard."""
+    out = entry.get("out")
+    if out == "":
+        return None                        # shard legitimately emitted nothing
+    if not out or not isinstance(out, str):
+        return "manifest entry has no usable output record"
+    path = os.path.join(outdir, out)
+    if not os.path.exists(path):
+        return f"{out}: recorded output shard is missing"
+    size = os.path.getsize(path)
+    if size != entry.get("out_size"):
+        return (f"{out}: size {size} != recorded {entry.get('out_size')} "
+                f"(truncated or partially written)")
+    digest = _sha256_file(path)
+    if digest != entry.get("out_sha256"):
+        return (f"{out}: sha256 {digest[:16]}... != recorded "
+                f"{str(entry.get('out_sha256'))[:16]}... (content changed after "
+                f"this shard was recorded done)")
+    return None
+
+
 # dtype -> bytes/element, for the dry-run byte-volume estimate on PASS-THROUGH
 # tensors only (shard_inventory reads shapes from get_slice, never the tensor
 # data itself, so it cannot ask torch for itemsize). Covers the dtypes a raw
@@ -653,6 +795,9 @@ def shard_inventory(path, n_layers, keep_mtp=False):
         for name in f.keys():
             sl = f.get_slice(name)
             dt = sl.get_dtype()
+            defect = _repack_defect(name, dt, keys, n_layers, keep_mtp)
+            if defect is not None:
+                raise MalformedRepackTensorError(defect)
             if is_repack_target(name, dt, keys, n_layers, keep_mtp):
                 kind = classify(name, n_layers, keep_mtp=keep_mtp)
                 O, I = sl.get_shape()
@@ -712,6 +857,9 @@ def repack_shard(path, n_layers, keep_mtp=False):
         for name in f.keys():
             sl = f.get_slice(name)
             dt = sl.get_dtype()
+            defect = _repack_defect(name, dt, keys, n_layers, keep_mtp)
+            if defect is not None:
+                raise MalformedRepackTensorError(defect)
             if is_repack_target(name, dt, keys, n_layers, keep_mtp):
                 kind = classify(name, n_layers, keep_mtp=keep_mtp)
                 stampable = _stampable(kind)
@@ -904,12 +1052,19 @@ def main():
     if not check_or_record_params(a.outdir, guard_prefix, params):
         sys.exit(1)
 
-    # RESUME (same #383-class manifest idiom as convert_fp8_to_int4.py's --indir path):
-    # a sidecar records input-shard -> output-shard-name-or-"" (shards with no
-    # resident-FP8 tensors emit no file), written atomically so an interrupted run
-    # never leaves a half-written manifest for the next invocation to trust. The
-    # params guard above already owns "don't mix conversions" -- this manifest is
-    # purely which shards are done.
+    # RESUME (same #383-class manifest idiom as convert_fp8_to_int4.py's --indir
+    # path), CONTENT-VALIDATED: a sidecar records, per input shard, a dict --
+    # {"out": output-shard-name-or-"" (shards with no target tensors emit no
+    # file), "out_size"/"out_sha256": the emitted shard's content record,
+    # "stamps": its share of the stamp budget, "in_size"/"in_mtime_ns": the
+    # INPUT shard's fingerprint at completion} -- written atomically so an
+    # interrupted run never leaves a half-written manifest for the next
+    # invocation to trust. "Done" is re-verified on resume against the CONTENT
+    # records, never against bare existence: a truncated/mutated output is
+    # re-emitted (to its recorded name), and a mutated INPUT aborts the run
+    # with InputChangedError (resuming over it would mix two sources into one
+    # container). The params guard above already owns "don't mix conversions"
+    # -- this manifest is purely which shards are done, and provably so.
     prog_path = os.path.join(a.outdir, prog_name)
     prog = {}
     if os.path.exists(prog_path):
@@ -918,6 +1073,7 @@ def main():
         except (OSError, ValueError):
             prog = {}
     done = prog.setdefault("shards", {})
+    _require_content_records(done, prog_path)
     # ST_FMT_STAMP_MAX is a CONTAINER-wide bound, and a resumed run only sees the
     # shards it processes itself -- so the running total lives in the manifest
     # next to the shard progress, not in a local counter that a resume resets.
@@ -934,18 +1090,39 @@ def main():
     n = fresh = skipped = 0
     for sp in shards:
         key = os.path.basename(sp)
+        fp = _input_fingerprint(sp)
         prev = done.get(key)
-        if prev is not None and (prev == "" or os.path.exists(os.path.join(a.outdir, prev))):
-            if prev:
-                n += 1
-            skipped += 1
-            continue
+        reuse_name = None
+        if prev is not None:
+            recorded = (prev.get("in_size"), prev.get("in_mtime_ns"))
+            if recorded != (fp["in_size"], fp["in_mtime_ns"]):
+                raise InputChangedError(
+                    f"{key}: INPUT CHANGED between runs -- fingerprint at "
+                    f"completion was size={recorded[0]} mtime_ns={recorded[1]}, "
+                    f"but {sp} is now size={fp['in_size']} "
+                    f"mtime_ns={fp['in_mtime_ns']}. Resuming would mix two "
+                    f"different sources into one container; delete "
+                    f"{prog_name} (and the emitted shards) in {a.outdir} to "
+                    f"re-mint from the current input")
+            problem = _resume_output_problem(prev, a.outdir)
+            if problem is None:
+                if prev["out"]:
+                    n += 1
+                skipped += 1
+                continue
+            # Recorded done, but the OUTPUT no longer validates: re-emit it,
+            # to its recorded name (so the container's shard numbering is
+            # stable), handing its stamp share back to the budget first.
+            print(f"[RESUME] {key}: recorded output failed content validation "
+                  f"({problem}) -- re-emitting")
+            reuse_name = prev.get("out") or None
+            prog["stamped"] -= int(prev.get("stamps", 0))
         out, inv, fmt_map = repack_shard(sp, a.n_layers, a.mtp)
         all_inv.extend(inv)
         if not out:
-            done[key] = ""
+            done[key] = {"out": "", "stamps": 0, **fp}
         else:
-            name = f"{out_prefix}{n:05d}.safetensors"
+            name = reuse_name if reuse_name else f"{out_prefix}{n:05d}.safetensors"
             # I-4 STRUCTURAL GATE: last check before the bytes exist on disk,
             # derived from `out` itself rather than from the selection that built
             # it. See _emission_stamp_gate.
@@ -970,7 +1147,13 @@ def main():
             # Fix up the two bytes that can vary, in place, right after the file
             # is written and before this shard is recorded done.
             _canonicalize_metadata_order(out_path)
-            done[key] = name
+            # Content record for resume: taken from the file just written
+            # (post-canonicalization, so the hash matches what a resume will
+            # re-read), plus the input fingerprint from before this shard was
+            # processed.
+            done[key] = {"out": name, "stamps": len(fmt_map),
+                         "out_size": os.path.getsize(out_path),
+                         "out_sha256": _sha256_file(out_path), **fp}
             n += 1
             fresh += 1
         tmp = prog_path + ".tmp"
@@ -984,14 +1167,14 @@ def main():
     # FIX ROUND 2 (clean-room conformance trial, spec I6 -- loud failure, every
     # refusal names its condition): a run that selects ZERO repack-target tensors
     # across every shard under --indir (present run AND any prior resumed run --
-    # `done` has one entry per shard, "" meaning that shard has NEVER produced an
-    # output) used to exit 0 having emitted nothing -- a silent trap: an empty
+    # `done` has one entry per shard, out=="" meaning that shard has NEVER
+    # produced an output) used to exit 0 having emitted nothing -- a silent trap: an empty
     # "container" (just the resume/params sidecars, no actual .safetensors output)
     # that nobody asked for and no caller-side check would catch. Refuse loudly
     # instead. --dry-run is NOT covered here: reporting "0 tensors selected" IS
     # the loud, honest answer dry-run exists to give, not a silent no-op -- see
     # the early `return` above, before any of this resume/write bookkeeping.
-    if all(v == "" for v in done.values()):
+    if all(v.get("out", "") == "" for v in done.values()):
         print(f"ERROR: no repack-target tensors found under {a.indir} (checked "
               f"{len(shards)} shard(s), 0 selected) -- nothing emitted; refusing "
               f"to exit 0 for an empty container nobody asked for", file=sys.stderr)
