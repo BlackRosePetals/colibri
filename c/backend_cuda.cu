@@ -2311,13 +2311,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
+    /* Must mirror upload's and free's accounting exactly -- literally the same
+     * expression they use (scale_count * sizeof(float), gated on fmt=6 never
+     * having a separate scale buffer) -- so all three can no longer drift
+     * independently. The prior `O * ng` shape over-reported for fmt=8 (real
+     * footprint is (O+127)/128 * ng block scales, not O * ng) and for fmt=6
+     * (which has no separate scale buffer at all). */
     size_t storage_bytes =
 #ifdef COLI_ANS
         tensor->compressed ? tensor->archive_bytes :
 #endif
         tensor->weight_bytes;
-    return storage_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+    return storage_bytes +
+        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

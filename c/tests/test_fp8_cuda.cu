@@ -261,6 +261,66 @@ int main(void){
             free(gw);free(gsc);
             printf("byte accounting: fmt=8 dense + fmt=4 grouped free() restores stats exactly\n");
         }
+
+        /* ---- coli_cuda_tensor_bytes() regression: the live-tensor byte report
+         * must equal weight_bytes + scale_count*sizeof(float) exactly (fmt=6
+         * excepted: no separate scale buffer, so weight_bytes alone). The old
+         * `O * ng` shape over-reported fmt=8 (real footprint is (O+127)/128 * ng
+         * block scales, not O*ng) and charged fmt=6 a phantom O*ng*4 scale
+         * buffer it never allocates -- this is the same shape bug F4 fixed in
+         * tensor_free(), here in the sibling accessor most callers actually use
+         * for GPU-tier budget bookkeeping (c/colibri.c). */
+        {
+            ColiCudaTensor *bt=nullptr;
+            uint8_t *bw=(uint8_t*)malloc((size_t)I*D); float *bs=(float*)malloc(hs_n*4);
+            for(size_t i=0;i<(size_t)I*D;i++) bw[i]=rnd_e4m3();
+            for(int i=0;i<hs_n;i++) bs[i]=ldexpf(1.f+rand()/(float)RAND_MAX,-12);
+            if(!coli_cuda_tensor_upload(&bt,bw,bs,8,D,I,0)){ printf("FAIL bytes-check fmt8 upload\n"); return 1; }
+            size_t want=bt->weight_bytes+bt->scale_count*sizeof(float);
+            size_t got=coli_cuda_tensor_bytes(bt);
+            if(got!=want){
+                printf("FAIL bytes-check fmt8: got %zu want %zu (weight_bytes %zu + scale_count %zu*4)\n",
+                    got,want,bt->weight_bytes,bt->scale_count);
+                return 1;
+            }
+            coli_cuda_tensor_free(bt);
+            free(bw);free(bs);
+
+            const int SI=256,SO=32;   /* fmt=6: one exact 256-wide in-block, no tail */
+            size_t srb=row_bytes(6,SI);
+            ColiCudaTensor *st=nullptr;
+            uint8_t *sw=(uint8_t*)malloc(srb*SO);
+            for(size_t i=0;i<srb*(size_t)SO;i++) sw[i]=(uint8_t)rand();
+            if(!coli_cuda_tensor_upload(&st,sw,nullptr,6,SI,SO,0)){ printf("FAIL bytes-check fmt6 upload\n"); return 1; }
+            want=st->weight_bytes;
+            got=coli_cuda_tensor_bytes(st);
+            if(got!=want||st->scale_count!=0){
+                printf("FAIL bytes-check fmt6: got %zu want %zu scale_count %zu (want 0)\n",
+                    got,want,st->scale_count);
+                return 1;
+            }
+            coli_cuda_tensor_free(st);
+            free(sw);
+
+            const int GI=64,GO=32,GS=32;             /* fmt=4 grouped: unchanged regression */
+            int gng=(GI+GS-1)/GS;
+            ColiCudaTensor *gt=nullptr;
+            uint8_t *gw=(uint8_t*)malloc((size_t)((GI+1)/2)*GO);
+            float *gsc=(float*)malloc((size_t)GO*gng*4);
+            for(size_t i=0;i<(size_t)((GI+1)/2)*GO;i++) gw[i]=(uint8_t)rand();
+            for(int i=0;i<GO*gng;i++) gsc[i]=ldexpf(1.f+rand()/(float)RAND_MAX,-4);
+            if(!coli_cuda_tensor_upload_g(&gt,gw,gsc,4,GI,GO,0,GS)){ printf("FAIL bytes-check fmt4g upload\n"); return 1; }
+            want=gt->weight_bytes+gt->scale_count*sizeof(float);
+            got=coli_cuda_tensor_bytes(gt);
+            if(got!=want||gt->scale_count!=(size_t)GO*gng){
+                printf("FAIL bytes-check fmt4g: got %zu want %zu scale_count %zu (want %d)\n",
+                    got,want,gt->scale_count,GO*gng);
+                return 1;
+            }
+            coli_cuda_tensor_free(gt);
+            free(gw);free(gsc);
+            printf("tensor_bytes: fmt=8 dense + fmt=6 + fmt=4 grouped report exact footprint\n");
+        }
         coli_cuda_shutdown();
     }
     printf("OK\n"); return 0;
