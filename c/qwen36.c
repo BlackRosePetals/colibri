@@ -583,7 +583,7 @@ typedef struct {
 } Layer;
 
 /* ---------- LRU expert cache (int8 weights + per-row float scales) ---------- */
-typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; uint8_t *g4, *u4, *d4; float *gs, *us, *ds; uint64_t used; } Slot;
+typedef struct { int eid; int pinned; int is_int4; int8_t *g, *u, *d; float *gs, *us, *ds; uint64_t used; } Slot;
 typedef struct { Slot *slots; int n, cap; } LCache;
 
 typedef struct {
@@ -1197,7 +1197,6 @@ static void slot_ensure_allocated(Model *m, Slot *s) {
     s->ds = s_block + 2*scale_count_gu(c);
     s->pinned = 0;
     s->is_int4 = 0;
-    s->g4 = s->u4 = s->d4 = NULL;   /* packed int4 (allocated on int4 load if GPU int4 active) */
 }
 
 static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
@@ -1235,29 +1234,14 @@ static void load_expert_merged(Model *m, int layer, int eid, Slot *s) {
             s->g[i] = v;
         }
         s->is_int4 = 1;
-        /* Keep the packed bytes for the int4 GPU shader. The unpacked int8 copy
-         * above is retained for the CPU fallback / int8-GPU path. Only allocate
-         * when a GPU int4 backend is actually active, to avoid doubling expert
-         * memory on CPU-only or int8-GPU runs. Free any previous occupant first
-         * (LRU slot reuse). */
-        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
-        /* Keep the packed int4 bytes alongside the unpacked int8 copy: they are
-         * the upload source for the (optional) CUDA expert tier and allow int8
-         * rematerialisation without touching the container again. */
-        {
-            int64_t gp = ng / 2, up = ng / 2, dp = nd / 2;   /* gate/up/down packed sizes */
-            s->g4 = (uint8_t *)malloc((size_t)gp);
-            s->u4 = (uint8_t *)malloc((size_t)up);
-            s->d4 = (uint8_t *)malloc((size_t)dp);
-            if (!s->g4 || !s->u4 || !s->d4) { fprintf(stderr, "OOM int4-packed %s\n", nm); exit(1); }
-            memcpy(s->g4, raw,           (size_t)gp);
-            memcpy(s->u4, raw + gp,      (size_t)up);
-            memcpy(s->d4, raw + gp + up, (size_t)dp);
-        }
+        /* The packed int4 bytes are NOT kept here. This engine only ever reads
+         * the unpacked int8 copy above, so retaining them doubled expert-cache
+         * RSS on the recommended gs64 container for nothing. They are the upload
+         * source for the CUDA expert tier and come back with it (#713), which is
+         * where they are actually read. */
         free(raw);
     } else {
         s->is_int4 = 0;
-        free(s->g4); free(s->u4); free(s->d4); s->g4 = s->u4 = s->d4 = NULL;
         st_read_raw(&m->S, nm, s->g, 1);
     }
     st_read_f32(&m->S, qsnm, s->gs, 0);
