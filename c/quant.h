@@ -974,10 +974,6 @@ static void planarize_i4_row(uint8_t *row, int I){
     int nb=I/64;
     for(int b=0;b<nb;b++){
         uint8_t *blk=row+b*32;
-        for(int k=0;k<32;k++){
-            int e_lo=2*k, e_hi=2*k+1;   /* elementi del byte k a coppie */
-            (void)e_lo; (void)e_hi;
-        }
         /* pair: byte j ha (elem 2j, elem 2j+1). planar: byte k = (elem k, elem k+32) */
         for(int k=0;k<32;k++){
             int src_lo=k, src_hi=k+32;                       /* elementi voluti */
