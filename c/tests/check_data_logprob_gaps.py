@@ -32,8 +32,13 @@ Then:
     python3 tests/check_data_logprob_gaps.py engine_stdout.raw --id 7 --topk 5
 
 Checks performed:
-  - every DATA frame for --id has exactly 5 + 2k header fields, a finite
-    float lp, and k == --topk (k may be < topk only if vocab < topk);
+  - every DATA frame for --id has exactly 5 + 2k header fields, a parseable
+    float lp, and k == --topk (k may be < topk only if vocab < topk).
+    A non-finite lp ("nan"/"inf": degenerate logits, e.g. an all -inf row
+    after grammar masking) counts as PRESENT -- the channel carried a value,
+    which is exactly what this audit is for -- and is FLAGGED in the output
+    without failing the check (whether the engine should serialize such rows
+    differently is a U7b server-side register question, not a gap);
   - ECHO frames (if the request also echoed) cover contiguous positions
     0..P-1, position 0 carrying "nan 0";
   - payload framing (n bytes + newline) stays byte-exact throughout, so a
@@ -82,6 +87,7 @@ def parse_frames(blob):
 def check(frames, request_id, topk):
     rid = str(request_id).encode()
     problems = []
+    flags = []
     data_frames = 0
     echo_positions = []
     for fields, payload in frames:
@@ -101,7 +107,11 @@ def check(frames, request_id, topk):
                 problems.append(f"malformed DATA numeric fields: {fields!r}")
                 continue
             if not math.isfinite(lp):
-                problems.append(f"non-finite lp in DATA frame: {fields!r}")
+                # PRESENT, not a gap: the channel carried a value; degenerate
+                # logits (an all -inf row, say) legitimately produce nan/inf.
+                # Flagged so a reviewer sees it; never fails the audit.
+                flags.append(f"non-finite lp in DATA frame #{data_frames}"
+                             f" (present, flagged): {fields!r}")
             if k != topk:
                 problems.append(f"DATA top-k {k} != requested {topk}: {fields!r}")
             if len(fields) != 5 + 2 * k:
@@ -119,7 +129,7 @@ def check(frames, request_id, topk):
                 problems.append(f"short ECHO frame: {fields!r}")
     if echo_positions and echo_positions != list(range(len(echo_positions))):
         problems.append(f"ECHO positions not contiguous from 0: {echo_positions}")
-    return data_frames, len(echo_positions), problems
+    return data_frames, len(echo_positions), problems, flags
 
 
 def main():
@@ -131,12 +141,14 @@ def main():
     args = parser.parse_args()
     blob = open(args.transcript, "rb").read()
     frames = parse_frames(blob)
-    data_frames, echo_frames, problems = check(frames, args.id, args.topk)
+    data_frames, echo_frames, problems, flags = check(frames, args.id, args.topk)
     print(f"[gapcheck] id={args.id}: {data_frames} DATA frames, "
-          f"{echo_frames} ECHO frames")
+          f"{echo_frames} ECHO frames, {len(flags)} flagged non-finite")
     if data_frames == 0:
         problems.append("no DATA frames found for this id -- wrong id, or the "
                         "run produced nothing (check ERROR frames)")
+    for flag in flags:
+        print(f"[gapcheck] FLAG: {flag}")
     for problem in problems:
         print(f"[gapcheck] {problem}")
     verdict = ("FAIL" if problems
