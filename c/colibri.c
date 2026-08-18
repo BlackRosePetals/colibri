@@ -509,7 +509,7 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
     if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&!wg->planar&&!wu->planar&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
-    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
+    else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&!wg->planar&&!wu->planar&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
         matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
     else { matmul_qt(g,x,wg,S); matmul_qt(u,x,wu,S); }
 }
@@ -954,8 +954,23 @@ static int planar_on(void){
     return g_planar;
 }
 static _Atomic long g_planar_n;   /* tensori planarizzati (telemetria una-tantum) */
+/* K1b: IDOT a gruppi per fmt=4 (gs%64==0) — OPT-IN, cambia le numeriche
+ * (attivazioni int8): resta 0 finche' l'ablazione non benedice un default.
+ * EN: opt-in grouped IDOT for fmt=4; int8 activations, awaiting ablation. */
+static int g_idot_gs=-1;
+static int idot_gs_on(void){
+    if(g_idot_gs<0){ const char *e=getenv("IDOT_GS"); g_idot_gs=(e&&atoi(e))?1:0;
+        if(g_idot_gs&&!planar_on()) g_idot_gs=0;   /* richiede la famiglia planare */
+        if(g_idot_gs) fprintf(stderr,"[K1b] grouped planar IDOT active for gs64 tensors (opt-in)\n"); }
+    return g_idot_gs;
+}
 static void qt_planarize(QT *t){
-    if(!planar_on()||t->fmt!=2||t->planar||!t->q4) return;
+    if(!planar_on()||t->planar||!t->q4) return;
+    if(t->fmt==4){
+        if(!idot_gs_on()||t->gs<64||t->gs%64) return;   /* K1b: solo su opt-in */
+        planarize_i4(t->q4,t->O,t->I); t->planar=1; return;
+    }
+    if(t->fmt!=2) return;
     planarize_i4(t->q4,t->O,t->I); t->planar=1;
     if(atomic_fetch_add_explicit(&g_planar_n,1,memory_order_relaxed)==0)
         fprintf(stderr,"[K1] planar int4 layout active (PLANAR=0 disables)\n");
@@ -1000,8 +1015,8 @@ static inline int pq_want(const QT *g,const QT *u,int nr){
     if(!g_idot) return 0;
     if(nr==1 && !g_no_fused_pair && !spec_pinned() &&
        g->fmt==2 && u->fmt==2 && g->I==u->I && g->O==u->O) return 0;
-    int a = g->fmt==1 || (g->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
-    int b = u->fmt==1 || (u->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s));
+    int a = g->fmt==1 || (g->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)) || (g->fmt==4 && g->planar);
+    int b = u->fmt==1 || (u->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)) || (u->fmt==4 && u->planar);
     return a || b;
 }
 
@@ -1046,7 +1061,32 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     }
 #endif
     if(w->fmt==0){ matmul(y,x,w->qf,S,w->I,w->O); return; }
-    if(w->fmt==4){ matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return; }
+    if(w->fmt==4){
+        if(w->planar){
+            /* K1b: quantizza le attivazioni (o riusa il contesto g_pq) e calcola le
+             * somme per (riga, gruppo) — il termine -8*sum del dot unsigned.
+             * EN: grouped planar IDOT — int8 activations + per-(row,group) sums. */
+            int I=w->I, ng=(I+w->gs-1)/w->gs; int8_t *xq; float *sx;
+            if(S<0 || I<0 || (size_t)S>SIZE_MAX/(size_t)(I?I:1)){ fprintf(stderr,"matmul_qt: shape overflow\n"); exit(1); }
+            if(g_pq.x==x && g_pq.S==S && g_pq.I==I){ xq=(int8_t*)g_pq.xq; sx=(float*)g_pq.sx; }
+            else {
+                quant_scratch((size_t)S*I,(size_t)S,&xq,&sx);
+                for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
+            }
+            static _Thread_local int32_t *xsg; static _Thread_local size_t xsg_cap;
+            if((size_t)S*ng>xsg_cap){ free(xsg); xsg=malloc((size_t)S*ng*sizeof(int32_t));
+                xsg_cap=xsg?(size_t)S*ng:0; if(!xsg){ fprintf(stderr,"OOM xsg\n"); exit(1); } }
+            for(int s=0;s<S;s++) for(int g=0;g<ng;g++){
+                int base=g*w->gs, end=base+w->gs; if(end>I) end=I;
+                int32_t t2=0; const int8_t *r2=xq+(int64_t)s*I;
+                for(int i=base;i<end;i++) t2+=r2[i];
+                xsg[(int64_t)s*ng+g]=t2;
+            }
+            matmul_i4p_grouped_idot(y,xq,sx,xsg,w->q4,w->s,S,I,w->O,w->gs);
+            return;
+        }
+        matmul_i4_grouped(y,x,w->q4,w->s,S,w->I,w->O,w->gs); return;
+    }
     if(w->fmt==6){ matmul_e8(y,x,w->q4,NULL,S,w->I,w->O); return; }   /* scales live in-block */
     if(allow_idot && g_idot && (w->fmt==1 || (w->fmt==2 && (spec_pinned() ? g_i4s<=1 : S>=g_i4s)))){
         int I=w->I; int8_t *xq; float *sx;
@@ -1383,7 +1423,7 @@ static void expert_ffn(float *hh, float *gg, float *uu, const float *xg, QT *g, 
      * branch, quantize h here (rows in parallel, same qrow_i8 -> identical
      * bytes) and publish the g_pq context matmul_qt_ex already consumes;
      * cleared right after so no stale match can outlive this call. */
-    if(g_idot && (d->fmt==1 || (d->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)))){
+    if(g_idot && (d->fmt==1 || (d->fmt==2 && (spec_pinned() ? g_i4s<=1 : nr>=g_i4s)) || (d->fmt==4 && d->planar))){
         static _Thread_local int8_t *hq; static _Thread_local size_t hq_cap;
         static _Thread_local float *hsx; static _Thread_local int32_t *hxs;
         static _Thread_local size_t hrow_cap;
