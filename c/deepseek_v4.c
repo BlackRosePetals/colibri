@@ -14628,6 +14628,39 @@ int coli_hadamard_bf16_ref(float *values, size_t length) {
     return 0;
 }
 
+/* Scratch _Thread_local riusabile per le attivazioni qdq (famiglia #1071/#1075):
+ * ogni entry *_ref qui sotto pagava un paio di malloc/free PER CHIAMATA sul
+ * path caldo (attenzione: ~5 matvec fp8 per layer per token; expert: una per
+ * coppia). I valori calcolati non cambiano di un bit — cambia solo da dove
+ * arriva il buffer. I buffer crescono e non si restituiscono mai: il picco è
+ * batch*columns del matmul più largo, pochi MB per thread.
+ * EN: growable thread-local scratch for the qdq activations. Every *_ref entry
+ * below paid a malloc/free pair per call on the hot path; values are bit-for-
+ * bit unchanged — only the buffer's provenance changes. */
+typedef struct {
+    float *activation; size_t activation_capacity;
+    uint8_t *scales; size_t scales_capacity;
+} V4QdqScratch;
+static _Thread_local V4QdqScratch v4_qdq_scratch_state;
+static int v4_qdq_scratch(size_t activation_count, size_t scales_count,
+                          float **activation, uint8_t **scales) {
+    V4QdqScratch *s = &v4_qdq_scratch_state;
+    if (activation_count > s->activation_capacity) {
+        free(s->activation);
+        s->activation = malloc(activation_count * sizeof(*s->activation));
+        s->activation_capacity = s->activation ? activation_count : 0;
+    }
+    if (scales_count > s->scales_capacity) {
+        free(s->scales);
+        s->scales = malloc(scales_count);
+        s->scales_capacity = s->scales ? scales_count : 0;
+    }
+    if (!s->activation || !s->scales) return -1;
+    *activation = s->activation;
+    *scales = s->scales;
+    return 0;
+}
+
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -14654,23 +14687,15 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
         coli_v4_gpu_matvec_grouped(weight, output, input, 1) == 0)
         return 0;
 #endif
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(columns / 128);
-    if (!activation || !activation_scales) {
-        free(activation);
-        free(activation_scales);
+    float *activation; uint8_t *activation_scales;
+    if (v4_qdq_scratch(columns, columns / 128, &activation, &activation_scales))
         return -1;
-    }
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128) != 0) {
-        free(activation);
-        free(activation_scales);
         return -1;
     }
     matmul_mxfp4(output, activation, weight->data, weight->scales,
                  1, (int)columns, (int)rows);
-    free(activation_scales);
-    free(activation);
     return 0;
 }
 
@@ -14700,23 +14725,17 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
     if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
         return 0;
 #endif
-    float *activation = malloc(columns * sizeof(*activation));
-    uint8_t *activation_scales = malloc(scale_columns);
-    if (!activation || !activation_scales) {
-        free(activation);
-        free(activation_scales);
+    float *activation; uint8_t *activation_scales;
+    if (v4_qdq_scratch(columns, scale_columns, &activation, &activation_scales))
         return -1;
-    }
     if (coli_fp8_activation_qdq_ref(activation, activation_scales,
                                     input, columns, 128) != 0) {
-        free(activation);
-        free(activation_scales);
         return -1;
     }
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {
-            free(activation_scales); free(activation); return -1;
+            return -1;
         }
         float fp8[256];
         for (int code = 0; code < 256; code++)
@@ -14743,13 +14762,11 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
             }
             _mm256_storeu_ps(output + (size_t)tile * 8, sum);
         }
-        free(activation_scales); free(activation); return 0;
+        return 0;
     }
 #endif
     matmul_fp8(output, activation, weight->data, weight->scales,
                1, (int)columns, (int)rows);
-    free(activation_scales);
-    free(activation);
     return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT */
