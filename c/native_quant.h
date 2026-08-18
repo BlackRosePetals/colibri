@@ -39,6 +39,13 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
 int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input);
 
+/* Growable thread-local scratch for the qdq activation buffers shared by the
+ * *_ref/_pre matvec and matmul entries (defined in the NATIVE_QUANT unit).
+ * Replaces the historical malloc/free pair per call; buffers are never
+ * returned. Values computed from them are bit-for-bit unchanged. */
+int coli_v4_qdq_scratch(size_t activation_count, size_t scales_count,
+                        float **activation, uint8_t **scales);
+
 /* Optional CUDA tier (Windows engine build only, COLI_V4_GPU_TIER). The
  * engine-side wrappers in deepseek_v4.c resolve coli_cuda_dsv4.dll through
  * backend_loader_dsv4.c; the matvec_ref implementations dispatch to them when
