@@ -29,33 +29,51 @@ typedef struct {
  * full 7-field header, e.g. "SUBMIT 1 0 12 16 0 1 0 logprobs=5 ids=1".
  * A namespace instead of more positional fields: the next per-request knob
  * (a future seed, say) claims a key here rather than forcing another
- * field-count migration of this scarce wire budget. Unknown keys reject the
- * whole frame -- framing stays as unambiguous as the legacy arms'
- * trailing-field guard. An OLD engine rejects ANY extended header cleanly:
- * both legacy sscanf arms fail on the extra field (their trailing %c matches
- * the separating space) and the engine answers ERROR 0 BAD_REQUEST. */
+ * field-count migration of this scarce wire budget. Unknown keys, duplicate
+ * keys, glued tokens and out-of-range values all reject the whole frame --
+ * framing stays as unambiguous as the legacy arms' trailing-field guard.
+ * An OLD engine rejects ANY extended header: both legacy sscanf arms fail on
+ * the extra field (their trailing %c matches the separating space) and the
+ * engine answers ERROR 0 BAD_REQUEST. The rejection itself is safe, but the
+ * reject path does not drain the rejected request's payload bytes, so an old
+ * engine re-reads them as protocol lines -- the pre-existing behavior of
+ * every malformed-SUBMIT reject, not exposure added by this namespace.
+ *
+ * The value is accumulated by hand into a bounded int (digit loop stops once
+ * the running value exceeds the largest legal value of any key, then a
+ * pending-digit check rejects): sscanf %llu on an overflowing field is
+ * undefined behavior (C11 7.21.6.2), so no sscanf ever touches the value. */
 static inline int coli_submit_ext(const char *p, ColiSubmit *s)
 {
-    int seen = 0;
+    int seen = 0, seen_logprobs = 0, seen_ids = 0;
     while (*p == ' ' || *p == '\t') p++;
     while (*p) {
         char key[16];
-        unsigned long long val;
-        int n = 0;
-        if (sscanf(p, "%15[a-z_]=%llu%n", key, &val, &n) != 2 || n <= 0)
-            return 0;
-        if (p[n] && p[n] != ' ' && p[n] != '\t') return 0;
+        int kn = 0, val = 0;
+        const char *d;
+        while (kn < 15 && ((*p >= 'a' && *p <= 'z') || *p == '_'))
+            key[kn++] = *p++;
+        key[kn] = 0;
+        if (kn == 0 || *p != '=') return 0;
+        p++;
+        d = p;
+        while (*p >= '0' && *p <= '9' && val <= COLI_SUBMIT_TOPK_MAX)
+            val = val * 10 + (*p++ - '0');
+        if (p == d) return 0;                        /* no digits after '=' */
+        if (*p >= '0' && *p <= '9') return 0;        /* out of range: digits left */
+        if (*p && *p != ' ' && *p != '\t') return 0; /* glued garbage after value */
         if (!strcmp(key, "logprobs")) {          /* per-token top-k emission */
-            if (val > COLI_SUBMIT_TOPK_MAX) return 0;
-            s->logprobs = (int)val;
+            if (seen_logprobs || val > COLI_SUBMIT_TOPK_MAX) return 0;
+            seen_logprobs = 1;
+            s->logprobs = val;
         } else if (!strcmp(key, "ids")) {        /* pre-tokenized prompt intake */
-            if (val > 1) return 0;
-            s->tok_ids = (int)val;
+            if (seen_ids || val > 1) return 0;
+            seen_ids = 1;
+            s->tok_ids = val;
         } else {
-            return 0;
+            return 0;                            /* unknown key */
         }
         seen = 1;
-        p += n;
         while (*p == ' ' || *p == '\t') p++;
     }
     return seen;
@@ -87,9 +105,14 @@ static inline int coli_submit_parse(const char *line, ColiSubmit *s)
     }
     if (!ok) {
         s->gbytes = 0;
+        /* Extended arm: the numeric gbytes field and the first key=value token
+         * MUST be whitespace-separated ("512logprobs=5" is one malformed field,
+         * not a 512 followed by an opt-in -- %llu would otherwise stop at the
+         * first letter and silently split it). */
         if (sscanf(line, "SUBMIT %llu %d %llu %d %f %f %llu%n", &s->id,
                    &s->slot, &s->bytes, &s->max_tokens, &s->temperature,
                    &s->top_p, &s->gbytes, &base) == 7 && base > 0 &&
+            (line[base] == ' ' || line[base] == '\t') &&
             coli_submit_ext(line + base, s)) ok = 1;
     }
     if (!ok) return 0;

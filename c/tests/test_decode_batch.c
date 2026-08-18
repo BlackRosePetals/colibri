@@ -82,6 +82,24 @@ static void test_submit_extension_fields(void)
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5x", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=5 junk", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs", &sub));
+    /* glued numeric field + key: one malformed field, NOT "512" + an opt-in
+     * (%llu would otherwise stop at the first letter and silently split it) */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 512logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0ids=1", &sub));
+    /* duplicate keys: rejected outright, never silently last-wins */
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=3 logprobs=5", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=1 ids=1", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 ids=0 ids=0", &sub));
+    /* overflowing values: rejected by the bounded digit loop, no sscanf %llu
+     * ever sees the value (overflow there is UB; a wrapping libc would fold
+     * 2^64+5 back to an in-range 5) */
+    assert(!coli_submit_parse(
+        "SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=18446744073709551621", &sub));
+    assert(!coli_submit_parse(
+        "SUBMIT 42 3 17 64 0.7 0.95 0 ids=18446744073709551617", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=329", &sub));
+    assert(!coli_submit_parse("SUBMIT 42 3 17 64 0.7 0.95 0 logprobs=1000", &sub));
     /* an extended header still validates the base fields */
     assert(!coli_submit_parse("SUBMIT 0 3 17 64 0.7 0.95 0 logprobs=5", &sub));
     assert(!coli_submit_parse("SUBMIT 42 3 17 0 0.7 0.95 0 logprobs=5", &sub));
