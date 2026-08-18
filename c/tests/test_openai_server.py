@@ -457,6 +457,30 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_olmoe_request_and_response_transcript_is_byte_exact(self):
+        expected = b"SUBMIT 1 0 5 3 0.25 0.9\nH\xc3\xa9\nx\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.5 50.0 1.25 5 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "olmoe"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        chunks = []
+        stats = engine.generate("Hé\nx", 3, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 5)
+        self.assertFalse(stats["length_limited"])
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 

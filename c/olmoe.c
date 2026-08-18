@@ -1170,10 +1170,10 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
- * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
+ * returns 1 if that request was cancelled, 0 otherwise, -1 on input EOF. */
+static int serve_read_cmd(FILE *in, FILE *out, const char *cur_id) {
     char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    if (!fgets(ln, sizeof(ln), in)) return -1;
     char cmd[16], id[64];
     if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
     if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
@@ -1181,18 +1181,18 @@ static int serve_read_cmd(const char *cur_id) {
         int slot, plen, max_tok; float temp, top_p;
         int nf = sscanf(ln, "%*s %*s %d %d %d %f %f", &slot, &plen, &max_tok, &temp, &top_p);
         if (nf < 5 || plen < 0 || plen > (1<<22) || max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+            fprintf(out, "ERROR %s bad submit header\n", id); fflush(out); return 0; }
         (void)slot;
         char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        if (fread(pl, 1, (size_t)plen, in) != (size_t)plen) { free(pl); return -1; }
         pl[plen] = 0;
-        int nl = fgetc(stdin); (void)nl;
+        int nl = fgetc(in); (void)nl;
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", id);
             q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
             q->payload = pl; q->plen = plen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); }
+        } else { fprintf(out, "ERROR %s queue full\n", id); fflush(out); free(pl); }
     }
     return 0;
 }
@@ -1223,7 +1223,7 @@ static void serve_one(Model *m, Tok *T, SReq *q, int ctx_cap) {
         fputc('\n', stdout); fflush(stdout);
         gen++; hist_len++;
         while (coli_stdin_readable()) {
-            int r = serve_read_cmd(q->id);
+            int r = serve_read_cmd(stdin, stdout, q->id);
             if (r < 0) { free(ids); return; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
@@ -1313,7 +1313,7 @@ static void serve_loop(Model *m, Tok *T, int ctx_cap) {
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;
         SReq q = g_q[0];
         memmove(g_q, g_q + 1, (size_t)(--g_qn) * sizeof(SReq));
         serve_one(m, T, &q, ctx_cap);
