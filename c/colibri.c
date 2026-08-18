@@ -231,6 +231,7 @@ typedef struct {
  * two renumbers demonstrate. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I, gs;  /* gs=group size (0=per-row, 128=grouped) */
+    int planar;  /* K1: fmt=2 con nibble a PIANI (vedi quant.h) — i kernel *_i4p; 0 = coppie classiche */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -506,7 +507,7 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
                                     int S, int I, int O, int gs);
 
 static void expert_gate_up(float *g,float *u,const float *x,QT *wg,QT *wu,int S){
-    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
+    if(!g_no_fused_pair&&!spec_pinned()&&S==1&&wg->fmt==2&&!wg->planar&&!wu->planar&&wu->fmt==2&&wg->I==wu->I&&wg->O==wu->O)
         matmul_i4_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,wg->I,wg->O);
     else if(!g_no_fused_pair&&S==1&&wg->fmt==4&&wu->fmt==4&&wg->I==wu->I&&wg->O==wu->O&&wg->gs==wu->gs)
         matmul_i4_grouped_pair(g,u,x,wg->q4,wg->s,wu->q4,wu->s,S,wg->I,wg->O,wg->gs);
@@ -922,6 +923,37 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
     }
 }
 
+/* ---- K1: layout int4 a piani, gate e repack (vedi quant.h) -----------------
+ * Planarizziamo SOLO i tensori MoE (slab expert + trio MLP denso + shared):
+ * i loro consumatori sono esattamente matmul_qt/expert_gate_up, tutti
+ * planar-aware. kv_b (letto raw dal path DSA fuso), embedding (dequant
+ * per-token) e attenzione restano a coppie PER COSTRUZIONE. Off su build GPU
+ * (i backend leggono q4 a coppie), sotto XEXP (dot_i4i8 sulle slab) e su
+ * build AVX-512F (il ramo f32 a 512 bit accumula in altro ordine).
+ * EN: K1 planar gate. MoE tensors only; GPU builds, XEXP and AVX-512F builds
+ * keep the classic pair layout. PLANAR=0 is the kill switch. */
+static int g_planar=-1;
+static int planar_on(void){
+    if(g_planar<0){
+#if defined(COLI_CUDA)||defined(COLI_METAL)||defined(COLI_VULKAN)
+        g_planar=0;
+#elif defined(__AVX512F__)&&defined(__AVX512BW__)
+        g_planar=0;
+#else
+        const char *e=getenv("PLANAR"); g_planar=!(e&&*e=='0');
+        const char *xe=getenv("XEXP"); if(xe&&*xe=='1') g_planar=0;
+#endif
+    }
+    return g_planar;
+}
+static _Atomic long g_planar_n;   /* tensori planarizzati (telemetria una-tantum) */
+static void qt_planarize(QT *t){
+    if(!planar_on()||t->fmt!=2||t->planar||!t->q4) return;
+    planarize_i4(t->q4,t->O,t->I); t->planar=1;
+    if(atomic_fetch_add_explicit(&g_planar_n,1,memory_order_relaxed)==0)
+        fprintf(stderr,"[K1] planar int4 layout active (PLANAR=0 disables)\n");
+}
+
 /* ---- quantizzazione attivazioni sollevata a livello layer ---------------------------
  * moe() quantizza x UNA volta per layer e raccoglie le righe int8 accanto al gather
  * f32; il ramo IDOT di matmul_qt_ex le riusa quando (x,S,I) coincidono ESATTAMENTE
@@ -935,7 +967,7 @@ static void matmul_i4_grouped_pair(float *yg, float *yu, const float *x,
  * gathers int8 rows next to the f32 gather; the IDOT branch reuses them on an
  * exact (x,S,I) pointer/shape match. Bit-identical (qrow_i8 is a pure function
  * of the row bytes). Every other path ignores the context and is unchanged. */
-static struct { const float *x; int S, I; const int8_t *xq; const float *sx; } g_pq;
+static struct { const float *x; int S, I; const int8_t *xq; const float *sx; const int32_t *xsum; } g_pq;
 static void pq_build(const float *x, int S, int D, int8_t *xq, float *sx){
     /* righe indipendenti -> parallelizzare sulle righe e' bit-identico; il loop
      * DENTRO qrow_i8 resta scalare (stesso ordine di lrintf di sempre).
@@ -943,6 +975,13 @@ static void pq_build(const float *x, int S, int D, int8_t *xq, float *sx){
      * the per-row loop inside qrow_i8 stays scalar (same lrintf order). */
     #pragma omp parallel for schedule(static) if(S>=8)
     for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*D, xq+(int64_t)s*D, D);
+}
+/* somma int32 per riga degli int8 gia' quantizzati: il termine -8*sum(x) del
+ * dot planare unsigned (K1). EN: per-row int32 sums of the quantized rows. */
+static void pq_build_xsum(const int8_t *xq, int S, int D, int32_t *xsum){
+    #pragma omp parallel for schedule(static) if(S>=8)
+    for(int s=0;s<S;s++){ int32_t t=0; const int8_t *r=xq+(int64_t)s*D;
+        for(int i=0;i<D;i++) t+=r[i]; xsum[s]=t; }
 }
 /* Il gate/up di questo expert passerebbe dall'IDOT di matmul_qt_ex? Specchia
  * l'ordine di dispatch di expert_gate_up: a S==1 la fused pair f32 (fmt=2)
@@ -1014,6 +1053,22 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
             for(int s=0;s<S;s++) sx[s]=qrow_i8(x+(int64_t)s*I, xq+(int64_t)s*I, I);
         }
         if(w->fmt==1) matmul_q_idot(y,xq,sx,w->q8,w->s,S,I,w->O);
+        else if(w->planar){
+            /* K1: kernel planare unsigned; il termine -8*sum(x) arriva dal
+             * contesto (g_pq, gia' raccolto per riga) o si calcola qui.
+             * EN: planar unsigned kernel; -8*sum(x) from g_pq or computed. */
+            const int32_t *xs32 = (g_pq.x==x && g_pq.S==S && g_pq.I==I) ? g_pq.xsum : NULL;
+            static _Thread_local int32_t *xsb; static _Thread_local size_t xsb_cap;
+            if(!xs32){
+                if((size_t)S>xsb_cap){ free(xsb); xsb=malloc((size_t)S*sizeof(int32_t));
+                    xsb_cap=xsb?(size_t)S:0;
+                    if(!xsb){ fprintf(stderr,"OOM planar xsum\n"); exit(1); } }
+                for(int s2=0;s2<S;s2++){ int32_t t2=0; const int8_t *r2=xq+(int64_t)s2*I;
+                    for(int i2=0;i2<I;i2++) t2+=r2[i2]; xsb[s2]=t2; }
+                xs32=xsb;
+            }
+            matmul_i4p_idot(y,xq,sx,xs32,w->q4,w->s,S,I,w->O);
+        }
         else matmul_i4_idot(y,xq,sx,w->q4,w->s,S,I,w->O);
         return;
     }
@@ -1021,6 +1076,7 @@ static void matmul_qt_ex(float *y, const float *x, QT *w, int S, int allow_idot)
     else if(w->fmt==3) matmul_i2(y,x,w->q4,w->s,S,w->I,w->O);
     else if(w->fmt==5) matmul_i3(y,x,w->q4,w->s,S,w->I,w->O);
     else if(w->fmt==8) matmul_fp8(y,x,(const uint8_t*)w->q8,w->s,S,w->I,w->O);
+    else if(w->planar) matmul_i4p(y,x,w->q4,w->s,S,w->I,w->O);
     else matmul_i4(y,x,w->q4,w->s,S,w->I,w->O);
 }
 
@@ -1251,7 +1307,7 @@ static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (ba
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
 /* format from `bits`: >=16 f32, 5..8 int8, 4 int4-packed, 3 int3-g64 (group scales), <=2 int2 */
 static void qt_alloc(QT *t, int O, int I, int bits){
-    t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
+    t->O=O; t->I=I; t->gs=0; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL; t->planar=0;
     if(bits>=16){ t->fmt=0; t->qf=falloc((int64_t)O*I); }
     else if(bits>=5 || g_nopack){ t->fmt=1; t->q8=qalloc((int64_t)O*I); t->s=qsalloc(O); }
     else if(bits>=4){ t->fmt=2; t->q4=qalloc((int64_t)O*((I+1)/2)); t->s=qsalloc(O); }
@@ -1792,6 +1848,7 @@ static void qt_verify_fmt_stamp(const char *name, const char *stamped, int fmt){
  *  - altrimenti: tensore pieno (f32/bf16) -> quantizzato a runtime a `bits` (oracolo tiny / pesi pieni)
  * drop=1 -> fadvise DONTNEED (streaming expert). */
 static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int drop, QT *t){
+    t->planar=0;   /* K1: il flag non sopravvive mai a un refill */
     char sn[300]; snprintf(sn,sizeof(sn),"%s.qs",name);
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
@@ -2051,6 +2108,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->gate_proj = qt_load(m,P("mlp.gate_proj.weight"), c->dense_inter, D, dbits);
             l->up_proj   = qt_load(m,P("mlp.up_proj.weight"),   c->dense_inter, D, dbits);
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
+            qt_planarize(&l->gate_proj); qt_planarize(&l->up_proj); qt_planarize(&l->down_proj);   /* K1 */
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
             l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
@@ -2058,6 +2116,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
             l->sh_down = qt_load(m,P("mlp.shared_experts.down_proj.weight"), D, sI, dbits);
+            qt_planarize(&l->sh_gate); qt_planarize(&l->sh_up); qt_planarize(&l->sh_down);   /* K1 */
 #ifdef COLI_CUDA
             qt_cuda_colocate(&l->sh_gate,&l->kv_b);  /* PIPE2: shared chain on the layer home device */
             qt_cuda_colocate(&l->sh_up,&l->sh_gate);
@@ -2438,6 +2497,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         qt_from_disk(m,nm[0],I,D,b,g_drop,&s->g);
         qt_from_disk(m,nm[1],I,D,b,g_drop,&s->u);
         qt_from_disk(m,nm[2],D,I,b,g_drop,&s->d);
+        qt_planarize(&s->g); qt_planarize(&s->u); qt_planarize(&s->d);   /* K1 */
         atomic_fetch_add_explicit(&g_prof_io,
             st_nbytes(&m->S,nm[0])+st_nbytes(&m->S,nm[1])+st_nbytes(&m->S,nm[2]),memory_order_relaxed);
         s->eid=eid; return 0;
@@ -2473,7 +2533,7 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
                 int64_t nb=tw[k]->nbytes;
                 int gs=0;
                 int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
-                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
+                qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL; qt[k]->planar=0;   /* K1: byte nella MAPPA (read-only/shared): MAI planarizzare */
                 qt[k]->q8=(int8_t*)((char*)bw[k]+tw[k]->off); qt[k]->q4=(uint8_t*)((char*)bw[k]+tw[k]->off);
                 qt[k]->s=(float*)((char*)bq[k]+tq[k]->off);
             }
@@ -2673,6 +2733,11 @@ static int expert_load_impl(Model *m, int layer, int eid, ESlot *s, int fatal, i
         int fmt=qt_resolve_fmt(tw[k]->name,OO[k],II[k],nb,tq[k]->nbytes,&gs,NULL);   /* routed expert: never stamped */
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+pos[k]); qt[k]->q4=s->slab+pos[k]; qt[k]->s=fp[k];
+        /* K1: slab di proprieta' (pread, riscritta a ogni fill) -> planarizza.
+         * Il reset dentro qt_planarize non basta: il flag del fill PRECEDENTE
+         * va azzerato PRIMA, perche' i byte appena letti sono a coppie.
+         * EN: slab-owned bytes -> planarize; clear the stale flag first. */
+        qt[k]->planar=0; qt_planarize(qt[k]);
     }
     s->eid=eid; return 0;
 }
@@ -4684,6 +4749,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
      * EN: hoisted activation quantization, materialized on the FIRST IDOT-eligible
      * expert; zero cost when no expert would take the IDOT branch. */
     int8_t *xq_all=NULL, *xqg=NULL; float *sx_all=NULL, *sxg=NULL; int pq_ready=0;
+    int32_t *xsum_all=NULL, *xsumg=NULL;   /* K1: termine -8*sum(x) per il dot planare */
     g_pq.x=NULL;      /* mai fidarsi di un contesto di un moe() precedente / never trust a stale context */
     float *xe=NULL;   /* fmt=6: x under the rotation Q^T, built once per call — all routed
                        * experts of the layer share it (the placement rule in quant.h) */
@@ -5225,11 +5291,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
                     if(!xq_all){
                         xq_all=xalloc((size_t)S*D,"moe xq"); sx_all=xalloc((size_t)S*sizeof(float),"moe sx");
                         xqg   =xalloc((size_t)S*D,"moe xqg"); sxg  =xalloc((size_t)S*sizeof(float),"moe sxg");
+                        xsum_all=xalloc((size_t)S*sizeof(int32_t),"moe xsum");
+                        xsumg   =xalloc((size_t)S*sizeof(int32_t),"moe xsumg");
                     }
-                    pq_build(x,S,D,xq_all,sx_all); pq_ready=1;
+                    pq_build(x,S,D,xq_all,sx_all); pq_build_xsum(xq_all,S,D,xsum_all); pq_ready=1;
                 }
-                for(int r=0;r<nr;r++){ memcpy(xqg+(int64_t)r*D, xq_all+(int64_t)rows[r]*D,(size_t)D); sxg[r]=sx_all[rows[r]]; }
-                g_pq.x=xg; g_pq.S=nr; g_pq.I=D; g_pq.xq=xqg; g_pq.sx=sxg;
+                for(int r=0;r<nr;r++){ memcpy(xqg+(int64_t)r*D, xq_all+(int64_t)rows[r]*D,(size_t)D); sxg[r]=sx_all[rows[r]]; xsumg[r]=xsum_all[rows[r]]; }
+                g_pq.x=xg; g_pq.S=nr; g_pq.I=D; g_pq.xq=xqg; g_pq.sx=sxg; g_pq.xsum=xsumg;
             }
             expert_ffn(hh,gg,uu,xg,&e->g,&e->u,&e->d,nr,I);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
@@ -5467,7 +5535,7 @@ shared_done:
     free(logits_all); free(choice); free(idxs); free(ws); free(keff); free(uniq);
     g_pq.x=NULL;   /* xg sta per essere liberato: nessun contesto deve sopravvivergli
                     * EN: xg is about to be freed — no context may outlive it */
-    free(xq_all); free(sx_all); free(xqg); free(sxg);
+    free(xq_all); free(sx_all); free(xqg); free(sxg); free(xsum_all); free(xsumg);
     free(xg); free(gg); free(uu); free(hh); free(rows); free(rw); free(xe);
     #undef E8_XE
 #ifdef COLI_CUDA
