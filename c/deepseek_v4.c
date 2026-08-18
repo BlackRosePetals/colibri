@@ -1999,7 +1999,16 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    int result = coli_fp8_matvec_ref(qa, &wq_a, input);
+    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
+     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
+     * compute, GPU path invariato (riceve l'input raw come prima).
+     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
+    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales ||
+                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2049,7 +2058,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2220,6 +2229,7 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -2451,7 +2461,16 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    int result = coli_fp8_matvec_ref(qa, &wq_a, input);
+    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
+     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
+     * compute, GPU path invariato (riceve l'input raw come prima).
+     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
+    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales ||
+                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -2489,7 +2508,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -2617,6 +2636,7 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -2738,7 +2758,20 @@ int coli_v4_attention_window_batch_ref(
 #define V4_ATTN_PROF_MARK(slot) do { if (prof_t) { \
         double _now = v4_attn_prof_now(); (slot) += _now - prof_t; \
         prof_t = _now; } } while (0)
-    int result = coli_fp8_matmul_batch_ref(qa, &wq_a, inputs, batch);
+    /* wq_a e wkv consumano lo stesso batch di input: qdq UNA volta per item e
+     * riuso via _pre (dedup rinviato da #1076). Bit-identico; il path GPU
+     * riceve gli input raw come prima.
+     * EN: wq_a and wkv consume the same input batch — qdq once, reuse. */
+    float *inputs_act = malloc((size_t)batch * hidden * sizeof(*inputs_act));
+    uint8_t *inputs_act_scales = malloc((size_t)batch * (hidden / 128 + 1));
+    int result = (!inputs_act || !inputs_act_scales) ? -1 : 0;
+    for (int item = 0; !result && item < batch; item++)
+        if (coli_fp8_activation_qdq_ref(
+                inputs_act + (size_t)item * hidden,
+                inputs_act_scales + (size_t)item * (hidden / 128),
+                inputs + (size_t)item * hidden, (size_t)hidden, 128))
+            result = -1;
+    if (!result) result = coli_fp8_matmul_batch_pre(qa, &wq_a, inputs, inputs_act, batch);
     if (!result) coli_bf16_round_array(qa, (size_t)batch * q_rank);
     const void *raw_q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!raw_q_norm || decode_bf16(norm, raw_q_norm, q_rank))) result = -1;
@@ -2879,7 +2912,7 @@ int coli_v4_attention_window_batch_ref(
         }
     V4_ATTN_PROF_MARK(prof_qb);
 
-    if (!result) result = coli_fp8_matmul_batch_ref(kv, &wkv, inputs, batch);
+    if (!result) result = coli_fp8_matmul_batch_pre(kv, &wkv, inputs, inputs_act, batch);
     if (!result) coli_bf16_round_array(kv, (size_t)batch * head_dim);
     const void *raw_kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!raw_kv_norm || decode_bf16(norm, raw_kv_norm, head_dim))) result = -1;
@@ -3148,6 +3181,7 @@ int coli_v4_attention_window_batch_ref(
                 prof_rope * 1e3, prof_attn * 1e3, prof_wo * 1e3);
 #undef V4_ATTN_PROF_MARK
 
+    free(inputs_act_scales); free(inputs_act);
     return result ? set_error(error, error_size, "batched attention failed") : 0;
 }
 #endif /* COLI_V4_UNIT_ATTENTION_BATCH */
@@ -6534,7 +6568,16 @@ static int attention_token_impl(float *output,
         return set_error(error, error_size, "out of memory in attention");
     }
 
-    int result = coli_fp8_matvec_ref(qa, &wq_a, input);
+    /* wq_a e wkv consumano lo stesso input: qdq UNA volta e riuso via _pre
+     * (il dedup rinviato da #1076). Bit-identico: stessi byte qdq, stesso
+     * compute, GPU path invariato (riceve l'input raw come prima).
+     * EN: wq_a and wkv consume the same input — qdq once, reuse via _pre. */
+    float *input_act = malloc((size_t)wq_a.columns * sizeof(*input_act));
+    uint8_t *input_act_scales = malloc((size_t)wq_a.columns / 128 + 1);
+    int result = (!input_act || !input_act_scales ||
+                  coli_fp8_activation_qdq_ref(input_act, input_act_scales, input,
+                                              (size_t)wq_a.columns, 128)) ? -1 : 0;
+    if (!result) result = coli_fp8_matvec_pre(qa, &wq_a, input, input_act);
     coli_bf16_round_array(qa, (size_t)q_rank);
     const void *q_norm = layer_data(weights, "attn.q_norm.weight", NULL);
     if (!result && (!q_norm || decode_bf16(norm_weight, q_norm, (size_t)q_rank) ||
@@ -6572,7 +6615,7 @@ static int attention_token_impl(float *output,
         for (int i = 0; i < head_dim; i++) values[i] = coli_bf16_round(values[i] * scale);
     }
 
-    if (!result) result = coli_fp8_matvec_ref(kv, &wkv, input);
+    if (!result) result = coli_fp8_matvec_pre(kv, &wkv, input, input_act);
     if (!result) coli_bf16_round_array(kv, (size_t)head_dim);
     const void *kv_norm = layer_data(weights, "attn.kv_norm.weight", NULL);
     if (!result && (!kv_norm || decode_bf16(norm_weight, kv_norm, (size_t)head_dim) ||
@@ -6700,6 +6743,7 @@ static int attention_token_impl(float *output,
     free(compressed_indices);
     free(sines); free(cosines); free(norm_weight); free(oa);
     free(attended); free(kv); free(q); free(qa);
+    free(input_act_scales); free(input_act);
     if (result) return set_error(error, error_size, "attention computation failed");
     return 0;
 }
@@ -14699,10 +14743,10 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
     return 0;
 }
 
-int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
-                        const float *input) {
-    if (!output || !weight || !input ||
-        weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+/* Validazione condivisa fra _ref e _pre (stessi controlli di sempre).
+ * EN: shared shape/format validation between _ref and _pre. */
+static int fp8_matvec_validate(const ColiTensorView *weight) {
+    if (!weight || weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
         weight->scale_format != COLI_SCALE_F32 ||
         !weight->data || !weight->scales || weight->rows < 1 ||
         weight->columns < 1 || weight->columns % 128 ||
@@ -14716,22 +14760,17 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
     if (weight->data_bytes != rows * columns ||
         weight->scale_bytes != scale_rows * scale_columns * sizeof(float))
         return -1;
-#ifdef COLI_V4_GPU_TIER
-    /* The resident layer mirror carries a Dsv4CudaTensor* in view->gpu. Its
-     * weight bytes are the UNPACKED row-major matrix (the resident copy may be
-     * rows8-packed for the AVX2 CPU path), so the handle alone drives the call;
-     * only the activation vectors cross the boundary. Any backend failure falls
-     * through to the CPU reference below. */
-    if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
-        return 0;
-#endif
-    float *activation; uint8_t *activation_scales;
-    if (coli_v4_qdq_scratch(columns, scale_columns, &activation, &activation_scales))
-        return -1;
-    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
-                                    input, columns, 128) != 0) {
-        return -1;
-    }
+    return 0;
+}
+
+/* Compute CPU su attivazione GIA' qdq (estratto invariato da matvec_ref).
+ * EN: CPU compute on an already-qdq'd activation, extracted verbatim. */
+static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
+                              const float *activation) {
+    size_t rows = (size_t)weight->rows;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+    (void)scale_columns;
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {
@@ -14768,6 +14807,50 @@ int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
     matmul_fp8(output, activation, weight->data, weight->scales,
                1, (int)columns, (int)rows);
     return 0;
+}
+
+int coli_fp8_matvec_ref(float *output, const ColiTensorView *weight,
+                        const float *input) {
+    if (!output || !input || fp8_matvec_validate(weight))
+        return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+#ifdef COLI_V4_GPU_TIER
+    /* The resident layer mirror carries a Dsv4CudaTensor* in view->gpu. Its
+     * weight bytes are the UNPACKED row-major matrix (the resident copy may be
+     * rows8-packed for the AVX2 CPU path), so the handle alone drives the call;
+     * only the activation vectors cross the boundary. Any backend failure falls
+     * through to the CPU reference below. */
+    if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
+        return 0;
+#endif
+    float *activation; uint8_t *activation_scales;
+    if (coli_v4_qdq_scratch(columns, scale_columns, &activation, &activation_scales))
+        return -1;
+    if (coli_fp8_activation_qdq_ref(activation, activation_scales,
+                                    input, columns, 128) != 0) {
+        return -1;
+    }
+    return fp8_matvec_compute(output, weight, activation);
+}
+
+/* Variante a qdq sollevata: `activation` e' l'input gia' passato da
+ * coli_fp8_activation_qdq_ref UNA volta dal chiamante (wq_a e wkv consumano lo
+ * stesso vettore: prima veniva riquantizzato due volte per token per layer).
+ * `input` resta il vettore raw per l'eventuale path GPU, che quantizza per
+ * conto suo — identico a _ref. Stessi controlli, stesso compute: bit-identico.
+ * EN: hoisted-qdq variant. `activation` is the input already qdq'd ONCE by the
+ * caller (wq_a and wkv consume the same vector); `input` stays raw for the GPU
+ * path, which does its own thing exactly as in _ref. Bit-identical. */
+int coli_fp8_matvec_pre(float *output, const ColiTensorView *weight,
+                        const float *input, const float *activation) {
+    if (!output || !input || !activation || fp8_matvec_validate(weight))
+        return -1;
+#ifdef COLI_V4_GPU_TIER
+    if (weight->gpu && coli_v4_gpu_fp8_matvec(weight, output, input) == 0)
+        return 0;
+#endif
+    return fp8_matvec_compute(output, weight, activation);
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT */
 
@@ -14939,9 +15022,10 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 #pragma GCC diagnostic pop
 #endif
 
-int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
-                              const float *inputs, int batch) {
-    if (!outputs || !weight || !inputs || batch < 1 || batch > 128 ||
+/* Validazione condivisa fra _ref e _pre (stessi controlli di sempre).
+ * EN: shared shape/format validation between _ref and _pre. */
+static int fp8_batch_validate(const ColiTensorView *weight, int batch) {
+    if (!weight || batch < 1 || batch > 128 ||
         weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
         weight->scale_format != COLI_SCALE_F32 ||
         !weight->data || !weight->scales || weight->rows < 1 ||
@@ -14953,6 +15037,17 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
     size_t scale_columns = columns / 128;
     if (weight->data_bytes != rows * columns ||
         weight->scale_bytes != scale_rows * scale_columns * sizeof(float)) return -1;
+    return 0;
+}
+
+static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
+                             const float *activations, int batch);
+
+int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, int batch) {
+    if (!outputs || !inputs || fp8_batch_validate(weight, batch)) return -1;
+    size_t columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
 #ifdef COLI_V4_GPU_TIER
     /* Same mirror-driven dispatch as coli_fp8_matvec_ref: the resident
      * layer's Dsv4CudaTensor handle rides on view->gpu and only activations
@@ -14974,6 +15069,35 @@ int coli_fp8_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             return -1;
         }
+    return fp8_batch_compute(outputs, weight, activations, batch);
+}
+
+/* Variante a qdq sollevata: `activations` sono gli input gia' passati da
+ * coli_fp8_activation_qdq_ref UNA volta dal chiamante (wq_a e wkv del prefill
+ * consumano lo stesso batch); `inputs` resta il batch raw per il path GPU,
+ * identico a _ref. Bit-identico.
+ * EN: hoisted-qdq variant — `activations` were qdq'd once by the caller,
+ * `inputs` stays raw for the GPU path exactly as in _ref. Bit-identical. */
+int coli_fp8_matmul_batch_pre(float *outputs, const ColiTensorView *weight,
+                              const float *inputs, const float *activations,
+                              int batch) {
+    if (!outputs || !inputs || !activations || fp8_batch_validate(weight, batch))
+        return -1;
+#ifdef COLI_V4_GPU_TIER
+    if (weight->gpu &&
+        coli_v4_gpu_fp8_matmul_batch(weight, outputs, inputs, batch) == 0)
+        return 0;
+#endif
+    return fp8_batch_compute(outputs, weight, activations, batch);
+}
+
+/* Compute CPU su attivazioni GIA' qdq (estratto invariato da batch_ref).
+ * EN: CPU compute on already-qdq'd activations, extracted verbatim. */
+static int fp8_batch_compute(float *outputs, const ColiTensorView *weight,
+                             const float *activations, int batch) {
+    size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
+    size_t scale_columns = columns / 128;
+    (void)scale_columns;
 #ifdef __AVX2__
     if (weight->block_rows == 8) {
         if (rows % 8) {
