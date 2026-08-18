@@ -136,7 +136,10 @@ class FamilyRegistryTest(unittest.TestCase):
             "linear_key_head_dim": 8, "linear_value_head_dim": 8,
             "linear_conv_kernel_dim": 4,
         }
-        by_id, by_type = _build_registry(FAMILIES + (QWEN36_FIXTURE,))
+        # qwen36 is a registered family now, so the fixture would collide on its
+        # model_type alias. Assert against the production descriptor instead --
+        # which is the stronger test: it pins the shipped geometry, not a copy.
+        by_id, by_type = _build_registry(FAMILIES)
         family = by_type[config["model_type"]]
         self.assertEqual(family, by_id["qwen36"])
         resolved = type("R", (), {"descriptor": family, "family_config": config,
@@ -224,6 +227,11 @@ class FamilyRegistryTest(unittest.TestCase):
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
             "olmoe": "<|user|>\nhello {world}\n<|assistant|>\n",
+            # Qwen3.6's generation prompt MUST open <think>: the model was
+            # never trained on the bare "assistant\\n" state and greedy argmax
+            # there lands on an EOS special (measured gen=0).
+            "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
+                      "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
         }
         self.assertEqual(
