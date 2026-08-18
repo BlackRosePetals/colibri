@@ -897,19 +897,34 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 	$(CC) $(NOCUDA_CFLAGS) olmoe.c -o olmoe$(EXE) $(NOCUDA_LDFLAGS)
 
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
-# MoE). CPU-only in this target; the optional CUDA expert tier is a separate
-# follow-up (see docs/qwen36-phase01.md).
-# NOCUDA_*: this file contains no CUDA, so building it with -DCOLI_CUDA and
-# linking -lcudart only made `make qwen36 CUDA=1` depend on a toolkit it
-# never calls. Same shape as olmoe. (The CUDA expert tier is #713, which
-# adds its own sources and takes the CUDA flags back.)
-qwen36$(EXE): qwen36.c st.h json.h compat.h
-	$(CC) $(NOCUDA_CFLAGS) qwen36.c -o qwen36$(EXE) $(NOCUDA_LDFLAGS)
+# MoE). With CUDA=1 the optional VRAM expert tier (qwen36_tier.c) is compiled
+# in and reuses the shared CUDA backend; without it the engine is CPU-only
+# (qwen36_tier.h provides inline stubs).
+#
+# The flags follow the same switch. Without CUDA=1 this target keeps the
+# NOCUDA_* flags it got when the engine had no CUDA at all: compiling
+# -DCOLI_CUDA and linking -lcudart for a build that calls neither only made
+# `make qwen36` depend on a toolkit it never touches. With CUDA=1 the tier is
+# real CUDA and takes the normal flags back.
+ifeq ($(CUDA),1)
+QWEN36_TIER_SRC = qwen36_tier.c
+QWEN36_CFLAGS   = $(CFLAGS)
+QWEN36_LDFLAGS  = $(LDFLAGS)
+else
+QWEN36_TIER_SRC =
+QWEN36_CFLAGS   = $(NOCUDA_CFLAGS)
+QWEN36_LDFLAGS  = $(NOCUDA_LDFLAGS)
+endif
+qwen36$(EXE): qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) qwen36.c $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o qwen36$(EXE) $(QWEN36_LDFLAGS)
 
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.
-tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c st.h json.h compat.h
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+# Same tier sources as the engine: the test includes qwen36.c, so with CUDA=1
+# it needs qwen36_tier.c and the backend object too (without CUDA, the header's
+# inline stubs cover it and both are empty).
+tests/test_qwen36_ctx$(EXE): tests/test_qwen36_ctx.c qwen36.c qwen36_tier.h st.h json.h compat.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(LDFLAGS)
 
 inkling$(EXE): inkling.c st.h json.h compat.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) inkling.c $(INK_CUDA_OBJ) $(METAL_OBJ) -o inkling$(EXE) $(LDFLAGS)
