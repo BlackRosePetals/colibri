@@ -1110,6 +1110,9 @@ typedef struct {
     Tok *T;
     int on, armed, max;
     uint64_t prop, acc;
+    char *src;   /* #7: owned copy of the grammar/schema text that built `gram`, used to
+                  * skip recompiling when a slot's next request sends the identical schema.
+                  * NULL unless a per-request grammar compiled successfully. */
 } GrDraft;
 /* NO initializer: GrDraft is ~107 KB (Grammar's 1024 static rules + the walker), and any
  * initializer — even `={.max=24}` — moves the whole struct from .bss into .data, writing
@@ -1309,12 +1312,23 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     /* Validate against the fixed buffers (in[256], cache cs/sn[128] -> qk_rope<=256).
      * Abort cleanly instead of smashing the stack. (GLM-5.2 qk_rope=64.) (#183) */
     if(c->qk_rope > 256){ fprintf(stderr,"qk_rope=%d exceeds rope_interleave buffer (256)\n",c->qk_rope); exit(1); }
-    typedef struct { int pos,qk,valid; float theta,cs[128],sn[128]; } RopeCache;   /* (#80) */
+    /* inv[j]=powf(theta,-2j/qk_rope) depends only on the model constants theta/qk,
+     * never on pos — but the pos-keyed refresh below re-ran `half` powf() calls every
+     * position (32 on GLM qk_rope=64), ~11M powf for a 4k prompt x 90 layers. Cache inv[]
+     * separately, keyed on (qk,theta), and recompute only cs/sn per position. Byte-
+     * identical: `ang = pos*inv[j]` is the same float product against the same inv value
+     * the old code formed inline, so cosf/sinf receive the identical argument. (#80) */
+    typedef struct { int pos,qk,valid,inv_valid; float theta,inv_theta,inv[128],cs[128],sn[128]; } RopeCache;
     static _Thread_local RopeCache cache;
     float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
+    if(!cache.inv_valid||cache.qk!=c->qk_rope||cache.inv_theta!=c->theta){
+        for(int j=0;j<half;j++) cache.inv[j]=powf(c->theta,-2.0f*j/c->qk_rope);
+        cache.qk=c->qk_rope; cache.inv_theta=c->theta; cache.inv_valid=1;
+        cache.valid=0;   /* inv[] changed -> force cs/sn refresh below */
+    }
     if(!cache.valid||cache.pos!=pos||cache.qk!=c->qk_rope||cache.theta!=c->theta){
         for(int j=0;j<half;j++){
-            float inv=powf(c->theta,-2.0f*j/c->qk_rope),ang=pos*inv;
+            float ang=pos*cache.inv[j];
             cache.cs[j]=cosf(ang); cache.sn[j]=sinf(ang);
         }
         cache.pos=pos; cache.qk=c->qk_rope; cache.theta=c->theta; cache.valid=1;
@@ -3835,7 +3849,16 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             free(dbgQ); free(dbgC); }
 #endif
     }
-    if(!pipe_done) for(int s=0;s<S;s++){
+    /* Every iteration writes a DISTINCT KV row (its own `pos`) and rope_interleave's
+     * cache is _Thread_local, so the positions are independent -> parallelizing is
+     * byte-identical regardless of order. Only the CUDA/VULKAN shadow-shrink writes
+     * touch shared state (m->kv_dev_valid/vk_kv_valid), so the pragma is gated to
+     * CPU-only builds where those blocks compile out; on GPU builds this stays serial. */
+    if(!pipe_done){
+#if !defined(COLI_CUDA) && !defined(COLI_VULKAN)
+    #pragma omp parallel for schedule(static) if(S > 1)
+#endif
+    for(int s=0;s<S;s++){
         KVState *ks=kvs?kvs[s]:m->kv;
         int pos=positions?positions[s]:pos_base+s;
         float *qfull=Q+(int64_t)s*H*qh;
@@ -3855,6 +3878,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         rmsnorm(Ldst, Ldst, l->kv_a_ln, c->kv_lora, c->eps);     /* latente normato */
         memcpy(Rdst, cs+c->kv_lora, c->qk_rope*sizeof(float));
         rope_interleave(Rdst, pos, c);                            /* k_rot roped, condiviso fra teste */
+    }
     }
     /* ---- DSA lightning indexer ----
      * Layer FULL: k_idx dei token nuovi in cache + selezione top-k per query (riusata
@@ -6556,6 +6580,7 @@ static int grammar_setup_text(GrDraft *g, Tok *T, char *txt, const char *label){
 /* Release a per-request grammar so the slot can host the next request (keeps max). */
 static void grammar_teardown(GrDraft *g){
     if(g->gram.n) gr_free(&g->gram);
+    free(g->src);                        /* #7: release the cached schema text (NULL-safe) */
     int max=g->max; memset(g,0,sizeof(*g)); g->max=max;
 }
 static void grammar_setup(GrDraft *g, Tok *T){
@@ -7757,8 +7782,24 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     for(int i=0;i<nctx;i++) if(req[i].active && req[i].id==sub.id){
         printf("ERROR %llu DUPLICATE_ID\n",sub.id); fflush(stdout); free(gtxt); free(raw); free(line); return 0;
     }
-    grammar_teardown(&grd[sub.slot]);    /* new request owns the slot's grammar state */
-    if(gtxt) grammar_setup_text(&grd[sub.slot],T,gtxt,"request");   /* fail-soft; owns gtxt */
+    /* #7: if this slot's last request compiled the *same* schema/grammar text, skip the
+     * schema->GBNF->parse->state-init pipeline (measurable for tool-loop agents that resend
+     * one schema every turn) and just reset the walker -- which is exactly how
+     * grammar_setup_text finishes. Byte-identical to the teardown+recompile path either way. */
+    GrDraft *gd=&grd[sub.slot];
+    if(gtxt && gd->on && gd->src && !strcmp(gd->src,gtxt)){
+        grammar_reset(gd);               /* fresh walker state, same compiled grammar */
+        free(gtxt);
+    } else {
+        grammar_teardown(gd);            /* new request owns the slot's grammar state */
+        if(gtxt){
+            size_t glen=(size_t)sub.gbytes;
+            char *keep=malloc(glen+1);   /* setup_text frees gtxt; keep a copy as the cache key */
+            if(keep){ memcpy(keep,gtxt,glen); keep[glen]=0; }
+            if(grammar_setup_text(gd,T,gtxt,"request")==0) gd->src=keep;  /* fail-soft; owns gtxt */
+            else free(keep);
+        }
+    }
     ServeCtx *sc=&ctx[sub.slot]; kv_bind(m,&sc->kv);
     int *tmp=malloc(maxctx*sizeof(int));
     if(!tmp){ fprintf(stderr,"OOM mux_submit tmp\n"); free(raw); free(line); exit(1); }
