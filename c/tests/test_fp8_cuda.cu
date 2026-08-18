@@ -283,6 +283,16 @@ int main(void){
                     got,want,bt->weight_bytes,bt->scale_count);
                 return 1;
             }
+            /* Independent oracle: fmt=8 footprint from quant.h's documented
+             * layout -- O*I raw e4m3 bytes + ceil(O/128)*ceil(I/128) f32 block
+             * scales (hs_n above) -- no struct fields, so the accessor cannot
+             * validate itself against the counts upload happened to store. */
+            size_t indep=(size_t)I*D+(size_t)hs_n*sizeof(float);
+            if(got!=indep||bt->scale_count!=(size_t)hs_n){
+                printf("FAIL bytes-check fmt8 independent: got %zu want %zu (%d*%d + %d*4), scale_count %zu (want %d)\n",
+                    got,indep,I,D,hs_n,bt->scale_count,hs_n);
+                return 1;
+            }
             coli_cuda_tensor_free(bt);
             free(bw);free(bs);
 
