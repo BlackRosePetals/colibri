@@ -60,3 +60,12 @@ controlled A/Bs — with `moe_intermediate_size=512`, Qwen's rows are short, so
 per-row quantization error concentrates the same way. The gs64 container costs
 ~1.7 GB more on disk and a few percent on cold-start; warm decode speed is the
 same or slightly better.
+
+## `--ram` is not honoured by this engine
+
+`coli --ram` sizes the RAM budget for engines that stream experts from disk on
+demand. qwen36 does not: the CUDA expert tier it is built for (#713) requires
+full RAM residency of the expert set, so the budget is decided by the container,
+not by a flag. The engine reads no `RAM_GB`, and passing `--ram` changes
+nothing. Said here rather than silently ignored, because a flag that appears to
+work and does not is worse than one that is documented as unsupported.

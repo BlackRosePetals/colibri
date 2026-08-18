@@ -879,8 +879,12 @@ olmoe$(EXE): olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unico
 # Qwen3.6-35B-A3B engine (hybrid Gated Attention + Gated DeltaNet + streaming
 # MoE). CPU-only in this target; the optional CUDA expert tier is a separate
 # follow-up (see docs/qwen36-phase01.md).
+# NOCUDA_*: this file contains no CUDA, so building it with -DCOLI_CUDA and
+# linking -lcudart only made `make qwen36 CUDA=1` depend on a toolkit it
+# never calls. Same shape as olmoe. (The CUDA expert tier is #713, which
+# adds its own sources and takes the CUDA flags back.)
 qwen36$(EXE): qwen36.c st.h json.h compat.h
-	$(CC) $(CFLAGS) qwen36.c -o qwen36$(EXE) $(LDFLAGS)
+	$(CC) $(NOCUDA_CFLAGS) qwen36.c -o qwen36$(EXE) $(NOCUDA_LDFLAGS)
 
 # Context-size gates: KV layout, growth across requests, and the attention
 # capacity. Includes qwen36.c directly, so no model file is needed.

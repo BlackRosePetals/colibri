@@ -2171,6 +2171,15 @@ static void serve_one(Model *m, ServeReq *q){
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
     m->max_t = np + q->max_tok;
     reset_recurrent(m); ensure_kv(m); m->kv_len = 0;
+    /* Per-REQUEST state, not per-process: without this the server keeps the
+     * first request's prefill flag and expert-collection set forever, so
+     * COLIBRI_RESIDENT=1 collects on request #1 and never again, and the
+     * router EMA carries one conversation's history into the next. */
+    m->first_step = 1;
+    if (m->seen) memset(m->seen, 0, (size_t)m->c.n_layers * m->c.n_experts);
+    if (m->momentum_logits)
+        memset(m->momentum_logits, 0,
+               (size_t)m->c.n_layers * m->c.n_experts * sizeof(float));
     float *lo = step(m, ids, np, 0);
     int gen=0, limited=1;
     int eos_ids[4]; int n_eos=serve_eos_ids(eos_ids,4);
