@@ -464,7 +464,7 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(frame, expected)
             process.stdout.feed(
                 b"DATA 1 4\nA\n\xc3\xa9\n"
-                b"DONE 1 STAT 1 2.5 50.0 1.25 5 0\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 5 0\n"
             )
 
         process = FakeProcess(respond)
