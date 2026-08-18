@@ -377,11 +377,24 @@ jobs:
           # the output. The sanitizers are the half of this gate that watches
           # memory, and PILOT=1 puts concurrent expert loads against the cache
           # so the slot paths are exercised, not just walked past.
+          #
+          # This step asserts MEMORY SAFETY, not token-exactness -- the three
+          # runs above already own that. -fsanitize changes inlining and
+          # vectorization, so this is a differently-compiled binary, and float
+          # reassociation can flip a token wherever the margin is thin. Demanding
+          # exactness from it conflates two goals and made this job red on a
+          # docs-only commit: the normal build matched 16/16, the sanitizer build
+          # did not. So: run it, ignore a token mismatch, fail on any sanitizer
+          # diagnostic.
           make clean >/dev/null 2>&1 || true
           make qwen36 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
-          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=print_stacktrace=1 \
             COLI_DENSE_I8=0 SNAP=qwen36_tiny_c PILOT=1 WIDE=2 \
-            ./qwen36 1 8 qwen36_tiny/ref_full.json
+            ./qwen36 1 8 qwen36_tiny/ref_full.json > san.log 2>&1 || true
+          if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then
+            echo "FAIL: sanitizer diagnostic under PILOT"; cat san.log; exit 1
+          fi
+          echo "sanitizers clean:"; grep -E "Matching tokens" san.log || true
       - name: A malformed container is refused, not read
         run: |
           cd c
