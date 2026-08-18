@@ -87,10 +87,16 @@ int main(void){
                 fprintf(stderr,"FAIL matmul_i4p_idot @%zu\n",i); if(fails>8) break; } }
         free(qp);free(ql);free(sc);free(xq);free(sx);free(xs);free(ya);free(yb);
     }
-#if defined(__AVX2__)
-    /* f32 planare vs f32 a coppie: bit-uguali DOVE il gate accende il planare
-     * (build AVX2 — su ARM matmul_i4p non ha ramo NEON e il gate resta spento;
-     * il test asserisce il claim esattamente dove il claim e' fatto). */
+#if defined(__AVX2__) && !(defined(__AVX512F__) && defined(__AVX512BW__))
+    /* f32 planare vs f32 a coppie: bit-uguali DOVE il gate accende il planare.
+     * Il gate del motore (planar_on) esclude ARM (niente ramo NEON in
+     * matmul_i4p) E i build AVX-512F (matmul_i4 li' puo' prendere il ramo
+     * dot_i4f_avx512, ordine di accumulo diverso) — il test DEVE rispecchiare
+     * il gate alla lettera, o asserisce un claim che il motore non fa.
+     * Trovato dal runner-lottery: la PR e' passata su un runner AVX2, il push
+     * su dev e' finito su un runner AVX-512-VNNI ed e' fallito qui (#1081).
+     * EN: the test must mirror planar_on() exactly; an AVX-512 runner runs
+     * matmul_i4's 512-bit arm while the engine keeps planar OFF there. */
     {
         int O=256, I=6100, rb=(I+1)/2, S=3;   /* coda I%64!=0 inclusa */
         uint8_t *qp=malloc((size_t)O*rb); for(size_t i=0;i<(size_t)O*rb;i++) qp[i]=(uint8_t)rnd();
