@@ -1086,6 +1086,77 @@ static inline int32_t dot_i4p_u(const uint8_t *w4, const int8_t *x, int I){
     return sum;
 }
 
+/* ---- K1b (OPT-IN, IDOT_GS=1): IDOT planare A GRUPPI (fmt=4, gs%64==0) -----
+ * Con gs=64 il gruppo di scala COINCIDE col blocco-piano da 64 elementi: il
+ * dot unsigned del blocco (2 dpbusd) -> int32 di gruppo, meno 8*somma(x) del
+ * gruppo, per la scala f32 del gruppo. Attivazioni int8 (stessa famiglia
+ * qrow_i8 del resto dell'IDOT): NON bit-identico al kernel f32 a gruppi --
+ * per questo e' dietro flag, in attesa dell'ablazione. xsg = somme int32
+ * per (riga, gruppo), calcolate dal chiamante in una passata esatta.
+ * EN: grouped planar IDOT, opt-in. With gs=64 the scale group IS the plane
+ * block; per-group unsigned dot minus 8*group-sum, times the group scale.
+ * int8 activations: not bit-identical to the f32 grouped kernel, hence the
+ * flag until the ablation blesses a default. */
+static void matmul_i4p_grouped_idot(float *y, const int8_t *xq, const float *sx,
+                                    const int32_t *xsg, const uint8_t *q4,
+                                    const float *scale, int S, int I, int O, int gs){
+    int rb=(I+1)/2, ng=(I+gs-1)/gs, bpg=gs/64;   /* blocchi-piano per gruppo */
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint8_t *w=q4+(int64_t)o*rb;
+        const float *scl=scale+(int64_t)o*ng;
+        for(int s=0;s<S;s++){
+            const int8_t *xr=xq+(int64_t)s*I;
+            const int32_t *xg=xsg+(int64_t)s*ng;
+            float a=0; int g=0;
+            for(; (g+1)*gs<=I; g++){                     /* gruppi interi */
+                int32_t d=0;
+                for(int b=0;b<bpg;b++){
+                    int base=g*gs+b*64;
+                    const uint8_t *blk=w+(base>>1);
+                    const int8_t *xb=xr+base;
+#if defined(coli_dpbusd256)
+                    const __m256i m4=_mm256_set1_epi8(0x0F);
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i acc=_mm256_setzero_si256();
+                    acc=coli_dpbusd256(acc,_mm256_and_si256(bb,m4),
+                                       _mm256_loadu_si256((const __m256i*)xb));
+                    acc=coli_dpbusd256(acc,_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
+                                       _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    d+=hsum256_i32(acc);
+#elif defined(__AVX2__)
+                    const __m256i m4=_mm256_set1_epi8(0x0F);
+                    const __m256i ones=_mm256_set1_epi16(1);
+                    __m256i bb=_mm256_loadu_si256((const __m256i*)blk);
+                    __m256i p0=_mm256_maddubs_epi16(_mm256_and_si256(bb,m4),
+                                                    _mm256_loadu_si256((const __m256i*)xb));
+                    __m256i p1=_mm256_maddubs_epi16(_mm256_and_si256(_mm256_srli_epi16(bb,4),m4),
+                                                    _mm256_loadu_si256((const __m256i*)(xb+32)));
+                    __m256i acc=_mm256_add_epi32(_mm256_madd_epi16(p0,ones),
+                                                 _mm256_madd_epi16(p1,ones));
+                    d+=hsum256_i32(acc);
+#else
+                    for(int k=0;k<32;k++){
+                        d+=(int32_t)(blk[k]&0xF)*xb[k];
+                        d+=(int32_t)(blk[k]>>4)*xb[k+32];
+                    }
+#endif
+                }
+                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+            }
+            if(g*gs<I){                                  /* coda: gruppo parziale, nibble a coppie */
+                int32_t d=0;
+                for(int i=g*gs;i<I;i++){
+                    uint8_t byte=w[i>>1];
+                    d+=(int32_t)((i&1)?(byte>>4):(byte&0xF))*xr[i];
+                }
+                a=fmaf((float)(d-8*xg[g]),scl[g],a);
+            }
+            y[(int64_t)s*O+o]=a*sx[s];
+        }
+    }
+}
+
 /* matmul IDOT planare (fmt=2): y = (dot_u - 8*xsum[s]) * scale[o] * sx[s].
  * Bit-identico a matmul_i4_idot: somme intere, identita' esatta. */
 static void matmul_i4p_idot(float *y, const int8_t *xq, const float *sx, const int32_t *xsum,
