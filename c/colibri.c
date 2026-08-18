@@ -939,6 +939,13 @@ static int planar_on(void){
         g_planar=0;
 #elif defined(__AVX512F__)&&defined(__AVX512BW__)
         g_planar=0;
+#elif !defined(__AVX2__)
+        g_planar=0;   /* matmul_i4p non ha (ancora) un ramo NEON: su ARM il path
+                       * f32 planare degraderebbe a scalare E cambierebbe l'ordine
+                       * di accumulo rispetto al gemello NEON a coppie — il claim
+                       * bit-identico vale solo dove i gemelli esistono entrambi.
+                       * EN: no NEON arm in matmul_i4p yet — planar stays off on
+                       * non-AVX2 builds until one lands with matching order. */
 #else
         const char *e=getenv("PLANAR"); g_planar=!(e&&*e=='0');
         const char *xe=getenv("XEXP"); if(xe&&*xe=='1') g_planar=0;

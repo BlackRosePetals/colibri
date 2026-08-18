@@ -87,6 +87,26 @@ int main(void){
                 fprintf(stderr,"FAIL matmul_i4p_idot @%zu\n",i); if(fails>8) break; } }
         free(qp);free(ql);free(sc);free(xq);free(sx);free(xs);free(ya);free(yb);
     }
+#if defined(__AVX2__)
+    /* f32 planare vs f32 a coppie: bit-uguali DOVE il gate accende il planare
+     * (build AVX2 — su ARM matmul_i4p non ha ramo NEON e il gate resta spento;
+     * il test asserisce il claim esattamente dove il claim e' fatto). */
+    {
+        int O=256, I=6100, rb=(I+1)/2, S=3;   /* coda I%64!=0 inclusa */
+        uint8_t *qp=malloc((size_t)O*rb); for(size_t i=0;i<(size_t)O*rb;i++) qp[i]=(uint8_t)rnd();
+        uint8_t *ql=malloc((size_t)O*rb); memcpy(ql,qp,(size_t)O*rb); planarize_i4(ql,O,I);
+        float *sc=malloc(O*sizeof(float)); for(int o=0;o<O;o++) sc[o]=0.001f+(rnd()%997)*1e-6f;
+        float *x=malloc((size_t)S*I*sizeof(float));
+        for(size_t i=0;i<(size_t)S*I;i++) x[i]=((int32_t)(rnd()&0xFFFF)-0x8000)/8192.0f;
+        float *ya=malloc((size_t)S*O*sizeof(float)), *yb=malloc((size_t)S*O*sizeof(float));
+        matmul_i4(ya,x,qp,sc,S,I,O);
+        matmul_i4p(yb,x,ql,sc,S,I,O);
+        for(size_t i=0;i<(size_t)S*O;i++){ checks++;
+            if(memcmp(&ya[i],&yb[i],4)){ fails++;
+                fprintf(stderr,"FAIL matmul_i4p f32 @%zu\n",i); if(fails>8) break; } }
+        free(qp);free(ql);free(sc);free(x);free(ya);free(yb);
+    }
+#endif
     printf("int-kernel exactness: %d checks, %d failures (%s / " IDOT_KERNEL ")\n",
            checks,fails,fails?"FAIL":"PASS");
     return fails?1:0;
