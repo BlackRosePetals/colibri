@@ -36,8 +36,9 @@ make -C c qwen36
 COLI_MODEL=~/Models/qwen36_i4_gs64 ./c/coli chat
 ```
 
-`coli` reads the model's `config.json` (`model_type` contains `qwen`), picks
-this engine, and drives it over the serve protocol — `coli web` and
+`coli` reads the model's `config.json` and matches its `model_type` against the
+family registry (`qwen3_5_moe` / `qwen3_5_moe_text` — an exact match, so other
+Qwen architectures are not claimed by this engine), picks it, and drives it over the serve protocol — `coli web` and
 `coli serve` (OpenAI-compatible API) work the same way.
 
 Direct invocation without the gateway:
@@ -49,7 +50,8 @@ N_NEW=200 ./c/qwen36 256 4 prompt.txt
 
 Requirements: ~30 GB RAM for comfortable expert caching, NVMe storage for the
 container. CPU-only in this build; the CUDA VRAM expert tier is a separate PR
-(`docs/qwen36-cuda-tier.md`).
+([#713](https://github.com/JustVugg/colibri/pull/713)), which brings its own
+`docs/qwen36-cuda-tier.md` — the file does not exist in this PR.
 
 ## Which container?
 
