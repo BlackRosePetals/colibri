@@ -1093,7 +1093,54 @@ static void matmul_i4p_idot(float *y, const int8_t *xq, const float *sx, const i
     int rb=(I+1)/2;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
-        for(int s=0;s<S;s++){
+        int s=0;
+#if defined(coli_dpbusd256)
+        /* K2: tile 1x4 sulla union — il blocco pesi (load + 2 and + srli) si
+         * paga UNA volta per 4 righe di attivazione invece che per riga. La
+         * union del prefill consegna nr=2..16 righe per expert: e' esattamente
+         * la finestra che il per-riga serviva peggio. Somme intere ->
+         * bit-identico al path per-riga per associativita'.
+         * EN: 1x4 register tile — the weight block's load+mask cost is paid
+         * once per 4 activation rows. Integer sums: bit-identical to the
+         * per-row path by associativity. */
+        const __m256i m4t=_mm256_set1_epi8(0x0F);
+        for(;s+4<=S;s+=4){
+            const int8_t *x0=xq+(int64_t)s*I, *x1=x0+I, *x2=x1+I, *x3=x2+I;
+            __m256i a0=_mm256_setzero_si256(), a1=_mm256_setzero_si256();
+            __m256i a2=_mm256_setzero_si256(), a3=_mm256_setzero_si256();
+            int i=0;
+            for(;i+64<=I;i+=64){
+                __m256i b =_mm256_loadu_si256((const __m256i*)(w+(i>>1)));
+                __m256i lo=_mm256_and_si256(b,m4t);
+                __m256i hi=_mm256_and_si256(_mm256_srli_epi16(b,4),m4t);
+                a0=coli_dpbusd256(a0,lo,_mm256_loadu_si256((const __m256i*)(x0+i)));
+                a0=coli_dpbusd256(a0,hi,_mm256_loadu_si256((const __m256i*)(x0+i+32)));
+                a1=coli_dpbusd256(a1,lo,_mm256_loadu_si256((const __m256i*)(x1+i)));
+                a1=coli_dpbusd256(a1,hi,_mm256_loadu_si256((const __m256i*)(x1+i+32)));
+                a2=coli_dpbusd256(a2,lo,_mm256_loadu_si256((const __m256i*)(x2+i)));
+                a2=coli_dpbusd256(a2,hi,_mm256_loadu_si256((const __m256i*)(x2+i+32)));
+                a3=coli_dpbusd256(a3,lo,_mm256_loadu_si256((const __m256i*)(x3+i)));
+                a3=coli_dpbusd256(a3,hi,_mm256_loadu_si256((const __m256i*)(x3+i+32)));
+            }
+            int32_t d0=hsum256_i32(a0), d1=hsum256_i32(a1);
+            int32_t d2=hsum256_i32(a2), d3=hsum256_i32(a3);
+            /* coda a coppie, unsigned: stessa identita' -8*xsum del per-riga */
+            for(;i<I;i+=2){
+                uint8_t byte=w[i>>1];
+                d0+=(int32_t)(byte&0xF)*x0[i]; d1+=(int32_t)(byte&0xF)*x1[i];
+                d2+=(int32_t)(byte&0xF)*x2[i]; d3+=(int32_t)(byte&0xF)*x3[i];
+                if(i+1<I){
+                    d0+=(int32_t)(byte>>4)*x0[i+1]; d1+=(int32_t)(byte>>4)*x1[i+1];
+                    d2+=(int32_t)(byte>>4)*x2[i+1]; d3+=(int32_t)(byte>>4)*x3[i+1];
+                }
+            }
+            y[(int64_t)(s+0)*O+o]=(float)(d0-8*xsum[s+0])*sc*sx[s+0];
+            y[(int64_t)(s+1)*O+o]=(float)(d1-8*xsum[s+1])*sc*sx[s+1];
+            y[(int64_t)(s+2)*O+o]=(float)(d2-8*xsum[s+2])*sc*sx[s+2];
+            y[(int64_t)(s+3)*O+o]=(float)(d3-8*xsum[s+3])*sc*sx[s+3];
+        }
+#endif
+        for(;s<S;s++){
             int32_t d=dot_i4p_u(w,xq+(int64_t)s*I,I)-8*xsum[s];
             y[(int64_t)s*O+o]=(float)d*sc*sx[s];
         }

@@ -71,7 +71,7 @@ int main(void){
     }
     /* 4) matmul-level: planar IDOT must equal pair IDOT bitwise */
     {
-        int O=512, I=2048, rb=(I+1)/2, S=4;
+        int O=512, I=2048, rb=(I+1)/2, S=6;   /* K2: 4 righe di tile + 2 di resto */
         uint8_t *qp=malloc((size_t)O*rb); for(size_t i=0;i<(size_t)O*rb;i++) qp[i]=(uint8_t)rnd();
         uint8_t *ql=malloc((size_t)O*rb); memcpy(ql,qp,(size_t)O*rb); planarize_i4(ql,O,I);
         float *sc=malloc(O*sizeof(float)); for(int o=0;o<O;o++) sc[o]=0.001f+(rnd()%997)*1e-6f;
