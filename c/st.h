@@ -377,11 +377,28 @@ static void st_fmt_stamp_ingest(shards *S, jval *root, const char *shard_path) {
                     shard_path, ST_FMT_STAMP_MAX); exit(1); }
         if (S->fmt_n == S->fmt_cap) {
             S->fmt_cap = S->fmt_cap ? S->fmt_cap * 2 : 16;
-            S->fmt_name = realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
-            S->fmt_val  = realloc(S->fmt_val,  S->fmt_cap * sizeof(char*));
+            char **nn = (char**)realloc(S->fmt_name, S->fmt_cap * sizeof(char*));
+            if (!nn) { fprintf(stderr, "%s: OOM reallocating format-stamp table (fmt_name, %d entries)\n",
+                        shard_path, S->fmt_cap); exit(1); }
+            S->fmt_name = nn;
+            char **nv = (char**)realloc(S->fmt_val, S->fmt_cap * sizeof(char*));
+            if (!nv) { fprintf(stderr, "%s: OOM reallocating format-stamp table (fmt_val, %d entries)\n",
+                        shard_path, S->fmt_cap); exit(1); }
+            S->fmt_val = nv;
         }
-        S->fmt_name[S->fmt_n] = strdup(inner->keys[i]);
-        S->fmt_val[S->fmt_n]  = strdup(v->str);
+        /* Neither strdup here is benign to drop: a NULL fmt_name would be dereferenced by
+         * the duplicate-scan strcmp above on the very next entry, and a NULL fmt_val is
+         * worse -- the process would exit 0 with no diagnostic, st_fmt_stamp() would then
+         * return NULL for a tensor that IS stamped, and the container would silently read
+         * as unstamped: qt_verify_fmt_stamp's TRUST-VERIFY-REFUSE check (colibri.c) is a
+         * no-op on an unstamped tensor, so one failed allocation would quietly disable it
+         * on an untrusted-container path. Refuse instead. */
+        char *sn = strdup(inner->keys[i]), *sv = strdup(v->str);
+        if (!sn || !sv) { fprintf(stderr, "%s: OOM duplicating __metadata__[\"colibri.fmt\"] stamp "
+                    "for tensor '%s' -- refusing (a dropped stamp would silently disable format "
+                    "verification for this tensor)\n", shard_path, inner->keys[i]); exit(1); }
+        S->fmt_name[S->fmt_n] = sn;
+        S->fmt_val[S->fmt_n]  = sv;
         S->fmt_n++;
     }
     free(arena2);  /* always NULL (json_parse never populates it -- see j_dup); the jval
