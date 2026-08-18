@@ -74,7 +74,7 @@ static void test_errors_and_busy_payload_are_byte_exact(void)
     FILE *in=bytes_input(bad,sizeof(bad)-1);
     FILE *out=tmpfile(); assert(out); binary_stream(out);
     ServeReq request={0};
-    assert(serve_read_req(in,out,&request,NULL)==0);
+    assert(serve_read_req(in,out,&request,NULL)==-2);
     char output[128]; size_t count=read_output(out,output,sizeof(output));
     static const char want[]="ERROR bad bad submit header\n";
     assert(count==sizeof(want)-1&&memcmp(output,want,count)==0);
@@ -93,11 +93,40 @@ static void test_errors_and_busy_payload_are_byte_exact(void)
     fclose(in); fclose(out);
 }
 
+static void test_malformed_submit_cannot_become_a_control(void)
+{
+    static const char *frames[]={
+        "SUBMIT bad 0 12 0 0.7 0.95\nCANCEL live\n",
+        "SUBMIT bad 0 12 4 0.7 0.95 extra extra\nCANCEL live\n",
+    };
+    for(size_t i=0;i<sizeof(frames)/sizeof(frames[0]);i++){
+        FILE *in=bytes_input(frames[i],strlen(frames[i]));
+        FILE *out=tmpfile(); assert(out); binary_stream(out);
+        ServeReq request={0};
+        assert(serve_read_req(in,out,&request,"live")==-2);
+        assert(fgetc(in)=='C');
+        char output[64]; size_t count=read_output(out,output,sizeof(output));
+        static const char want[]="ERROR bad bad submit header\n";
+        assert(count==sizeof(want)-1&&memcmp(output,want,count)==0);
+        fclose(in); fclose(out);
+    }
+
+    static const char bad_term[]=
+        "SUBMIT broken 0 1 4 0.7 0.95\nxXSTOP live\n";
+    FILE *in=bytes_input(bad_term,sizeof(bad_term)-1);
+    FILE *out=tmpfile(); assert(out); binary_stream(out);
+    ServeReq request={0};
+    assert(serve_read_req(in,out,&request,"live")==-2);
+    assert(fgetc(in)=='S');
+    fclose(in); fclose(out);
+}
+
 int main(void)
 {
     test_submit_preserves_k3_wire_bytes();
     test_controls_match_only_active_request();
     test_errors_and_busy_payload_are_byte_exact();
+    test_malformed_submit_cannot_become_a_control();
     puts("kimi serve framing baseline: ok");
     return 0;
 }

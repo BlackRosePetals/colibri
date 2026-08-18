@@ -157,6 +157,10 @@ static void test_writer_golden_bytes(void)
     assert(coli_serve_write_error(output, "req-7", "bad\r\nframe"));
     ColiServeDone done = {3, 1.25, 50.0, 1.25, 7, 1};
     assert(coli_serve_write_done(output, "req-7", &done));
+    char done_line[128];
+    assert(coli_serve_format_done(done_line, sizeof(done_line), "req-7", &done) ==
+           (int)strlen("DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n"));
+    assert(strcmp(done_line, "DONE req-7 STAT 3 1.250 50.0 1.25 7 1\n") == 0);
 
     static const unsigned char expected[] =
         "\x01\x01READY\x01\x01\nSTAT 0 0.0 0.0 1.25 0 0\n"
