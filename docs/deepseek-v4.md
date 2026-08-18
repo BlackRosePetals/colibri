@@ -77,15 +77,19 @@ picks at start-up by GPU:
 
 | DLL | build target | kernels | GPUs |
 |---|---|---|---|
-| `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll DEEPGEMM_HOME=<sm120 DeepGEMM checkout>` (from a vcvars64 shell) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
+| `coli_cuda_dsv4_dg.dll` | `make cuda-dsv4-dg-dll` (from a vcvars64 shell; fetches the pinned DeepGEMM headers on first use) | DeepGEMM tensor-core prefill paths + generic kernels | compute capability 12.x (RTX 50-series) |
 | `coli_cuda_dsv4.dll` | `make cuda-dsv4-dll CUDA_ARCH=portable` | generic CUDA kernels only (fp32 compute from fp8/fp4 decode) | any sm_80+ (RTX 30/40/50, A/H series) |
 
-The DeepGEMM flavour is an opt-in build (as in #772): `DEEPGEMM_HOME` must
-point at the community sm120 port of DeepGEMM (bvolpato/DeepGEMM branch
-`sm120-full`; upstream DeepGEMM has no sm120 kernels) with
-`c/patches-deepgemm-sm120-msvc.patch` applied — MSVC ignores `alignas(64)` on
-by-value TMA descriptors and the patch pads them. The generic DLL needs no
-external tree. Loader rules:
+The DeepGEMM sm120 headers the DLL needs are not in the repository:
+`c/tools/fetch_deepgemm.sh` checks out the community sm120 port of DeepGEMM
+(MIT; upstream DeepGEMM has no sm120 kernels) plus its CUTLASS/CuTe submodule
+(BSD-3) at a pinned commit into the gitignored `c/third_party/deepgemm/`,
+verifies both commit ids, and applies `c/patches-deepgemm-sm120-msvc.patch`
+(MSVC ignores `alignas(64)` on by-value TMA descriptors — the patch pads
+them). `make cuda-dsv4-dg-dll` and `DEEPGEMM=1` run it on first build
+(`make deepgemm-fetch` runs it alone; ~40 MB, git required);
+`DEEPGEMM_HOME=<dir>` points at an existing tree instead and `DEEPGEMM_PIN`
+bumps the commit. Attribution: `THIRD_PARTY_NOTICES.md`. Loader rules:
 try `_dg` first, ask it whether device 0 fits (`dsv4_cuda_backend_arch_ok`),
 otherwise load the generic DLL; `COLI_DSV4_DLL=<file name>` forces one. The
 start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
@@ -96,7 +100,7 @@ start-up banner names the choice: `[DSV4 CUDA] backend=coli_cuda_dsv4_dg.dll
 ```bash
 cd c
 make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=portable   # generic kernels, any sm_80+
-make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1 DEEPGEMM_HOME=<dir>   # DeepGEMM flavour, sm_120a only
+make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 DEEPGEMM=1           # DeepGEMM flavour, sm_120a only (fetches the pinned headers)
 make -f Makefile.deepseek-v4 deepseek-v4 CUDA=1 CUDA_ARCH=sm_86 NO_TC=1   # toolkit older than 12.8
 ```
 

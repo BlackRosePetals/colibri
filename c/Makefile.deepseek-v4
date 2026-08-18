@@ -122,9 +122,12 @@ ifeq ($(DEEPGEMM),1)
 # The DeepGEMM kernels use sm_120a-only PTX (block-scaled MMA); they cannot be
 # compiled for compute_120 or any other target, so DEEPGEMM=1 builds for
 # sm_120a only (CUDA_ARCH is ignored). Use the generic build for other cards.
-ifndef DEEPGEMM_HOME
-$(error DEEPGEMM_HOME must point to the sm120 DeepGEMM checkout (see patches-deepgemm-sm120-msvc.patch))
-endif
+# Headers: a pinned checkout made by tools/fetch_deepgemm.sh on first build
+# (gitignored third_party/deepgemm); DEEPGEMM_HOME points at an existing tree.
+DEEPGEMM_HOME ?= third_party/deepgemm
+DEEPGEMM_PIN ?= 39fb4447a062b418fd08ce17cd308adb28559417
+DEEPGEMM_STAMP = $(DEEPGEMM_HOME)/deep_gemm/include/deep_gemm/impls/sm120_bf16_gemm.cuh
+V4_DEEPGEMM_DEP = $(DEEPGEMM_STAMP)
 V4_CUDA_GENCODE = -gencode arch=compute_120a,code=sm_120a
 V4_DEEPGEMM_FLAGS = -DCOLI_DSV4_DEEPGEMM \
                 -I$(DEEPGEMM_HOME)/deep_gemm/include -I$(DEEPGEMM_HOME)/cutlass/include \
@@ -201,8 +204,13 @@ backend_loader_dsv4.o: backend_loader_dsv4.c backend_cuda_dsv4.h
 	$(CC) $(CFLAGS) -c backend_loader_dsv4.c -o $@
 
 # Linux/macOS CUDA=1: the tier compiled straight into the engine.
-backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h
+backend_cuda_dsv4.o: backend_cuda_dsv4.cu backend_cuda_dsv4.h $(V4_DEEPGEMM_DEP)
 	"$(NVCC)" $(V4_NVCCFLAGS) -c backend_cuda_dsv4.cu -o $@
+
+ifneq ($(DEEPGEMM_STAMP),)
+$(DEEPGEMM_STAMP):
+	DEEPGEMM_HOME="$(DEEPGEMM_HOME)" tools/fetch_deepgemm.sh "$(DEEPGEMM_PIN)"
+endif
 
 deepseek-v4-test-objs: $(TEST_UNIT_OBJS)
 
