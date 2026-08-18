@@ -218,8 +218,50 @@ int main(void){
         for(int c=0;c<COUNT;c++){ coli_cuda_tensor_free(tg[c]);coli_cuda_tensor_free(tu[c]);coli_cuda_tensor_free(td[c]);
             free(hg[c]);free(hu[c]);free(hd[c]);free(hgs[c]);free(hus[c]);free(hds[c]); }
         free(x);free(ysync);free(hw);free(hsc);
-        coli_cuda_shutdown();
         if(api_bad){ printf("FAIL\n"); return 1; }
+
+        /* ---- Byte-accounting regression: coli_cuda_tensor_free must undo
+         * exactly what upload charged, per scale shape. fmt=8's 128x128 block
+         * scale_count ((O+127)/128 blocks, not O rows) is the shape that once
+         * made free() over-count and trip the tensor_bytes >= bytes guard,
+         * leaving the diagnostic counter stuck non-zero forever; fmt=4 grouped
+         * (O*ng row-group scales) is covered alongside since it shares the same
+         * free()-side expression. */
+        {
+            size_t c0,b0,c1,b1;
+            coli_cuda_stats(0,&c0,&b0);
+            ColiCudaTensor *bt=nullptr;
+            uint8_t *bw=(uint8_t*)malloc((size_t)I*D); float *bs=(float*)malloc(hs_n*4);
+            for(size_t i=0;i<(size_t)I*D;i++) bw[i]=rnd_e4m3();
+            for(int i=0;i<hs_n;i++) bs[i]=ldexpf(1.f+rand()/(float)RAND_MAX,-12);
+            if(!coli_cuda_tensor_upload(&bt,bw,bs,8,D,I,0)){ printf("FAIL byte-check fmt8 upload\n"); return 1; }
+            coli_cuda_tensor_free(bt);
+            coli_cuda_stats(0,&c1,&b1);
+            if(c1!=c0||b1!=b0){
+                printf("FAIL byte-check fmt8: count %zu->%zu bytes %zu->%zu (want unchanged)\n",c0,c1,b0,b1);
+                return 1;
+            }
+            free(bw);free(bs);
+
+            const int GI=64,GO=32,GS=32;
+            int gng=(GI+GS-1)/GS;
+            ColiCudaTensor *gt=nullptr;
+            uint8_t *gw=(uint8_t*)malloc((size_t)((GI+1)/2)*GO);
+            float *gsc=(float*)malloc((size_t)GO*gng*4);
+            for(size_t i=0;i<(size_t)((GI+1)/2)*GO;i++) gw[i]=(uint8_t)rand();
+            for(int i=0;i<GO*gng;i++) gsc[i]=ldexpf(1.f+rand()/(float)RAND_MAX,-4);
+            coli_cuda_stats(0,&c0,&b0);
+            if(!coli_cuda_tensor_upload_g(&gt,gw,gsc,4,GI,GO,0,GS)){ printf("FAIL byte-check fmt4g upload\n"); return 1; }
+            coli_cuda_tensor_free(gt);
+            coli_cuda_stats(0,&c1,&b1);
+            if(c1!=c0||b1!=b0){
+                printf("FAIL byte-check fmt4g: count %zu->%zu bytes %zu->%zu (want unchanged)\n",c0,c1,b0,b1);
+                return 1;
+            }
+            free(gw);free(gsc);
+            printf("byte accounting: fmt=8 dense + fmt=4 grouped free() restores stats exactly\n");
+        }
+        coli_cuda_shutdown();
     }
     printf("OK\n"); return 0;
 }
