@@ -79,6 +79,8 @@ we shipped twice.
   refused rather than silently resolved to one of them (untrusted containers).
 
 ### Interfaces
+- **#829** (@aaristov) — GPU-vs-fallback counters and chat status made visible in
+  `coli serve`: the tier's behaviour is now observable instead of inferred.
 - **#1095** (@benmaster82) — OLMoE planner geometry adapter (#1066).
 - **#1096** (@terrizoaguimor) — DeepSeek V4 serve framing on the shared codec,
   completing the codec migration across OLMoE, Kimi K3 and V4.
