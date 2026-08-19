@@ -28,7 +28,7 @@ static size_t read_output(FILE *stream, unsigned char *output, size_t capacity)
 
 static void reset_queue(void)
 {
-    for(int i=0;i<g_qn;i++){ free(g_q[i].payload); free(g_q[i].audio); }
+    for(int i=0;i<g_qn;i++) serve_request_dispose(&g_q[i]);
     memset(g_q,0,sizeof(g_q)); g_qn=0;
 }
 
@@ -81,10 +81,30 @@ static void test_controls_and_queue_full_preserve_behavior(void)
     fclose(input); fclose(output); g_qn=0;
 }
 
+static void test_malformed_submit_cannot_become_control(void)
+{
+    static const char frame[]=
+        "SUBMIT bad 0 12 0 0.7 0.95 4\nCANCEL liveWXYZ\n";
+    FILE *input=bytes_input(frame,sizeof(frame)-1);
+    FILE *output=tmpfile(); assert(output); binary_stream(output);
+    assert(serve_read_cmd(input,output,"live")==-2);
+    assert(fgetc(input)=='C');
+    fclose(input); fclose(output);
+
+    static const char bad_term[]=
+        "SUBMIT broken 0 1 4 0.7 0.95 4\nxWXYZXSTOP live\n";
+    input=bytes_input(bad_term,sizeof(bad_term)-1);
+    output=tmpfile(); assert(output); binary_stream(output);
+    assert(serve_read_cmd(input,output,"live")==-2);
+    assert(fgetc(input)=='S');
+    fclose(input); fclose(output);
+}
+
 int main(void)
 {
     test_text_and_audio_submits_are_exact();
     test_controls_and_queue_full_preserve_behavior();
+    test_malformed_submit_cannot_become_control();
     puts("inkling serve framing baseline: ok");
     return 0;
 }
