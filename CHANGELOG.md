@@ -82,6 +82,9 @@ we shipped twice.
 - **#1122** (@ZacharyZcR) — `USAGE_SAVE=0` honoured in every engine (#1039): the
   history was loaded but written back anyway, which quietly contaminated any A/B
   that shared a usage file between arms.
+- **#1121** (@ZacharyZcR) — LRU victim selection now respects a lowered `ecap`
+  (#1034): after an RSS-guard reduction the cache kept evicting against the old
+  capacity.
 - **#1123** (@ZacharyZcR) — the v1.6.2 warning-cleanup patches landed (#1032).
 - **#1106** (@monotophic) — duplicate tensor names across indexed shards are now
   refused rather than silently resolved to one of them (untrusted containers).
