@@ -206,7 +206,7 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.workspace_bytes, 0)
 
     def test_unproven_production_planners_refuse_instead_of_inventing_zero(self):
-        for model_type in ("inkling", "deepseek_v4"):
+        for model_type in ("deepseek_v4",):
             family = family_for_config({"model_type": model_type})
             resolved = type("R", (), {"descriptor": family, "family_config": {},
                                        "model_dir": "."})()
@@ -446,6 +446,157 @@ class FamilyRegistryTest(unittest.TestCase):
         ws_mla = (ctx * 64 + ctx * 16 * qh + ctx * (128 + 32) +
                   2 * ctx * 16 * 128) * 4
         self.assertEqual(geometry.workspace_bytes, max(ws_kda, ws_mla))
+
+    def test_inkling_geometry_matches_engine_hybrid_allocation(self):
+        # 6 layers: default rule (i+1)%6 -> 5 sliding + 1 global (last).
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["inkling"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # 5 sliding layers: kv=2, hd=32, rows=window=8 -> 2*2*8*32*4 each
+        sliding = 5 * (2 * 2 * 8 * 32 * 4)
+        # 1 global layer: kv=4, hd=32, rows=context=32 -> 2*4*32*32*4
+        global_ = 1 * (2 * 4 * 32 * 32 * 4)
+        self.assertEqual(geometry.context_state_bytes, sliding + global_)
+        # Conv states per layer: (2*kvdim + 2*hidden) * (conv_k-1) * 4
+        kvdim_s = 2 * 32   # sliding kv*hd
+        kvdim_g = 4 * 32   # global kv*hd
+        fixed = 5 * (2 * kvdim_s + 2 * 2048) * 2 * 4
+        fixed += 1 * (2 * kvdim_g + 2 * 2048) * 2 * 4
+        self.assertEqual(geometry.fixed_state_bytes, fixed)
+        self.assertEqual(geometry.configured_experts, 8)
+
+    def test_inkling_geometry_sliding_ring_does_not_scale_past_window(self):
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 8)    # context == window
+        large = planner_geometry(resolved, 64)   # context > window
+        # Sliding ring rows are capped at window, so beyond window the
+        # sliding contribution is flat; only the 1 global layer grows.
+        delta = large.context_state_bytes - small.context_state_bytes
+        self.assertEqual(delta, 1 * (2 * 4 * (64 - 8) * 32 * 4))
+        # Fixed (conv) state is context-independent
+        self.assertEqual(small.fixed_state_bytes, large.fixed_state_bytes)
+
+    def test_inkling_geometry_local_layer_ids_override_default(self):
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+            "local_layer_ids": [0, 2],   # only layers 0 and 2 are sliding
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # 2 sliding (kv=2, rows=8) + 2 global (kv=4, rows=32)
+        expected = 2 * (2 * 2 * 8 * 32 * 4) + 2 * (2 * 4 * 32 * 32 * 4)
+        self.assertEqual(geometry.context_state_bytes, expected)
+
+    def test_inkling_geometry_audio_tower_adds_fixed_reserve(self):
+        base = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "swa_num_attention_heads": 16,
+            "swa_num_key_value_heads": 2,
+            "swa_head_dim": 32,
+            "sliding_window_size": 8,
+            "d_rel": 4,
+            "sconv_kernel_size": 3,
+            "n_routed_experts": 8,
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": base,
+                                   "model_dir": "."})()
+        no_audio = planner_geometry(resolved, 32)
+
+        with_audio_cfg = dict(base)
+        with_audio_cfg["audio_config"] = {"n_mel_bins": 80, "mel_vocab_size": 16}
+        resolved2 = type("R", (), {"descriptor": family,
+                                   "family_config": with_audio_cfg,
+                                   "model_dir": "."})()
+        audio = planner_geometry(resolved2, 32)
+        # audio_enc table [80*16, 2048] + norm [2048], fp32
+        expected_audio = (80 * 16 * 2048 + 2048) * 4
+        self.assertEqual(audio.fixed_state_bytes - no_audio.fixed_state_bytes,
+                         expected_audio)
+        self.assertEqual(audio.context_state_bytes, no_audio.context_state_bytes)
+
+    def test_inkling_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_inkling_geometry_rejects_bad_layer_types_length(self):
+        config = {
+            "model_type": "inkling",
+            "hidden_size": 2048,
+            "num_hidden_layers": 6,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 32,
+            "n_routed_experts": 8,
+            "layer_types": ["hybrid_sliding"],  # wrong length
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["inkling"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
 
     def test_cli_and_gateway_dispatch_follow_the_registry(self):
         import openai_server

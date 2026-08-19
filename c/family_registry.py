@@ -226,6 +226,104 @@ def _kimi_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+
+def _inkling_local_layers(config, layers):
+    """Which Inkling layers are sliding-window (1-based rule from inkling.c:557-568).
+
+    Precedence, mirroring the engine:
+      1. explicit ``layer_types`` array ("hybrid_sliding" marks local layers)
+      2. ``local_layer_ids`` array of 0-based layer indices
+      3. the default ``(i + 1) % 6 != 0`` rule (5 of every 6 layers sliding)
+    """
+    lt = config.get("layer_types")
+    if isinstance(lt, list):
+        if len(lt) != layers:
+            raise ValueError("inkling: layer_types length must match num_hidden_layers")
+        return [t == "hybrid_sliding" for t in lt]
+    ll = config.get("local_layer_ids")
+    if isinstance(ll, list):
+        local = [False] * layers
+        for v in ll:
+            if isinstance(v, int) and 0 <= v < layers:
+                local[v] = True
+        return local
+    return [(i + 1) % 6 != 0 for i in range(layers)]
+
+
+def _inkling_geometry(config, context, _model_dir):
+    """Inkling: hybrid GQA -- sliding-window layers (window ring) + global layers
+    + short convolutions (sconv) on K/V/attn/mlp + optional DMel audio tower.
+
+    Mirrors the engine's allocation in inkling.c:
+
+    KV cache (kv_alloc, inkling.c:1687-1699): every layer keeps its own
+    K/V pair sized from the layer's kv heads and head dim (L_KV/L_HD,
+    inkling.c:80-82). Sliding layers are a ring of ``window`` rows
+    (kv_ring_rows, inkling.c:1124-1125) -- at context > window that is a
+    ~64x cut on 5-of-6 layers; global layers keep the full context.
+
+        state[layer] = 2 * kv * rows * hd * 4,  rows = window | context
+
+    Conv states (inkling.c:888-890, 1646): four depthwise short-conv states
+    per layer -- cs[0]/cs[1] are kv-wide (kvdim), cs[2]/cs[3] are hidden-wide
+    -- each holding ``conv_k - 1`` history rows. These do not scale with
+    context, so they are fixed_state_bytes.
+
+        fixed[layer] = (2 * kvdim + 2 * hidden) * (conv_k - 1) * 4
+
+    Workspace (attention temporaries, inkling.c:1141-1147): q, k, vv, rr
+    and ctx are per-batch S buffers; with S == context at prefill the peak
+    is the maximum across layer types (global vs sliding differ).
+
+        ws = S * (2 * qdim + 2 * kvdim + H * d_rel) * 4
+
+    Audio tower (inkling.c:808-832): a DMel encoder embedding table
+    [mel_bins * mel_vocab, hidden] plus one RMSNorm weight. It is a fixed
+    resident allocation when ``audio_config`` is present, so it joins
+    fixed_state_bytes.
+    """
+    layers = _required_int(config, "num_hidden_layers", "inkling")
+    experts = _required_int(config, "n_routed_experts", "inkling")
+    hidden = _required_int(config, "hidden_size", "inkling")
+    heads = _required_int(config, "num_attention_heads", "inkling")
+    n_kv = _required_int(config, "num_key_value_heads", "inkling")
+    head_dim = _required_int(config, "head_dim", "inkling")
+    swa_heads = _optional_int(config, "swa_num_attention_heads", heads, 1)
+    swa_kv = _optional_int(config, "swa_num_key_value_heads", n_kv, 1)
+    swa_hd = _optional_int(config, "swa_head_dim", head_dim, 1)
+    window = _optional_int(config, "sliding_window_size", 512, 1)
+    d_rel = _optional_int(config, "d_rel", 16, 1)
+    conv_k = _optional_int(config, "sconv_kernel_size",
+                           _optional_int(config, "conv_kernel_size", 4, 1), 1)
+
+    local = _inkling_local_layers(config, layers)
+    if len(local) != layers:
+        raise ValueError("inkling: layer_types length must match num_hidden_layers")
+
+    state = 0
+    fixed = 0
+    workspace = 0
+    for i in range(layers):
+        kv = swa_kv if local[i] else n_kv
+        hd = swa_hd if local[i] else head_dim
+        h = swa_heads if local[i] else heads
+        rows = window if (local[i] and window > 0 and window < context) else context
+        state += 2 * kv * rows * hd * 4
+        kvdim = kv * hd
+        fixed += (2 * kvdim + 2 * hidden) * (conv_k - 1) * 4
+        qdim = h * hd
+        ws = context * (2 * qdim + 2 * kvdim + h * d_rel) * 4
+        workspace = max(workspace, ws)
+
+    ac = config.get("audio_config")
+    if isinstance(ac, dict):
+        mel_bins = _optional_int(ac, "n_mel_bins", 80, 1)
+        mel_vocab = _optional_int(ac, "mel_vocab_size", 16, 1)
+        fixed += (mel_bins * mel_vocab * hidden + hidden) * 4
+
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -305,8 +403,8 @@ FAMILIES = (
         cli_adapter="inkling",
         gateway_adapter="inkling",
         planner_id="inkling_hybrid",
-        planner_geometry=None,
-        planner_unsupported_reason="Inkling planning awaits a measured hybrid GQA/sconv runtime adapter",
+        planner_geometry=_inkling_geometry,
+        planner_unsupported_reason="",
         expert_inventory=_inkling_expert_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "CTX_MAX"),
