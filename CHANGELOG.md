@@ -75,6 +75,14 @@ we shipped twice.
   reduction, with a determinism test that reproduces the hazard.
 - **#1101** (@monotophic) — allocation and `snprintf` results checked on the
   checkpoint-load path (#798).
+- **#1100 / #1108** (@monotophic) — fmt=8/fmt=6 scale-byte accounting in
+  `tensor_bytes`/`tensor_free`, and `weights_owned` set before the host-to-device
+  copy so a failed upload frees its buffer. Each ships with its own regression
+  test; all four of this contributor's CUDA fixes landed in this release.
+- **#1122** (@ZacharyZcR) — `USAGE_SAVE=0` honoured in every engine (#1039): the
+  history was loaded but written back anyway, which quietly contaminated any A/B
+  that shared a usage file between arms.
+- **#1123** (@ZacharyZcR) — the v1.6.2 warning-cleanup patches landed (#1032).
 - **#1106** (@monotophic) — duplicate tensor names across indexed shards are now
   refused rather than silently resolved to one of them (untrusted containers).
 
