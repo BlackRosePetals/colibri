@@ -4515,13 +4515,23 @@ typedef struct {
  * only the pool. */
 enum { DUAL_EXPERT_LOADER_COUNT = COLI_V4_EXPERT_LOADER_COUNT };
 enum { DUAL_EXPERT_LOADER_MAX = 16 };
+/* Default del POOL (non della riserva CPU qui sotto: quella resta sul COMPILE
+ * default — le lane bloccano in pread e non consumano core, vedi il commento
+ * sopra). 9 misurato contro 3 su questa classe di macchina: 8 run interfogliate
+ * a box quieto sul V4-Flash reale, decode 147.3s -> 104.8s medi (1.41x, 1.46x
+ * in mediana), TTFT invariato nel rumore, zero OOM/crash su 8/8 run — coerente
+ * con la misura in-tree 48ms -> 29.6ms per lettura fredda. V4_LOADER_LANES
+ * resta la manopola per dischi che si comportano diversamente.
+ * EN: pool default only; the CPU reservation keeps subtracting the compile
+ * constant. 9 vs 3 measured on the real checkpoint: 1.41x decode, no OOM. */
+enum { DUAL_EXPERT_LOADER_DEFAULT_LANES = 9 };
 
 static int dual_loader_lanes(void) {
     static int lanes;
     if (!lanes) {
         const char *value = getenv("V4_LOADER_LANES");
-        int n = value ? atoi(value) : DUAL_EXPERT_LOADER_COUNT;
-        if (n < 1) n = DUAL_EXPERT_LOADER_COUNT;
+        int n = value ? atoi(value) : DUAL_EXPERT_LOADER_DEFAULT_LANES;
+        if (n < 1) n = DUAL_EXPERT_LOADER_DEFAULT_LANES;
         if (n > DUAL_EXPERT_LOADER_MAX) n = DUAL_EXPERT_LOADER_MAX;
         lanes = n;
     }
