@@ -214,7 +214,7 @@ class BannerModelLineTest(unittest.TestCase):
 
     def test_each_engine_names_itself(self):
         for model_type, expected in (
-            ("glm5_moe", "GLM-5.2"),
+            ("glm_moe_dsa", "GLM-5.2"),
             ("inkling", "Inkling"),
             ("kimi_k3", "Kimi K3"),
             ("deepseek_v4", "DeepSeek V4 Flash"),
@@ -253,7 +253,7 @@ class BannerModelLineTest(unittest.TestCase):
     def test_size_is_reported_without_rounding_to_zero(self):
         small = self.line({"model_type": "olmoe"}, shard_bytes=4_200_000_000)
         self.assertIn("4.2 GB on disk", small)
-        large = self.line({"model_type": "glm5_moe"}, shard_bytes=372_000_000_000)
+        large = self.line({"model_type": "glm_moe_dsa"}, shard_bytes=372_000_000_000)
         self.assertIn("372 GB on disk", large)
         tiny = self.line({"model_type": "olmoe"}, shard_bytes=3_000_000)
         self.assertIn("MB on disk", tiny)

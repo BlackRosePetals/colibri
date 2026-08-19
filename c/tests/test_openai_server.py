@@ -334,6 +334,21 @@ class SchedulerTest(unittest.TestCase):
         self.assertEqual(stats["timed_out"], 1)
         self.assertEqual(stats["cancelled"], 1)
 
+    def test_counts_admitted_client_cancellation_without_completion(self):
+        scheduler = GenerationScheduler(max_queue=0, queue_timeout=1)
+        with self.assertRaises(ClientCancelled):
+            with scheduler.admit():
+                raise ClientCancelled()
+        stats = scheduler.snapshot()
+        self.assertEqual(stats["active"], 0)
+        self.assertEqual(stats["admitted"], 1)
+        self.assertEqual(stats["completed"], 0)
+        self.assertEqual(stats["cancelled"], 1)
+
+        with scheduler.admit():
+            pass
+        self.assertEqual(scheduler.snapshot()["completed"], 1)
+
     def test_admits_waiters_in_fifo_order(self):
         scheduler = GenerationScheduler(max_queue=2, queue_timeout=1)
         entered = threading.Event()
@@ -457,6 +472,63 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_kimi_request_and_response_transcript_is_byte_exact(self):
+        prompt = render_chat_kimi([
+            {"role": "system", "content": "Be precise."},
+            {"role": "user", "content": "你好\nKimi"},
+            {"role": "assistant", "reasoning_content": "because",
+             "content": "你好。"},
+            {"role": "user", "content": "Continue"},
+        ], enable_thinking=True)
+        payload = prompt.encode("utf-8")
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9\n".encode() +
+                    payload + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"ACCEPT 1 42\n"
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 42 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "kimi"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("kimi_k3", "model")
+        chunks = []
+        stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 42)
+
+    def test_olmoe_request_and_response_transcript_is_byte_exact(self):
+        expected = b"SUBMIT 1 0 5 3 0.25 0.9\nH\xc3\xa9\nx\n"
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 5 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "olmoe"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("olmoe", "model")
+        chunks = []
+        stats = engine.generate("Hé\nx", 3, 0.25, 0.9, chunks.append)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 5)
+        self.assertFalse(stats["length_limited"])
+
     def test_dispatches_interleaved_requests_by_id(self):
         submitted = []
 
@@ -733,14 +805,14 @@ class CapSentinelShimTest(unittest.TestCase):
                     [executable, want],
                     f"arch={model_type} exe={executable} kwargs={kwargs}")
 
-    def test_missing_or_unreadable_config_is_glm(self):
-        # historic default: anything that cannot be classified is glm
+    def test_synthetic_engine_without_config_uses_explicit_arch(self):
         self.assertEqual(self._spawn_argv("engine", "/nonexistent/model"),
                          ["engine", "0"])
         model = Path(self.tmp.name) / "model-broken"
         model.mkdir()
         (model / "config.json").write_text("{not json")
-        self.assertEqual(self._spawn_argv("engine", str(model)), ["engine", "0"])
+        with self.assertRaisesRegex(ValueError, "invalid config.json"):
+            self._spawn_argv("engine", str(model))
 
     def test_cap_for_arch_is_the_single_translation_point(self):
         self.assertEqual(cap_for_arch("glm", None), 0)
@@ -758,7 +830,8 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(model_arch(self._model("kimi_k3")), "kimi")
         self.assertEqual(model_arch(self._model("deepseek_v4")), "deepseek_v4")
         self.assertEqual(model_arch(self._model("olmoe")), "olmoe")
-        self.assertEqual(model_arch("/nonexistent"), "glm")
+        with self.assertRaisesRegex(ValueError, "cannot read config.json"):
+            model_arch("/nonexistent")
 
     def test_direct_v4_server_gets_bounded_dspark_defaults(self):
         env = {"V4_MTP_CONF": "0.7"}
@@ -773,6 +846,7 @@ class CapSentinelShimTest(unittest.TestCase):
         self.assertEqual(env["V4_MTP_DRAFT"], "3")
         self.assertEqual(env["V4_MTP_GB"], "0.45")
         self.assertEqual(env["V4_MTP_CONF"], "0.7")  # explicit override wins
+        self.assertEqual(env["V4_MTP_GPU"], "0")     # GPU drafting opt-in, off by default
 
     def test_direct_v4_server_preserves_explicit_omp_threads(self):
         env = {"OMP_NUM_THREADS": "3"}
