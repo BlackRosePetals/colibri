@@ -328,7 +328,20 @@ static int rt_save(const char *path, int quiet){
         for(int e = 0; e < rt_ne; e++) if(rt_c[i][e]){ tot += rt_c[i][e]; nz++; }
     }
     char tmp[2100];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    /* Truncation here is not cosmetic: fopen/rename below would then write and land on a
+     * DIFFERENT path than the caller asked for, silently, with no indication the intended
+     * history was never touched. Refuse instead of truncating. A NEGATIVE return
+     * (encoding error) is the same hazard in a worse coat: C leaves tmp indeterminate,
+     * so proceeding would fopen whatever bytes happen to be there. Same refusal path. */
+    int tl = snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    if (tl < 0 || tl >= (int)sizeof(tmp)) {
+        if (!quiet) {
+            if (tl < 0) fprintf(stderr, "[STATS] snprintf error building temp path, not saved: %s\n", path);
+            else        fprintf(stderr, "[STATS] path too long (>%d bytes), not saved: %s\n",
+                                (int)sizeof(tmp) - 5, path);
+        }
+        return 0;
+    }
     FILE *f = fopen(tmp, "w");
     if(!f){ if(!quiet) perror(tmp); return 0; }
     /* An all-zero history stays a ZERO-BYTE file, the way it was before this header
