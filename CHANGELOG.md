@@ -99,8 +99,12 @@ we shipped twice.
   completing the codec migration across OLMoE, Kimi K3 and V4.
 - **#1063 / #1068** (@terrizoaguimor) — model families are registry-owned:
   `coli`, the gateway, `doctor` and the planner read one descriptor table.
-- **#1087 / #1090** (@terrizoaguimor) — shared serve framing codec, adopted by
-  OLMoE and Kimi K3, each behind a byte-exact wire-transcript freeze.
+- **#1087 / #1090 / #1096 / #1116** (@terrizoaguimor) — a shared serve framing
+  codec, now adopted by **every engine**: OLMoE, Kimi K3, DeepSeek V4 and
+  Inkling (whose audio payload rides as an opaque extension). Each migration
+  landed behind a byte-exact wire-transcript freeze, so the gateway contract is
+  provably unchanged. Byte framing had been duplicated five times, which is how
+  Windows binary mode silently disappeared from sibling engines (#748).
 - **#1036** (@lineape) — distributed expert workers (LAN, opt-in via
   `CLUSTER_WORKERS`).
 - Planner: DeepSeek V4 expert naming now recognized, so `coli plan` and
