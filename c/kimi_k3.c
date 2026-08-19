@@ -2712,9 +2712,8 @@ int main(int argc, char **argv){
      * rates this engine runs at). */
     printf("TUNE decode: %d tokens in %.3fs\n", ntok, dt);
     if(m.trace) fclose(m.trace);
-    { const char *sv=getenv("USAGE_SAVE");
-      if(!(sv && atoi(sv)==0) && g_k3_usage[0])
-          rt_save(g_k3_usage,0); }                   /* same bytes as every other engine */
+    if(g_k3_usage[0])                                /* USAGE_SAVE=0 honoured inside rt_save (#1039) */
+        rt_save(g_k3_usage,0);                       /* same bytes as every other engine */
     if(g_k3_val_fp){ fflush(g_k3_val_fp); fclose(g_k3_val_fp); g_k3_val_fp=NULL; }
     if(g_k3_val_lfp){ fflush(g_k3_val_lfp); fclose(g_k3_val_lfp); g_k3_val_lfp=NULL; }
 #ifdef COLI_METAL

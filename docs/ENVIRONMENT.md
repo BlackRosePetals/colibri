@@ -361,6 +361,8 @@ documented with defaults in
 the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
 `COLI_CUDA_ATTN_BATCH=1`, `COLI_CUDA_MOE_BATCH=1`, `DSV4_CUDA_EXPERT_MIRRORS`,
 `V4_MOE_REFILL_GROUP`, `V4_PREFILL_SEGMENT`, `V4_PREFIX_CKPT*`, `CTX`.
+`COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
+usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
 
 ## OLMoE engine (`olmoe`)
 
