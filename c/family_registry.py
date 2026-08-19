@@ -149,6 +149,25 @@ def _qwen36_geometry(config, context, _model_dir):
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
 
 
+def _olmoe_geometry(config, context, _model_dir):
+    """Conventional full multi-head attention: every layer holds a K and a V
+    cache in fp32, and olmoe.c sizes both at num_attention_heads * head_dim, not
+    num_key_value_heads (`c/olmoe.c:1019-1020`, with head_dim = hidden_size //
+    num_attention_heads at `:327`). There is no recurrent or convolutional state,
+    and the KV cache is the only buffer that grows with context, so fixed and
+    workspace are zero -- the bounded per-forward scratch (attention scores,
+    logits, expert temporaries) is already covered by the base runtime reserve."""
+    layers = _required_int(config, "num_hidden_layers", "olmoe")
+    hidden = _required_int(config, "hidden_size", "olmoe")
+    heads = _required_int(config, "num_attention_heads", "olmoe")
+    head_dim = hidden // heads
+    if head_dim < 1:
+        raise ValueError("olmoe: hidden_size is smaller than num_attention_heads")
+    experts = _required_int(config, "num_experts", "olmoe")
+    state = layers * context * heads * head_dim * 2 * 4
+    return PlannerGeometry(state, 0, 0, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -276,8 +295,8 @@ FAMILIES = (
         cli_adapter="olmoe",
         gateway_adapter="olmoe",
         planner_id="olmoe_gqa",
-        planner_geometry=None,
-        planner_unsupported_reason="OLMoE planning awaits a measured runtime/workspace reserve",
+        planner_geometry=_olmoe_geometry,
+        planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM_EXPERT),
         config_section="root",
         limits=FamilyLimits(4096, 4096, 1024, 1024, 1, 8, "CTX"),

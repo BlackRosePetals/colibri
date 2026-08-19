@@ -34,9 +34,12 @@ typedef enum {
 typedef struct {
     size_t max_header_bytes;
     uint64_t max_payload_bytes;
+    uint64_t max_extension_bytes;
     int max_tokens;
     int require_exact_lf;
     int require_finite_sampling;
+    int allow_extension_bytes;
+    int allow_prefix_hint;
 } ColiServeWireProfile;
 
 typedef struct {
@@ -47,6 +50,8 @@ typedef struct {
     int max_tokens;
     float temperature;
     float top_p;
+    uint64_t extension_bytes;
+    int prefix_bytes;
     unsigned char *payload;
 } ColiServeCommand;
 
@@ -77,6 +82,12 @@ static inline unsigned char *coli_serve_command_take_payload(ColiServeCommand *c
     unsigned char *payload = command ? command->payload : NULL;
     if (command) command->payload = NULL;
     return payload;
+}
+
+static inline unsigned char *coli_serve_command_extension(ColiServeCommand *command)
+{
+    if (!command || !command->payload || !command->extension_bytes) return NULL;
+    return command->payload + (size_t)command->payload_bytes + 1;
 }
 
 static inline int coli_serve_parse_i32(const char *text, int *value)
@@ -141,7 +152,7 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
 {
     char *line;
     size_t count = 0;
-    char *fields[8];
+    char *fields[10];
     int nfields = 0;
 
     if (!input || !profile || !command) return COLI_SERVE_READ_BAD_FRAME;
@@ -204,16 +215,28 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
         free(line);
         return COLI_SERVE_READ_OK;
     }
-    if (nfields != 7) {
+    int minimum_fields = 7;
+    int maximum_fields = minimum_fields + !!profile->allow_extension_bytes +
+                         !!profile->allow_prefix_hint;
+    if (nfields < minimum_fields || nfields > maximum_fields ||
+        (nfields >= 8 && !profile->allow_extension_bytes) ||
+        (nfields >= 9 && (!profile->allow_prefix_hint ||
+                          !profile->allow_extension_bytes))) {
         free(line);
         return COLI_SERVE_READ_BAD_REQUEST;
     }
+    command->extension_bytes = 0;
+    command->prefix_bytes = 0;
     if (!coli_serve_parse_i32(fields[2], &command->slot) ||
         !coli_serve_parse_u64(fields[3], &command->payload_bytes) ||
         !coli_serve_parse_i32(fields[4], &command->max_tokens) ||
         !coli_serve_parse_f32(fields[5], &command->temperature) ||
         !coli_serve_parse_f32(fields[6], &command->top_p) ||
+        (nfields >= 8 &&
+         !coli_serve_parse_u64(fields[7], &command->extension_bytes)) ||
+        (nfields >= 9 && !coli_serve_parse_i32(fields[8], &command->prefix_bytes)) ||
         command->payload_bytes > profile->max_payload_bytes ||
+        command->extension_bytes > profile->max_extension_bytes ||
         command->max_tokens < 1 ||
         (profile->max_tokens && command->max_tokens > profile->max_tokens) ||
         (profile->require_finite_sampling &&
@@ -223,11 +246,17 @@ static inline ColiServeReadResult coli_serve_read_command_alloc(
     }
     free(line);
 
-    if (command->payload_bytes > SIZE_MAX - 1) return COLI_SERVE_READ_NOMEM;
+    if (command->payload_bytes > SIZE_MAX - 1 ||
+        command->extension_bytes > SIZE_MAX - 1 - (size_t)command->payload_bytes)
+        return COLI_SERVE_READ_NOMEM;
     size_t payload_bytes = (size_t)command->payload_bytes;
-    command->payload = allocate(payload_bytes + 1);
+    size_t extension_bytes = (size_t)command->extension_bytes;
+    command->payload = allocate(payload_bytes + 1 + extension_bytes);
     if (!command->payload) return COLI_SERVE_READ_NOMEM;
-    if (fread(command->payload, 1, payload_bytes, input) != payload_bytes) {
+    if (fread(command->payload, 1, payload_bytes, input) != payload_bytes ||
+        (extension_bytes &&
+         fread(command->payload + payload_bytes + 1, 1, extension_bytes, input) !=
+             extension_bytes)) {
         coli_serve_command_dispose(command);
         return COLI_SERVE_READ_BAD_FRAME;
     }
@@ -289,6 +318,20 @@ static inline int coli_serve_write_done(
                 done->length_limited) < 0)
         return 0;
     return fflush(output) == 0;
+}
+
+static inline int coli_serve_write_done_i32_suffix(
+    FILE *output, const char *id, const ColiServeDone *done,
+    const int *suffix, size_t suffix_count)
+{
+    if (fprintf(output, "DONE %s STAT %d %.3f %.1f %.2f %d %d", id,
+                done->completion_tokens, done->tokens_per_second,
+                done->cache_hit_percent, done->rss_gb, done->prompt_tokens,
+                done->length_limited) < 0)
+        return 0;
+    for (size_t i = 0; i < suffix_count; i++)
+        if (fprintf(output, " %d", suffix[i]) < 0) return 0;
+    return fputc('\n', output) != EOF && fflush(output) == 0;
 }
 
 static inline int coli_serve_format_done(
