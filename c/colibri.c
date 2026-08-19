@@ -390,9 +390,23 @@ static void eslot_release(ESlot *s){
 static int eslot_busy(const ESlot *s){ return __atomic_load_n(&s->in_flight,__ATOMIC_ACQUIRE)!=0; }
 static void eslots_acquire(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_acquire(slots[i]); }
 static void eslots_release(ESlot **slots,int n){ for(int i=0;i<n;i++) eslot_release(slots[i]); }
-static int eslot_lru_victim(ESlot *slots,int n){
-    int lru=-1;
-    for(int i=0;i<n;i++) if(!eslot_busy(&slots[i])&&(lru<0||slots[i].used<slots[lru].used)) lru=i;
+/* Victim per una riga piena (#1034): uno slot svuotato da rss_guard (eid=-1,
+ * slab=NULL) e' riusabile SOLO finche' gli slab vivi della riga stanno sotto
+ * ecap — riusarlo rialloca uno slab, quindi e' crescita, non eviction. Le
+ * prenotazioni in volo (eid<-1) contano come vive: stanno per possederne uno.
+ * EN: reusing a slab-less slot re-allocates, so it only counts as eviction
+ * EN: while the row's live-slab count is under ecap; else pick a slab owner. */
+static int eslot_lru_victim(ESlot *slots,int n,int ecap){
+    int lru=-1, empty=-1, live=0;
+    for(int i=0;i<n;i++){
+        ESlot *s=&slots[i];
+        if(s->slab || s->eid<-1) live++;
+        if(eslot_busy(s) || s->eid<-1) continue;
+        if(!s->slab){ if(s->eid==-1 && empty<0) empty=i; continue; }
+        if(s->eid==-1) return i;              /* slot libero che possiede ancora lo slab */
+        if(lru<0 || s->used<slots[lru].used) lru=i;
+    }
+    if(empty>=0 && live<ecap) return empty;   /* sotto il tetto: meglio il vuoto che sfrattare */
     return lru;
 }
 
@@ -5555,9 +5569,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
-              else { int lru=eslot_lru_victim(Sl,*nn);
+              else { int lru=eslot_lru_victim(Sl,*nn,m->ecap);
                      if(lru<0){ static int warned;
-                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] all LRU expert slots are in flight; skipping cache promotion\n"); }
+                         if(!warned){ warned=1; fprintf(stderr,"[CUDA] no reusable LRU expert slot (in flight or cap reached); skipping cache promotion\n"); }
                          continue; }
                      dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=(uint64_t)__atomic_add_fetch(&m->eclock,1,__ATOMIC_RELAXED); }
@@ -5749,15 +5763,9 @@ static void pilot_realload(Model *m, int layer, int eid){
     int slot,isnew=0;
     if(nn<m->ecap){ slot=nn; isnew=1; m->ecn[layer]=nn+1; }   /* cresci: pubblica subito lo slot (marcato prenotato) */
     else {
-        slot=-1;
-        for(int z=0;z<nn;z++){
-            if(eslot_busy(&Sl[z])) continue;             /* borrowed by an async GPU read */
-            if(Sl[z].eid==-1){ slot=z; break; }         /* riusa uno slot libero/fallito */
-            if(Sl[z].eid< -1) continue;                 /* prenotazione di un ALTRO worker: mai vittima */
-            if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-        }
+        slot=eslot_lru_victim(Sl,nn,m->ecap);           /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed);
-                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti gli slot sono in volo */
+                    pthread_mutex_unlock(&g_pilot_mx); return; }   /* tutti in volo, o cap raggiunto */
         /* LFRU eviction guard (#441, narrowed by #497 — folded into the SPMC selection):
          * protect the victim only when genuinely WARM (>=2 demand accesses) AND clearly
          * hotter than the speculation by tier_pick_lfru's 25%+4-freq hysteresis; the
@@ -5828,15 +5836,7 @@ static void pilot_uring_batch(Model *m){
         if(found){ pthread_mutex_unlock(&g_pilot_mx); continue; }
         int slot;
         if(nn<m->ecap){ slot=nn; m->ecn[layer]=nn+1; }
-        else{
-            slot=-1;
-            for(int z=0;z<nn;z++){
-                if(eslot_busy(&Sl[z])) continue;      /* borrowed by an async GPU read */
-                if(Sl[z].eid==-1){ slot=z; break; }
-                if(Sl[z].eid< -1) continue;          /* URING reservation in flight */
-                if(slot<0 || Sl[z].used<Sl[slot].used) slot=z;
-            }
-        }
+        else slot=eslot_lru_victim(Sl,nn,m->ecap);    /* riusa libero-con-slab, poi LRU; slot svuotati solo sotto ecap (#1034) */
         if(slot<0){ atomic_fetch_add_explicit(&g_pilot_drops,1,memory_order_relaxed); pthread_mutex_unlock(&g_pilot_mx); continue; }
         /* LFRU eviction guard (#441, narrowed by #497): protect only a genuinely WARM
          * resident (>=2 accesses) that is clearly hotter (see pilot_realload) */
