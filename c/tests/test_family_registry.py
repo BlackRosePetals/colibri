@@ -177,8 +177,36 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.configured_experts, 4)
         self.assertEqual(geometry.context_state_bytes, 13_312)
 
+    def test_olmoe_fixture_models_conventional_fp32_kv_cache(self):
+        # OLMoE keeps a full K and V cache per layer, sized at num_attention_heads
+        # * head_dim in fp32 (olmoe.c:1019-1020), no recurrent/fixed state, and no
+        # model-specific workspace beyond the base runtime reserve.
+        config = {
+            "model_type": "olmoe",
+            "num_hidden_layers": 4,
+            "hidden_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 16,
+            "vocab_size": 100,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type["olmoe"]
+        self.assertEqual(family, by_id["olmoe"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.configured_experts, 8)
+        # layers=4, context=32, heads=4, head_dim=32//4=8, K and V, fp32:
+        # 4 * 32 * 4 * 8 * 2 * 4 = 32768
+        self.assertEqual(geometry.context_state_bytes, 4 * 32 * 4 * 8 * 2 * 4)
+        self.assertEqual(geometry.fixed_state_bytes, 0)
+        self.assertEqual(geometry.workspace_bytes, 0)
+
     def test_unproven_production_planners_refuse_instead_of_inventing_zero(self):
-        for model_type in ("inkling", "kimi_k3", "olmoe", "deepseek_v4"):
+        for model_type in ("inkling", "kimi_k3", "deepseek_v4"):
             family = family_for_config({"model_type": model_type})
             resolved = type("R", (), {"descriptor": family, "family_config": {},
                                        "model_dir": "."})()
