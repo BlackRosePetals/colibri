@@ -2287,17 +2287,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
-        int ng = tensor->ng > 0 ? tensor->ng : 1;
-        /* Must mirror the upload's accounting exactly: fmt=6 never charged for a
-         * scale buffer, and over-subtracting here trips the >= guard below, which
-         * silently leaves the tensor's bytes on the device counter forever. */
+        /* Must mirror the upload's accounting exactly -- literally the same
+         * expression upload uses to charge (scale_count * sizeof(float), gated
+         * on fmt=6 never having a separate scale buffer), so the two can no
+         * longer drift independently. Over-subtracting here trips the >= guard
+         * below, which silently leaves the tensor's bytes on the device counter
+         * forever. */
         size_t storage_bytes =
 #ifdef COLI_ANS
             tensor->compressed ? tensor->archive_bytes :
 #endif
             tensor->weight_bytes;
         size_t bytes = storage_bytes +
-            ((tensor->fmt && tensor->fmt != 6) ? (size_t)tensor->O * ng * sizeof(float) : 0);
+            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -2309,13 +2311,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
+    /* Must mirror upload's and free's accounting exactly -- literally the same
+     * expression they use (scale_count * sizeof(float), gated on fmt=6 never
+     * having a separate scale buffer) -- so all three can no longer drift
+     * independently. The prior `O * ng` shape over-reported for fmt=8 (real
+     * footprint is (O+127)/128 * ng block scales, not O * ng) and for fmt=6
+     * (which has no separate scale buffer at all). */
     size_t storage_bytes =
 #ifdef COLI_ANS
         tensor->compressed ? tensor->archive_bytes :
 #endif
         tensor->weight_bytes;
-    return storage_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+    return storage_bytes +
+        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {
