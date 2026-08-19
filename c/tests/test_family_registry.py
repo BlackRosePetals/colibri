@@ -205,14 +205,73 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.fixed_state_bytes, 0)
         self.assertEqual(geometry.workspace_bytes, 0)
 
-    def test_unproven_production_planners_refuse_instead_of_inventing_zero(self):
-        for model_type in ():
+    def test_production_planners_report_real_geometry(self):
+        # #1066 is closed: every production planner now returns a real
+        # PlannerGeometry instead of refusing with PlannerUnsupportedError.
+        # The plan must never be a silently-invented zero-byte budget --
+        # every family here has a resident KV/state cache, so at least one
+        # of context_state_bytes or fixed_state_bytes must be non-zero.
+        cases = {
+            "olmoe": {
+                "model_type": "olmoe",
+                "hidden_size": 2048,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 16,
+                "num_experts": 8,
+            },
+            "kimi_k3": {
+                "model_type": "kimi_k3",
+                "hidden_size": 2048,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 16,
+                "q_lora_rank": 64,
+                "kv_lora_rank": 128,
+                "qk_nope_head_dim": 64,
+                "qk_rope_head_dim": 32,
+                "v_head_dim": 128,
+                "num_experts": 32,
+                "linear_attn_config": {
+                    "num_heads": 8,
+                    "head_dim": 64,
+                    "kda_layers": [1, 2, 3, 4, 5],
+                },
+            },
+            "inkling": {
+                "model_type": "inkling",
+                "hidden_size": 2048,
+                "num_hidden_layers": 6,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 32,
+                "n_routed_experts": 8,
+            },
+            "deepseek_v4": {
+                "model_type": "deepseek_v4",
+                "hidden_size": 2048,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 16,
+                "head_dim": 32,
+                "q_lora_rank": 16,
+                "o_groups": 4,
+                "o_lora_rank": 64,
+                "sliding_window": 8,
+                "index_head_dim": 24,
+                "n_routed_experts": 32,
+                "compress_ratios": [0, 2, 4, 4],
+            },
+        }
+        for model_type, config in cases.items():
             family = family_for_config({"model_type": model_type})
-            resolved = type("R", (), {"descriptor": family, "family_config": {},
-                                       "model_dir": "."})()
-            with self.subTest(model_type=model_type), \
-                 self.assertRaises(PlannerUnsupportedError):
-                planner_geometry(resolved, 32)
+            resolved = type("R", (), {"descriptor": family,
+                                      "family_config": config,
+                                      "model_dir": "."})()
+            with self.subTest(model_type=model_type):
+                geometry = planner_geometry(resolved, 32)
+                self.assertIsInstance(geometry, PlannerGeometry)
+                self.assertGreater(
+                    geometry.context_state_bytes + geometry.fixed_state_bytes,
+                    0)
 
 
     def test_olmoe_geometry_matches_engine_kv_allocation(self):
