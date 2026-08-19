@@ -92,7 +92,9 @@ we shipped twice.
 ### Interfaces
 - **#829** (@aaristov) — GPU-vs-fallback counters and chat status made visible in
   `coli serve`: the tier's behaviour is now observable instead of inferred.
-- **#1095** (@benmaster82) — OLMoE planner geometry adapter (#1066).
+- **#1095** (@benmaster82) — OLMoE planner geometry adapter, and **#1103**
+  (@SebaWag) — Kimi K3, Inkling and DeepSeek V4 adapters with 23 tests: every
+  family now has real planner geometry, so `coli plan` stops guessing (#1066).
 - **#1096** (@terrizoaguimor) — DeepSeek V4 serve framing on the shared codec,
   completing the codec migration across OLMoE, Kimi K3 and V4.
 - **#1063 / #1068** (@terrizoaguimor) — model families are registry-owned:
