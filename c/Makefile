@@ -141,10 +141,25 @@ ifeq ($(shell $(CC) -mcpu=native -dM -E - </dev/null 2>/dev/null | grep -c __ARM
 CPUFEAT  := $(shell grep -m1 '^Features' /proc/cpuinfo 2>/dev/null)
 ARCH_EXT := $(if $(filter asimddp,$(CPUFEAT)),+dotprod)$(if $(filter i8mm,$(CPUFEAT)),+i8mm)
 ifneq ($(ARCH_EXT),)
-ifneq ($(shell $(CC) -march=armv8-a$(ARCH_EXT) -dM -E - </dev/null 2>/dev/null | grep -cE '__ARM_FEATURE_DOTPROD|__ARM_FEATURE_MATMUL_INT8'),0)
+# gcc 11 defines __ARM_FEATURE_DOTPROD for -march=armv8-a+dotprod yet cannot
+# emit vdotq_s32 for that base ("target specific option mismatch"): the macro
+# probe alone is not enough. Verify by compiling the intrinsic for real, and
+# prefer the armv8.2-a base where dotprod is a first-class ISA feature
+# (Neoverse-N1 and friends report asimddp but are armv8.2 cores). Fall back to
+# armv8-a only if the compiler accepts the modifiers there too; otherwise the
+# idot kernels compile out and int4 S=1 decode falls back to f32 (#631, #1104).
+PROBE_C := $(shell mktemp /tmp/coli_v4_probe.XXXXXX.c)
+PROBE_OK := $(shell echo '#include <arm_neon.h>' > $(PROBE_C); echo 'int p(const signed char*w,const signed char*x,int n){int32x4_t a=vdupq_n_s32(0);for(;n>=16;n-=16)a=vdotq_s32(a,vld1q_s8(w),vld1q_s8(x));return vaddvq_s32(a);}' >> $(PROBE_C); $(CC) -c $(PROBE_C) -o /dev/null -march=armv8.2-a$(ARCH_EXT) 2>/dev/null && echo yes; rm -f $(PROBE_C))
+ifeq ($(PROBE_OK),yes)
+ARCHFLAG := -march=armv8.2-a$(ARCH_EXT)
+else
+PROBE_C8 := $(shell mktemp /tmp/coli_v4_probe.XXXXXX.c)
+PROBE_OK8 := $(shell echo '#include <arm_neon.h>' > $(PROBE_C8); echo 'int p(const signed char*w,const signed char*x,int n){int32x4_t a=vdupq_n_s32(0);for(;n>=16;n-=16)a=vdotq_s32(a,vld1q_s8(w),vld1q_s8(x));return vaddvq_s32(a);}' >> $(PROBE_C8); $(CC) -c $(PROBE_C8) -o /dev/null -march=armv8-a$(ARCH_EXT) 2>/dev/null && echo yes; rm -f $(PROBE_C8))
+ifeq ($(PROBE_OK8),yes)
 ARCHFLAG := -march=armv8-a$(ARCH_EXT)
 else
 $(warning $(CC) does not accept$(subst +, +,$(ARCH_EXT)): int8/int4 idot kernels compile out (#631))
+endif
 endif
 endif
 endif
