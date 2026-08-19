@@ -34,16 +34,30 @@
  *   1. IN-PROCESS control: every supported fmt (0,1,2,3,4) is launched in the
  *      parent and must complete cleanly. If weight_at trapped on those, the
  *      trap would be firing on valid input and this test would fail here.
- *   2. CHILD-HARNESS control: two SUPPORTED formats also go through the child
- *      path and must come back A6_EXIT_DECODED. This is what distinguishes a
- *      working harness from one that reports "aborted" unconditionally.
- *   3. THE PROBES: every unsupported fmt must come back A6_EXIT_TRAPPED. With
- *      the __trap() removed and the int2 fall-through restored, the kernel
- *      returns a number instead, the child exits A6_EXIT_DECODED, and this test
- *      fails -- which is the whole point of it.
+ *   2. CHILD-HARNESS control: the probe list always contains SUPPORTED formats
+ *      (0 and 3), whose predicate-derived expectation is A6_EXIT_DECODED. This
+ *      is what distinguishes a working harness from one that reports "aborted"
+ *      unconditionally.
+ *   3. THE PROBES: every probed fmt's expectation is DERIVED from the host
+ *      predicate -- coli_cuda_weight_at_supported(fmt) ? decoded : trapped --
+ *      so what this test pins is the INVARIANT that weight_at's device dispatch
+ *      agrees with the predicate the launch-site gates consult, with no silent
+ *      fall-through in either direction. With the __trap() removed and the int2
+ *      fall-through restored, a predicate-false fmt decodes and the test fails;
+ *      with a decode branch missing for a predicate-true fmt, that fmt traps
+ *      and the test fails too -- which is the whole point of it.
  *
- * The fmt set probed is the complement of coli_cuda_weight_at_supported over the
- * formats a container can actually carry (5,6,7,8), plus the out-of-range values
+ * WHY PREDICATE-DRIVEN AND NOT A FROZEN LIST. The expectations were originally
+ * hardcoded ("fmt=8 must trap"), which pins a MOMENT, not the invariant: the
+ * fmt=8 absorb-decode work (f8/absorb-fmt8) adds a weight_at fmt=8 branch and
+ * flips the predicate's truth table in the same commit, and a frozen "8 traps"
+ * expectation would fail on that merged tree even though nothing is wrong.
+ * Deriving each expectation from the predicate makes the test hold across that
+ * landing in either order: whatever the predicate promises, the silicon must
+ * deliver, and whatever it refuses, the silicon must refuse.
+ *
+ * The fmt set probed covers both sides of today's truth table (0,3 supported;
+ * 5,6,7,8 unsupported container-carriable formats) plus the out-of-range values
  * a corrupt descriptor could present (-1, 9, 1<<30) -- the ones the previous
  * `fmt <= 4` host gate admitted.
  *
@@ -185,12 +199,15 @@ static void expect_child(const char *self, int fmt, int want, const char *why) {
         return;
     }
     if (got == A6_EXIT_DECODED && want == A6_EXIT_TRAPPED) {
-        printf("FAIL fmt=%-6d weight_at DECODED an unsupported format instead of "
-               "refusing it -- the device-side __trap() is not firing\n", fmt);
+        printf("FAIL fmt=%-6d weight_at DECODED a format the host predicate "
+               "refuses -- the device-side __trap() is not firing (dispatch "
+               "disagrees with coli_cuda_weight_at_supported)\n", fmt);
     } else if (got == A6_EXIT_TRAPPED && want == A6_EXIT_DECODED) {
-        printf("FAIL fmt=%-6d the probe harness reports 'aborted' for a SUPPORTED "
-               "format -- the harness cannot tell the two verdicts apart, so its "
-               "unsupported-format results mean nothing\n", fmt);
+        printf("FAIL fmt=%-6d the launch aborted for a format the host predicate "
+               "SUPPORTS -- either weight_at is missing the decode branch the "
+               "predicate promises (dispatch lags the predicate), or the harness "
+               "cannot tell the two verdicts apart, in which case its "
+               "trap-expected results mean nothing\n", fmt);
     } else if (got < 0 && got != -1000 && want == A6_EXIT_TRAPPED) {
         /* A trap that takes the whole process down rather than surfacing as a
          * CUDA error is still a refusal, but say so rather than folding it into
@@ -262,19 +279,36 @@ int main(int argc, char **argv) {
     printf("-- control: supported formats decode (in-process)\n");
     inprocess_supported_control();
 
-    printf("-- control: the child harness can report a successful decode\n");
-    expect_child(argv[0], 0, A6_EXIT_DECODED, "supported, decoded in a child");
-    expect_child(argv[0], 3, A6_EXIT_DECODED, "supported, decoded in a child");
-
-    printf("-- the guard: unsupported formats must refuse, not fabricate\n");
-    expect_child(argv[0], 5, A6_EXIT_TRAPPED, "int3-g64 refused");
-    expect_child(argv[0], 6, A6_EXIT_TRAPPED, "E8/IQ3 refused");
-    expect_child(argv[0], 7, A6_EXIT_TRAPPED, "MXFP4 refused");
-    expect_child(argv[0], 8, A6_EXIT_TRAPPED, "fp8-e4m3-b128 refused");
-    expect_child(argv[0], 9, A6_EXIT_TRAPPED, "past the last defined fmt, refused");
-    expect_child(argv[0], -1, A6_EXIT_TRAPPED, "negative fmt refused (the old "
-                                               "`fmt <= 4` gate admitted this)");
-    expect_child(argv[0], 1 << 30, A6_EXIT_TRAPPED, "garbage fmt refused");
+    /* THE GUARD, predicate-driven (see the header comment): each probed fmt's
+     * expectation is derived from coli_cuda_weight_at_supported at RUN time, so
+     * this test asserts that weight_at's dispatch agrees with the predicate --
+     * no silent fall-through, no missing promised branch -- rather than pinning
+     * a frozen fmt list that goes stale the moment a format (e.g. fmt=8 via
+     * f8/absorb-fmt8) gains a device decode and flips the predicate. fmts 0 and
+     * 3 are predicate-true today and double as the child-harness control; the
+     * negative/out-of-range values stay probed no matter what the predicate
+     * grows to support. */
+    printf("-- the guard: dispatch must agree with the host predicate, per fmt\n");
+    static const struct { int fmt; const char *what; } probes[] = {
+        {0,       "f32 (child-harness control)"},
+        {3,       "int2 (child-harness control)"},
+        {5,       "int3-g64"},
+        {6,       "E8/IQ3"},
+        {7,       "MXFP4"},
+        {8,       "fp8-e4m3-b128"},
+        {9,       "past the last defined fmt"},
+        {-1,      "negative fmt (the old `fmt <= 4` gate admitted this)"},
+        {1 << 30, "garbage fmt"},
+    };
+    for (size_t i = 0; i < sizeof probes / sizeof probes[0]; i++) {
+        int want = coli_cuda_weight_at_supported(probes[i].fmt)
+                       ? A6_EXIT_DECODED : A6_EXIT_TRAPPED;
+        char why[160];
+        snprintf(why, sizeof why, "%s: predicate says %s, silicon agrees",
+                 probes[i].what,
+                 want == A6_EXIT_DECODED ? "decode" : "refuse");
+        expect_child(argv[0], probes[i].fmt, want, why);
+    }
 
     if (fails) { printf("cuda fmt trap tests: %d FAILED\n", fails); return 1; }
     printf("cuda fmt trap tests: ok\n");
