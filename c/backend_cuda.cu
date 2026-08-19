@@ -683,6 +683,9 @@ __global__ static void grouped_s4_wmma(float *y,const uint8_t *x,const float *xs
         wmma::mma_sync(acc,af,bf,acc);
     }
     __shared__ int out[8][64]; wmma::store_matrix_sync(out[warp],acc,8,wmma::mem_row_major);
+    __syncwarp();   /* i due fratelli sopra la portano; stessa lettura cross-lane di out[warp]
+                     * subito sotto -> stesso requisito di visibilita' (racecheck: 3 hazard qui).
+                     * EN: the two sibling kernels carry this; same cross-lane read follows. */
     for(int i=lane;i<64;i+=32){int s=i/8,o=tile*8+i%8;
         if(s<d.rows&&o<O)y[(size_t)(d.offset+s)*O+o]=(float)out[warp][i]*xscale[d.offset+s]*ws[o];}
 #endif
