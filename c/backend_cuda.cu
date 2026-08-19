@@ -993,6 +993,7 @@ __global__ static void attention_absorb_batch_kernel(float *ctx,const float *q,
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
     float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    __syncthreads(); /* every warp must read red[0] above before red[] is reused below */
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
@@ -1028,6 +1029,7 @@ __global__ static void attention_absorb_ragged_kernel(float *ctx,const float *q,
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]=fmaxf(red[tid],red[tid+n]);__syncthreads();}
     float mx=red[0];local=0;for(int t=tid;t<nt;t+=blockDim.x){float e=expf(scores[t]-mx);scores[t]=e;local+=e;}
+    __syncthreads(); /* every warp must read red[0] above before red[] is reused below */
     red[tid]=local;__syncthreads();
     for(int n=blockDim.x>>1;n;n>>=1){if(tid<n)red[tid]+=red[tid+n];__syncthreads();}
     float inv=1.f/red[0];for(int t=tid;t<nt;t+=blockDim.x)scores[t]*=inv;
