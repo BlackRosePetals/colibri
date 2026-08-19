@@ -64,7 +64,24 @@ we shipped twice.
   instead of holding the engine for a minutes-long prompt; cancelled requests
   no longer count as completed.
 
+### Apple Silicon
+- **#790 → #1113** (@RDouglasSharp) — **Metal backend for Kimi K3**: KDA state and
+  window buffers aligned, wrap-once buffer cache, CPU-side MLA KV cache. 1.7×/2.4×
+  on the compute-bound phases (KDA attention + projections dispatched to the GPU);
+  MoE experts stay on the CPU. Kimi K3's first GPU backend.
+
+### More correctness fixes
+- **#1098** (@monotophic) — `__syncthreads()` missing from the absorb softmax
+  reduction, with a determinism test that reproduces the hazard.
+- **#1101** (@monotophic) — allocation and `snprintf` results checked on the
+  checkpoint-load path (#798).
+- **#1106** (@monotophic) — duplicate tensor names across indexed shards are now
+  refused rather than silently resolved to one of them (untrusted containers).
+
 ### Interfaces
+- **#1095** (@benmaster82) — OLMoE planner geometry adapter (#1066).
+- **#1096** (@terrizoaguimor) — DeepSeek V4 serve framing on the shared codec,
+  completing the codec migration across OLMoE, Kimi K3 and V4.
 - **#1063 / #1068** (@terrizoaguimor) — model families are registry-owned:
   `coli`, the gateway, `doctor` and the planner read one descriptor table.
 - **#1087 / #1090** (@terrizoaguimor) — shared serve framing codec, adopted by
