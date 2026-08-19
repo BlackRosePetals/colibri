@@ -650,8 +650,15 @@ deepseek-v4-tiny-generate:
 	@echo "SKIP deepseek-v4-tiny-generate: V4 runtime requires x86-64/aarch64 Linux or Windows/MSYS2"
 endif
 
-# phony targets — 'glm' kept for backward compatibility
+# Convenience aliases — 'glm' kept for backward compatibility.
+# On POSIX EXE is empty, so `colibri: colibri$(EXE)` becomes a self-dependency
+# and marking it phony also forces the real binary to rebuild on every invocation.
+# Only create the alias when the platform executable suffix makes it distinct.
+ifneq ($(EXE),)
+.PHONY: colibri
 colibri: colibri$(EXE)
+endif
+.PHONY: glm
 glm: colibri$(EXE)
 
 # Config stamp: make only tracks file timestamps, not flag changes. Without this,
@@ -1422,7 +1429,7 @@ clean:
 
 bench: iobench$(EXE)
 	@if [ -n "$(ARGS)" ]; then ./iobench$(EXE) $(ARGS); else echo "built iobench$(EXE) — run: ./iobench$(EXE) <file> <MB> <iters> <threads> <direct 0|1>"; fi
-.PHONY: all colibri glm deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
+.PHONY: all deepseek-v4 deepseek-v4-clean deepseek-v4-oracle \
 	deepseek-v4-tiny-generate deepseek-v4-tiny-check \
 	iq3 rans fuzz-rans cuda-test hip-test gpu-compile cuda-bench fp8-bench cuda-dll hip-dll portable \
 	test-c test-python test check clean install uninstall bench

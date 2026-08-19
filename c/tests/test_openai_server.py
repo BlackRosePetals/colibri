@@ -918,6 +918,7 @@ class HTTPTest(unittest.TestCase):
             self.assertEqual(json.load(response)["data"][0]["id"], "test-model")
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/models", key="wrong")
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 401)
 
     def test_health_reports_scheduler_and_kv_slots(self):
@@ -1028,6 +1029,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stop": "H", "x_colibri_ignore_leading_stop": "yes",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_rejects_invalid_cache_slot(self):
@@ -1036,6 +1038,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "cache_slot": 2,
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
     def test_olmoe_never_files_the_answer_as_reasoning(self):
@@ -1107,6 +1110,7 @@ class HTTPTest(unittest.TestCase):
     def test_rejects_empty_legacy_completion(self):
         with self.assertRaises(HTTPError) as caught:
             self.request("/v1/completions", {"model": "test-model", "prompt": ""})
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
         self.assertEqual(json.load(caught.exception)["error"]["param"], "prompt")
 
@@ -1116,6 +1120,7 @@ class HTTPTest(unittest.TestCase):
                 "model": "test-model", "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True, "stream_options": "usage",
             })
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)
 
 
@@ -1192,7 +1197,8 @@ class ClientHangupTest(unittest.TestCase):
             "the old except clause would have covered this; the test proves nothing")
         with patch.object(APIHandler, "end_headers", self._abort):
             try:
-                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
             except Exception:
                 pass                      # the client sees a broken response; that is fine
             time.sleep(0.3)
@@ -1203,7 +1209,8 @@ class ClientHangupTest(unittest.TestCase):
         """Same as the hangup case: the damage is a lost handler, not the log."""
         with patch.object(APIHandler, "end_headers", self._abort):
             try:
-                urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2)
+                with urlopen(f"http://127.0.0.1:{self.server.server_port}/health", timeout=2):
+                    pass
             except Exception:
                 pass
             time.sleep(0.3)
@@ -1242,6 +1249,7 @@ class StaticServingTest(unittest.TestCase):
             self.assertEqual(response.read(), b"dashboard")
         with self.assertRaises(HTTPError) as caught:
             urlopen(self.base + "/%2e%2e/dist-private/secret.txt", timeout=2)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 404)
 
 
@@ -1277,6 +1285,7 @@ class SchedulerHTTPTest(unittest.TestCase):
         self.assertTrue(self.engine.entered.wait(1))
         with self.assertRaises(HTTPError) as caught:
             self.request()
+        self.addCleanup(caught.exception.close)
         error = json.loads(caught.exception.read())["error"]
         self.assertEqual(caught.exception.code, 429)
         self.assertEqual(caught.exception.headers["Retry-After"], "1")
@@ -1848,6 +1857,7 @@ class StreamingContextRejectTest(unittest.TestCase):
                       headers={"Content-Type": "application/json"})
         with self.assertRaises(HTTPError) as caught:
             urlopen(req, timeout=3)
+        self.addCleanup(caught.exception.close)
         self.assertEqual(caught.exception.code, 400)          # a real 400, not a 200 stream
         body = json.load(caught.exception)
         self.assertEqual(body["error"]["code"], "context_length_exceeded")
