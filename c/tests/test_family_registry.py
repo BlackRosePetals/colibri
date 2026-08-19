@@ -206,7 +206,7 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.workspace_bytes, 0)
 
     def test_unproven_production_planners_refuse_instead_of_inventing_zero(self):
-        for model_type in ("inkling", "kimi_k3", "deepseek_v4"):
+        for model_type in ("inkling", "deepseek_v4"):
             family = family_for_config({"model_type": model_type})
             resolved = type("R", (), {"descriptor": family, "family_config": {},
                                        "model_dir": "."})()
@@ -300,6 +300,152 @@ class FamilyRegistryTest(unittest.TestCase):
         geometry = planner_geometry(resolved, 32)
         self.assertEqual(geometry.context_state_bytes,
                          2 * 32 * 16 * 128 * 2 * 4)  # 16 heads, not 4
+
+    def test_kimi_geometry_matches_engine_hybrid_allocation(self):
+        # Kimi K3-shaped config: 8 layers, 5 KDA + 3 MLA (small synthetic).
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {
+                "num_heads": 8,
+                "head_dim": 64,
+                "short_conv_kernel_size": 3,
+                "kda_layers": [1, 2, 3, 4, 5],
+            },
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["kimi"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # MLA cache: 3 MLA layers x context x (kv_lora + qk_rope) x 4
+        self.assertEqual(geometry.context_state_bytes,
+                         3 * 32 * (128 + 32) * 4)
+        # KDA fixed recurrent state: 5 KDA layers x heads x hd x hd x 4
+        self.assertEqual(geometry.fixed_state_bytes,
+                         5 * 8 * 64 * 64 * 4)
+        self.assertEqual(geometry.configured_experts, 32)
+
+    def test_kimi_geometry_kda_state_does_not_scale_with_context(self):
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {
+                "num_heads": 8,
+                "head_dim": 64,
+                "short_conv_kernel_size": 3,
+                "kda_layers": [1, 2, 3, 4, 5],
+            },
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 16)
+        large = planner_geometry(resolved, 64)
+        # KDA recurrent state is context-independent
+        self.assertEqual(small.fixed_state_bytes, large.fixed_state_bytes)
+        # MLA cache scales linearly with context
+        self.assertEqual(large.context_state_bytes / small.context_state_bytes, 4)
+
+    def test_kimi_geometry_rejects_missing_linear_attn_config(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+        }
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_kimi_geometry_rejects_missing_kda_layers(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {"num_heads": 8, "head_dim": 64},
+        }
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_kimi_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_kimi_geometry_workspace_is_max_of_kda_and_mla(self):
+        config = {
+            "model_type": "kimi_k3",
+            "hidden_size": 2048,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 16,
+            "q_lora_rank": 64,
+            "kv_lora_rank": 128,
+            "qk_nope_head_dim": 64,
+            "qk_rope_head_dim": 32,
+            "v_head_dim": 128,
+            "num_experts": 32,
+            "linear_attn_config": {
+                "num_heads": 8,
+                "head_dim": 64,
+                "short_conv_kernel_size": 3,
+                "kda_layers": [1, 2, 3, 4, 5],
+            },
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["kimi"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        ctx = 32
+        # KDA workspace: 6*ctx*P + ctx*hd + ctx*hidden floats
+        ws_kda = (6 * ctx * (8 * 64) + ctx * 64 + ctx * 2048) * 4
+        # MLA workspace: qa + qv + ckv + gv + ctx buffers
+        qh = 64 + 32
+        ws_mla = (ctx * 64 + ctx * 16 * qh + ctx * (128 + 32) +
+                  2 * ctx * 16 * 128) * 4
+        self.assertEqual(geometry.workspace_bytes, max(ws_kda, ws_mla))
 
     def test_cli_and_gateway_dispatch_follow_the_registry(self):
         import openai_server

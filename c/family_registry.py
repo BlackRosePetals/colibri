@@ -168,6 +168,64 @@ def _olmoe_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, 0, experts)
 
 
+
+def _kimi_geometry(config, context, _model_dir):
+    """Kimi K3: hybrid -- 69 KDA (recurrent) + 24 gated MLA layers.
+
+    The engine marks KDA layers via linear_attn_config.kda_layers (1-based
+    indices, kimi_k3.c:552-555); every other layer is a gated MLA layer.
+    Only the MLA layers keep a positional Lc/Rc cache (kimi_k3.c:1704-1706),
+    so only they scale with context:
+
+        MLA cache = n_mla * context * (kv_lora + qk_rope) * 4
+
+    The KDA layers carry a per-head recurrent state that does NOT depend on
+    context (kimi_k3.c:691): kda_heads * kda_hd * kda_hd floats per layer.
+    That belongs in fixed_state_bytes, exactly like GLM's indexer state.
+
+    Workspace mirrors the prefill temporary set (C == context):
+      KDA (kimi_k3.c:896-898): q,k,v,gp,on,graw = 6*C*P, t1 = C*kda_hd,
+                               braw = C*hidden, P = kda_heads*kda_hd
+      MLA (kimi_k3.c:992-994): qa = C*q_lora, qv = C*H*qh, ckv = C*(kvl+qr),
+                               gv = C*H*vh, ctx = C*H*vh
+    The planner reserves the larger of the two (a single forward pass only
+    touches one layer type at a time).
+    """
+    layers = _required_int(config, "num_hidden_layers", "kimi_k3")
+    experts = _required_int(config, "num_experts", "kimi_k3")
+    hidden = _required_int(config, "hidden_size", "kimi_k3")
+    heads = _required_int(config, "num_attention_heads", "kimi_k3")
+    q_lora = _required_int(config, "q_lora_rank", "kimi_k3")
+    kv_lora = _required_int(config, "kv_lora_rank", "kimi_k3")
+    qk_nope = _required_int(config, "qk_nope_head_dim", "kimi_k3")
+    qk_rope = _required_int(config, "qk_rope_head_dim", "kimi_k3")
+    v_head = _required_int(config, "v_head_dim", "kimi_k3")
+
+    la = config.get("linear_attn_config")
+    if not isinstance(la, dict):
+        raise ValueError("kimi_k3: missing or invalid planning key 'linear_attn_config'")
+    kda_heads = _required_int(la, "num_heads", "kimi_k3")
+    kda_hd = _required_int(la, "head_dim", "kimi_k3")
+    kda_list = la.get("kda_layers")
+    if not isinstance(kda_list, list):
+        raise ValueError("kimi_k3: missing or invalid planning key 'linear_attn_config.kda_layers'")
+    n_kda = sum(1 for v in kda_list if isinstance(v, int) and 1 <= v <= layers)
+    n_mla = layers - n_kda
+    if n_mla < 0:
+        n_mla = 0
+
+    state = n_mla * context * (kv_lora + qk_rope) * 4
+    fixed = n_kda * kda_heads * kda_hd * kda_hd * 4
+
+    kda_proj = kda_heads * kda_hd
+    ws_kda = context * (6 * kda_proj + kda_hd + hidden) * 4
+    qh = qk_nope + qk_rope
+    ws_mla = context * (q_lora + heads * qh + kv_lora + qk_rope +
+                        2 * heads * v_head) * 4
+    workspace = max(ws_kda, ws_mla)
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -271,8 +329,8 @@ FAMILIES = (
         cli_adapter="kimi",
         gateway_adapter="kimi",
         planner_id="kimi_hybrid",
-        planner_geometry=None,
-        planner_unsupported_reason="Kimi planning awaits measured KDA recurrent-state and native MXFP4 reserves",
+        planner_geometry=_kimi_geometry,
+        planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_KIMI_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "K3_MAXT"),
