@@ -324,6 +324,75 @@ def _inkling_geometry(config, context, _model_dir):
     return PlannerGeometry(state, fixed, workspace, experts)
 
 
+
+def _dsv4_geometry(config, context, _model_dir):
+    """DeepSeek V4: sliding-window ring + per-layer compressor/indexer states.
+
+    Mirrors the engine's own ``context_bytes()`` (deepseek_v4.c:1271-1284)
+    exactly -- this is the resident cache the C runtime sizes at load:
+
+        base       = num_hidden_layers * sliding_window * head_dim * 4
+        per layer: ratio = compress_ratios[layer]
+                   compressed = ceil(context / ratio)
+                   total += compressed * head_dim * 4
+                   if ratio == 4:
+                       total += compressed * index_head_dim * 4
+
+    The window ring (``base``) does not depend on the context: it is a fixed
+    circular buffer, so it belongs in fixed_state_bytes. The compressor and
+    indexer states scale with ``context / ratio`` and belong in
+    context_state_bytes.
+
+    Workspace mirrors the batched-attention scratch set
+    (deepseek_v4.c:2741-2750): qa (q_rank), q (q_width), kv (head_dim),
+    attended (q_width), oa (oa_width), norm (max(q_rank, head_dim)) -- with
+    q_width = heads * head_dim and oa_width = o_groups * o_lora_rank. With
+    batch == context at prefill the peak is the sum of the batch-wide float
+    buffers plus the single norm buffer.
+
+    Experts: configured_experts = n_routed_experts.
+    """
+    layers = _required_int(config, "num_hidden_layers", "deepseek_v4")
+    experts = _required_int(config, "n_routed_experts", "deepseek_v4")
+    hidden = _required_int(config, "hidden_size", "deepseek_v4")
+    heads = _required_int(config, "num_attention_heads", "deepseek_v4")
+    head_dim = _required_int(config, "head_dim", "deepseek_v4")
+    q_rank = _required_int(config, "q_lora_rank", "deepseek_v4")
+    o_groups = _required_int(config, "o_groups", "deepseek_v4")
+    o_rank = _required_int(config, "o_lora_rank", "deepseek_v4")
+    window = _required_int(config, "sliding_window", "deepseek_v4")
+    index_hd = _required_int(config, "index_head_dim", "deepseek_v4")
+
+    ratios = config.get("compress_ratios")
+    if not isinstance(ratios, list) or len(ratios) != layers:
+        raise ValueError(
+            "deepseek_v4: compress_ratios must be a list matching "
+            "num_hidden_layers")
+
+    # Fixed window ring: n_layers * window * head_dim fp32.
+    fixed = layers * window * head_dim * 4
+
+    # Compressor + indexer states, scaling with context / ratio.
+    state = 0
+    for ratio in ratios:
+        if not isinstance(ratio, bool) and isinstance(ratio, int) and ratio > 0:
+            compressed = (context + ratio - 1) // ratio
+            state += compressed * head_dim * 4
+            if ratio == 4:
+                state += compressed * index_hd * 4
+        elif ratio != 0:
+            raise ValueError("deepseek_v4: compress_ratios entries must be "
+                             "non-negative integers")
+
+    # Batched-attention scratch (prefill, batch == context).
+    q_width = heads * head_dim
+    oa_width = o_groups * o_rank
+    workspace = (context * (q_rank + 2 * q_width + head_dim + oa_width) +
+                 max(q_rank, head_dim)) * 4
+
+    return PlannerGeometry(state, fixed, workspace, experts)
+
+
 _GLM_EXPERT = re.compile(
     r"(?:^|\.)model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
 )
@@ -507,8 +576,8 @@ FAMILIES = (
         cli_adapter="deepseek_v4",
         gateway_adapter="deepseek_v4",
         planner_id="deepseek_v4",
-        planner_geometry=None,
-        planner_unsupported_reason="DeepSeek V4 uses its C resident-tier planner; Python parity is not yet proven",
+        planner_geometry=_dsv4_geometry,
+        planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_V4_EXPERT),
         config_section="root",
         limits=FamilyLimits(4096, 1048576, 1024, 16384, 1, 8, "CTX"),

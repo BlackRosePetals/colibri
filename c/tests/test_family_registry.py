@@ -206,7 +206,7 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.workspace_bytes, 0)
 
     def test_unproven_production_planners_refuse_instead_of_inventing_zero(self):
-        for model_type in ("deepseek_v4",):
+        for model_type in ():
             family = family_for_config({"model_type": model_type})
             resolved = type("R", (), {"descriptor": family, "family_config": {},
                                        "model_dir": "."})()
@@ -597,6 +597,145 @@ class FamilyRegistryTest(unittest.TestCase):
                                    "model_dir": "."})()
         with self.assertRaises(ValueError):
             planner_geometry(resolved, 32)
+
+    def test_dsv4_geometry_matches_engine_context_bytes(self):
+        # 4 layers: ratios [0, 2, 4, 4] -> no-compress, compressor, indexer, indexer
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2, 4, 4],
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["deepseek_v4"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # Fixed window ring: 4 layers * window 8 * head_dim 32 * 4
+        self.assertEqual(geometry.fixed_state_bytes, 4 * 8 * 32 * 4)
+        # Compressor states: ceil(32/2)=16 * hd * 4  +  ceil(32/4)=8 * hd * 4 * 2
+        state = 16 * 32 * 4 + 8 * 32 * 4 + 8 * 32 * 4
+        # Indexer states (ratio==4): ceil(32/4)=8 * index_hd 24 * 4, for 2 layers
+        state += 8 * 24 * 4 + 8 * 24 * 4
+        self.assertEqual(geometry.context_state_bytes, state)
+        self.assertEqual(geometry.configured_experts, 32)
+
+    def test_dsv4_geometry_fixed_ring_does_not_scale_with_context(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2, 4, 4],
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 16)
+        large = planner_geometry(resolved, 64)
+        # Window ring is context-independent
+        self.assertEqual(small.fixed_state_bytes, large.fixed_state_bytes)
+        # Compressed states scale ~linearly with context (ceil divisions)
+        ratio = large.context_state_bytes / small.context_state_bytes
+        self.assertAlmostEqual(ratio, 4, delta=0.5)
+
+    def test_dsv4_geometry_workspace_matches_attention_scratch(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2, 4, 4],
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        ctx = 32
+        q_width = 16 * 32       # heads * head_dim
+        oa_width = 4 * 64       # o_groups * o_lora_rank
+        expected = (ctx * (16 + 2 * q_width + 32 + oa_width) +
+                    max(16, 32)) * 4
+        self.assertEqual(geometry.workspace_bytes, expected)
+
+    def test_dsv4_geometry_rejects_bad_compress_ratios(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 2],  # wrong length
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_dsv4_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_dsv4_geometry_all_uncompressed_layers_have_only_ring(self):
+        config = {
+            "model_type": "deepseek_v4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "head_dim": 32,
+            "q_lora_rank": 16,
+            "o_groups": 4,
+            "o_lora_rank": 64,
+            "sliding_window": 8,
+            "index_head_dim": 24,
+            "n_routed_experts": 32,
+            "compress_ratios": [0, 0, 0, 0],
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["deepseek_v4"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 64)
+        # No compressors: context state is zero, only the ring is resident
+        self.assertEqual(geometry.context_state_bytes, 0)
+        self.assertEqual(geometry.fixed_state_bytes, 4 * 8 * 32 * 4)
 
     def test_cli_and_gateway_dispatch_follow_the_registry(self):
         import openai_server
