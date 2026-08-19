@@ -3,6 +3,77 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [1.7.0] — 2026-08-19
+71 pull requests since v1.6.2. A sixth model family with its GPU tier, a
+rebuilt expert-matmul path, and the CI that would have caught the class of bug
+we shipped twice.
+
+### A sixth engine: Qwen3.6-35B-A3B — CPU and GPU
+- **#712** (@kreuzzelg) — hybrid Gated Attention + Gated DeltaNet + streaming
+  MoE, in `c/qwen36.c`. Pre-converted containers published (int4-gs64
+  recommended: cosine to the int8 anchor 0.98777 → 0.99313, KL 0.109 → 0.080
+  vs per-row). The engine takes any architecture-identical checkpoint
+  unchanged — KAT-Coder v2.5 runs on it with no code path of its own.
+- **#713** (@kreuzzelg) — CUDA VRAM expert tier with heat-based placement
+  across GPUs: **1.44 → 10.05 tok/s (7.0×) on 2× 8 GB cards, output
+  bit-identical to CPU** (`cmp` over the full 200-token generation), measured
+  cold with no heat table. A `qt_ready()` gate keeps CPU-only builds from
+  allocating the packed int4 buffers they never read: **7.33 GB saved**.
+
+### The expert matmul path, rebuilt (all bit-identical)
+- **#1071 / #1075 / #1076 / #1077** — activation quantization hoisted to layer
+  level across GLM, Kimi K3 and DeepSeek V4: the same vector was being
+  re-quantized ~16× per layer, serially. Removes ~5.2 ms/token of serial time
+  and every per-call `malloc` from the hot path.
+- **#1079 / #1086** — **K1: plane-nibble int4 layout + unsigned-VNNI dot.**
+  Storing element *k* and *k+32* in one byte deletes the unpack, and since
+  nibbles are stored unsigned, `dot(v,x) = dot(u,x) − 8·Σx` feeds `vpdpbusd`
+  natively. 8 uops per 64 MACs instead of 32: **1.45–2.65× on the IDOT
+  kernels**, zero bytes added.
+- **#1088** — **K2: 1×4 union tile.** The prefill union hands each expert
+  2–16 rows; the weight block's load+mask is now paid once per four rows
+  instead of once per row: **2.67–3.10× at S=4** (peak 253 GMAC/s).
+- **#1093** — parallel silu and the down-side activation hoist.
+- **#1094** — **K1b: grouped planar IDOT for gs64 containers** (`IDOT_GS=1`,
+  opt-in): the recommended container format could not reach the integer
+  kernels at any batch size before this.
+- **#1082** (@outtodata) — `FUSED3=1` opt-in fused AVX2 expert matmul.
+
+### Streaming and I/O
+- **#1097** — DeepSeek V4 expert-loader pool default 3 → 9 lanes:
+  **1.41× decode** on the real V4-Flash checkpoint (8 interleaved runs on a
+  quiet 25 GB box). `V4_LOADER_LANES` still overrides.
+- **#1056** (@dcutugno) — DeepGEMM sm120 headers fetched at a pinned commit on
+  first build: 2.5× prefill on sm120 with nothing vendored in-tree.
+- **#988 / #1054 / #1055** — DeepSeek V4 CUDA tier and dual-SSD mirror.
+
+### Correctness and CI
+- **#1083** — **ARM CI job** (`ubuntu-24.04-arm`) plus an integer-kernel
+  bit-exactness gate that runs on both ISAs. Every tiny-oracle job ran on x86
+  before this, so NEON-divergent paths were invisible — which is how the IDOT
+  defaults below shipped. Closes #1081.
+- **#1044 / #1080** — IDOT made opt-in in olmoe and inkling: the fast path is
+  x86-only and quantizes activations, so the same model produced different
+  tokens on x86 and ARM by default.
+- **#1109** (@SebaWag) — ARM64 dotprod probed by *compiling* the intrinsic:
+  GCC 11 defines `__ARM_FEATURE_DOTPROD` for a base it cannot emit
+  `vdotq_s32` for. Fixes #1104.
+- **#1111** — `__syncwarp()` after `grouped_s4_wmma`'s store (reported by
+  @monotophic with `compute-sanitizer` evidence). Fixes #1099.
+- **#1073 / #1074** (@bherald) — Kimi K3 cancels prefill between layers
+  instead of holding the engine for a minutes-long prompt; cancelled requests
+  no longer count as completed.
+
+### Interfaces
+- **#1063 / #1068** (@terrizoaguimor) — model families are registry-owned:
+  `coli`, the gateway, `doctor` and the planner read one descriptor table.
+- **#1087 / #1090** (@terrizoaguimor) — shared serve framing codec, adopted by
+  OLMoE and Kimi K3, each behind a byte-exact wire-transcript freeze.
+- **#1036** (@lineape) — distributed expert workers (LAN, opt-in via
+  `CLUSTER_WORKERS`).
+- Planner: DeepSeek V4 expert naming now recognized, so `coli plan` and
+  `coli doctor` stop counting every routed expert as dense (fixes #1110).
+
 ## [1.6.2] — 2026-08-14
 Security release: **six privately-reported memory-safety issues fixed**, all reachable
 from attacker-controlled input (malicious model file / `config.json`, or the kimi_k3
