@@ -71,6 +71,18 @@
  * backend_gpu_compat.h, which supplies the runtime surface for BOTH vendors. */
 #include "../backend_cuda.cu"
 
+/* backend_gpu_compat.h maps only the names the backend itself uses: this
+ * test's cudaMemset (the backend memsets asynchronously only) and
+ * cudaErrorUnknown (the backend never names the generic error) are not among
+ * them, so under hipcc (the HIP syntax-check lane runs gpu-compile on this
+ * file) they are undefined. Alias them locally per vendor rather than
+ * widening the product header for a test-only need -- the same arrangement
+ * tests/test_weights_owned_cuda.cu uses for its own off-surface names. */
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP__)
+#define cudaMemset       hipMemset
+#define cudaErrorUnknown hipErrorUnknown
+#endif
+
 #ifndef _WIN32
 #include <sys/types.h>
 #include <sys/wait.h>
