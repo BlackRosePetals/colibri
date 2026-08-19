@@ -472,6 +472,33 @@ class FakeProcess:
 
 
 class DispatcherTest(unittest.TestCase):
+    def test_inkling_audio_request_and_response_transcript_is_byte_exact(self):
+        prompt = "<|message_user|><|content_audio_input|><|audio|><|end_message|>"
+        payload = prompt.encode("utf-8")
+        audio = bytes(range(16)) * 5
+        expected = (f"SUBMIT 1 0 {len(payload)} 4 0.25 0.9 {len(audio)}\n".encode() +
+                    payload + audio + b"\n")
+
+        def respond(process, frame):
+            self.assertEqual(frame, expected)
+            process.stdout.feed(
+                b"DATA 1 4\nA\n\xc3\xa9\n"
+                b"DONE 1 STAT 1 2.500 50.0 1.25 7 0\n"
+            )
+
+        process = FakeProcess(respond)
+        with patch("openai_server.ARCH", "inkling"), \
+             patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("inkling", "model")
+            chunks = []
+            stats = engine.generate(prompt, 4, 0.25, 0.9, chunks.append,
+                                    audio=audio)
+        engine.close()
+
+        self.assertEqual(process.writes, [expected])
+        self.assertEqual(chunks, ["A\né"])
+        self.assertEqual(stats["prompt_tokens"], 7)
+
     def test_v4_request_and_response_transcript_is_byte_exact(self):
         prompt = "<｜begin▁of▁sentence｜>System<｜User｜>Hello<｜Assistant｜>"
         payload = prompt.encode("utf-8")

@@ -1867,9 +1867,9 @@ static int stdin_readable(void) {
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
+static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
     char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
+    if (!fgets(ln, sizeof(ln), input)) return -1;
     char cmd[16], id[64];
     if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
     if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
@@ -1893,24 +1893,24 @@ static int serve_read_cmd(const char *cur_id) {
          * has, rather than in one of its callers. */
         if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
             max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
+            fprintf(output, "ERROR %s bad submit header\n", id); fflush(output); return 0; }
         (void)slot;
         char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
+        if (fread(pl, 1, (size_t)plen, input) != (size_t)plen) { free(pl); return -1; }
         pl[plen] = 0;
         uint8_t *au = NULL;
         if (alen > 0) {
             au = malloc((size_t)alen);
-            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
+            if (fread(au, 1, (size_t)alen, input) != (size_t)alen) { free(pl); free(au); return -1; }
         }
-        int nl = fgetc(stdin); (void)nl;
+        int nl = fgetc(input); (void)nl;
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
             snprintf(q->id, sizeof(q->id), "%s", id);
             q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
             q->payload = pl; q->plen = plen;
             q->audio = au; q->alen = alen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
+        } else { fprintf(output, "ERROR %s queue full\n", id); fflush(output); free(pl); free(au); }
     }
     return 0;
 }
@@ -1993,7 +1993,7 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         fputc('\n', stdout); fflush(stdout);
         gen++; len++;
         while (stdin_readable()) {
-            int r = serve_read_cmd(q->id);
+            int r = serve_read_cmd(stdin, stdout, q->id);
             if (r < 0) { free(ids); return; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
@@ -2090,7 +2090,7 @@ static void serve_loop(Model *m, Tok *T) {
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
         serve_one(m, T, &q);
