@@ -214,6 +214,93 @@ class FamilyRegistryTest(unittest.TestCase):
                  self.assertRaises(PlannerUnsupportedError):
                 planner_geometry(resolved, 32)
 
+
+    def test_olmoe_geometry_matches_engine_kv_allocation(self):
+        # OLMoE config shaped like the real 1B-7B model (AI2), but small.
+        config = {
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 512,
+            "vocab_size": 50304,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        self.assertEqual(family, by_id["olmoe"])
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        # Engine allocates K+V with n_heads (not n_kv_heads), fp32:
+        #   head_dim = hidden // n_heads = 2048 // 16 = 128
+        #   state   = layers * context * heads * head_dim * 2 * 4
+        self.assertEqual(geometry.configured_experts, 8)
+        self.assertEqual(geometry.context_state_bytes,
+                         2 * 32 * 16 * 128 * 2 * 4)
+        self.assertEqual(geometry.fixed_state_bytes, 0)
+        # Workspace: the bounded per-forward scratch (attention scores,
+        # logits, expert temporaries) is covered by the base runtime reserve,
+        # so the planner reports no context-scaling workspace (dev #1095).
+        self.assertEqual(geometry.workspace_bytes, 0)
+
+    def test_olmoe_geometry_scales_with_context(self):
+        config = {
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 512,
+            "vocab_size": 50304,
+        }
+        by_id, by_type = _build_registry(FAMILIES)
+        family = by_type[config["model_type"]]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        small = planner_geometry(resolved, 16)
+        large = planner_geometry(resolved, 64)
+        ratio = large.context_state_bytes / small.context_state_bytes
+        self.assertEqual(ratio, 4)  # linear in context
+        # Workspace stays at zero at every context (per dev #1095): only the
+        # KV state scales with context, so the ratio above is the full story.
+        self.assertEqual(small.workspace_bytes, 0)
+        self.assertEqual(large.workspace_bytes, 0)
+
+    def test_olmoe_geometry_rejects_missing_keys(self):
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["olmoe"]
+        resolved = type("R", (), {"descriptor": family, "family_config": {},
+                                   "model_dir": "."})()
+        with self.assertRaises(ValueError):
+            planner_geometry(resolved, 32)
+
+    def test_olmoe_geometry_uses_n_heads_not_n_kv_heads(self):
+        # GQA where kv < q heads: the engine still allocates K/V per q head,
+        # so the plan must follow num_attention_heads (olmoe.c:1019-1020).
+        config = {
+            "model_type": "olmoe",
+            "hidden_size": 2048,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,   # GQA ratio 4
+            "num_experts": 8,
+            "num_experts_per_tok": 2,
+            "intermediate_size": 512,
+            "vocab_size": 50304,
+        }
+        by_id, _ = _build_registry(FAMILIES)
+        family = by_id["olmoe"]
+        resolved = type("R", (), {"descriptor": family, "family_config": config,
+                                   "model_dir": "."})()
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.context_state_bytes,
+                         2 * 32 * 16 * 128 * 2 * 4)  # 16 heads, not 4
+
     def test_cli_and_gateway_dispatch_follow_the_registry(self):
         import openai_server
         from importlib.machinery import SourceFileLoader
