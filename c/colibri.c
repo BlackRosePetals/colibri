@@ -8260,6 +8260,7 @@ static void run_serve(Model *m, const char *snap){
     _setmode(_fileno(stdout), _O_BINARY);
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
+    double t_serve0=now_s();             /* PROF: wall base for the exit-time profile_print */
     char tkp[2048]; snprintf(tkp,sizeof(tkp),"%s/tokenizer.json",snap);
     Tok T; tok_load(&T,tkp);
     int eos=tok_id_of(&T,"<|endoftext|>");
@@ -8412,6 +8413,12 @@ static void run_serve(Model *m, const char *snap){
     }
     free(line); free(buf);
     usage_save(m);
+    /* PROF=1 only: the cumulative backend counters (METAL:/METAL-ATTN:/MIRROR:) were
+     * unreachable in serve mode — profile_print only ran on the oracle/generate exit
+     * paths, so a served session could never show GPU-vs-fallback truth. stdin has hit
+     * EOF here: the last END/STAT frame is already out, so these stdout lines can no
+     * longer interleave with protocol a client is parsing. */
+    if(g_prof) profile_print(m, now_s()-t_serve0);
     #undef hist
     #undef len
     #undef first

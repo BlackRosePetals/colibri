@@ -257,9 +257,10 @@ static int run_fp8_gemm_gate(const char *name) {
 // up with no routed expert already fixing `mfmt`, it would submit the WRONG pointer
 // (q4, NULL/stale for an fmt=8 tensor whose weights live in q8) tagged as fmt=8.
 // This is safe ANYWAY, but only incidentally: moe_submit() (backend_metal.mm) gates
-// `fmt != 1 && fmt != 2` as its very FIRST statement, before any of g/u/d/gs/us/ds is
-// dereferenced or even resolve()'d -- so an fmt=8 submission is refused before the
-// bad pointer would ever be read, no matter what garbage MB_BUILD packed into it. This
+// on its fmt allowlist ({1,2,4,5,6}) as its very FIRST statement, before any of
+// g/u/d/gs/us/ds is dereferenced or even resolve()'d -- so an fmt=8 submission is
+// refused before the bad pointer would ever be read, no matter what garbage
+// MB_BUILD packed into it. This
 // test uses deliberately-invalid weight/scale pointers (never dereferenced if the gate
 // holds) to prove the fence BY TEST rather than leaving it an artifact of moe_submit's
 // fmt allowlist happening not to include 8 (yet) -- same discipline
