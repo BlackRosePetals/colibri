@@ -34,6 +34,10 @@ LOAD_RE = re.compile(
     r"(?:resident weights loaded in|init done in|loaded \d+ layers in|\bloaded\b.*?\bin\b)\s+([\d.]+)s.*?\bRSS\b\s*(?:after load:\s*)?([\d.]+)\s*GB",
     re.IGNORECASE
 )
+TUNE_RE = re.compile(r"TUNE decode:\s*(\d+)\s*tokens in\s*([\d.]+)s", re.IGNORECASE)
+FIRST_RE = re.compile(r"time_to_first_token=([\d.]+)s", re.IGNORECASE)
+V4_TOKENS_RE = re.compile(r"v4_tokens.*?generated=(\d+)", re.IGNORECASE)
+RAM_RE = re.compile(r"(?:projected=|dense=resident\(|available=)([\d.]+)G[iI]?B", re.IGNORECASE)
 IOBENCH_RE = re.compile(r"-> ([\d.]+) GB/s")
 
 
@@ -157,35 +161,56 @@ def evict_cache(ram_gb, snap_dir=None):
         return False
 
 
-def run_engine(engine, snap, prompt, max_new, runs, cap, bits):
+def run_engine(engine, snap, prompt, max_new, runs, cap, bits, memory_gb=None):
     results = []
     engine_name = os.path.basename(engine).lower()
 
     for i in range(runs):
-        env = dict(os.environ, CHAT="1", TEMP="0", MAX_NEW=str(max_new), SNAP=snap)
+        env = dict(os.environ, CHAT="1", COLI_TEMP="0", MAX_NEW=str(max_new), SNAP=snap)
         t0 = time.monotonic()
 
-        # Support modern engines and CLI wrappers (coli / deepseek_v4 / colibri)
-        if "coli" in engine_name:
+        # Support modern engines and CLI wrappers
+        # Exact basename check so 'colibri' isn't misclassified as 'coli-wrapper'
+        if engine_name in ("coli", "coli-wrapper"):
             cmd = [engine, "run", "--model", snap, prompt, "--ngen", str(max_new)]
             stdin_input = None
         elif "deepseek" in engine_name:
-            cmd = [engine, snap, prompt, "--max-tokens", str(max_new), "--memory-gb", "32"]
+            mem_str = str(int(memory_gb)) if memory_gb is not None else "32"
+            cmd = [engine, snap, prompt, "--max-tokens", str(max_new), "--memory-gb", mem_str]
             stdin_input = None
         else:
-            # Legacy positional engines (olmoe, inkling)
+            # Legacy positional engines (olmoe, inkling, colibri)
             cmd = [engine, str(cap), str(bits)]
             stdin_input = prompt + "\n"
 
         proc = subprocess.run(cmd, input=stdin_input, capture_output=True, text=True, env=env)
         wall = time.monotonic() - t0
-        m = LOAD_RE.search(proc.stdout) or LOAD_RE.search(proc.stderr)
-        if not m:
-            sys.exit(f"could not parse engine load line from stdout/stderr:\n{proc.stdout[-300:]}{proc.stderr[-300:]}")
-        load_s, rss = float(m.group(1)), float(m.group(2))
-        gen_s = wall - load_s
-        results.append({"tokens": max_new, "wall_s": wall, "gen_s": gen_s,
-                        "tok_s": max_new / gen_s, "rss": rss, "load_s": load_s})
+        output = proc.stdout + "\n" + proc.stderr
+
+        # 1. Try standard load & RSS regex
+        m = LOAD_RE.search(output)
+        if m:
+            load_s, rss = float(m.group(1)), float(m.group(2))
+            gen_s = wall - load_s
+            tok_count = max_new
+        else:
+            # 2. Fallback parser for engines like deepseek_v4 that output TUNE decode / timing lines
+            m_tune = TUNE_RE.search(output)
+            m_first = FIRST_RE.search(output)
+            m_tokens = V4_TOKENS_RE.search(output)
+            m_ram = RAM_RE.search(output)
+
+            if not m_tune and not m_first:
+                sys.exit(f"could not parse engine load/decode line from stdout/stderr:\n{output[-400:]}")
+
+            tok_count = int(m_tune.group(1)) if m_tune else (int(m_tokens.group(1)) if m_tokens else max_new)
+            gen_s = float(m_tune.group(2)) if m_tune else wall
+            load_s = float(m_first.group(1)) if m_first else max(0.0, wall - gen_s)
+            rss = float(m_ram.group(1)) if m_ram else (float(memory_gb) if memory_gb is not None else 0.0)
+
+        tok_s = tok_count / gen_s if gen_s > 0 else 0.0
+        results.append({"tokens": tok_count, "wall_s": wall, "gen_s": gen_s,
+                        "tok_s": tok_s, "rss": rss, "load_s": load_s})
     return results
 
 
@@ -208,10 +233,12 @@ def main():
     ap.add_argument("--warm-runs", type=int, default=1, help="warm decode runs after the cold run")
     ap.add_argument("--cap", type=int, default=16, help="per-layer expert cache cap passed to the engine")
     ap.add_argument("--bits", type=int, default=8, help="quant bits passed to the engine")
+    ap.add_argument("--memory-gb", type=float, default=None, help="RAM memory cap in GB passed to engine (default: auto-derived from host RAM)")
     ap.add_argument("--no-evict", action="store_true", help="skip page-cache eviction")
     args = ap.parse_args()
 
     info = machine_info()
+    mem_gb = args.memory_gb if args.memory_gb is not None else info.get("ram_gb", 32.0)
     evicted = False if args.no_evict else evict_cache(info.get("ram_gb", 8.0), snap_dir=args.snap)
     cold_label = "cold (cache evicted)" if evicted else "cold (cache not evicted)"
 
@@ -220,8 +247,8 @@ def main():
         # true cold disk figure first, before decode re-warms the container
         disk["cold"] = run_iobench(args.iobench, args.shard, 1)
 
-    cold = run_engine(args.engine, args.snap, args.prompt, args.max_new, 1, args.cap, args.bits)
-    warm = run_engine(args.engine, args.snap, args.prompt, args.max_new, max(1, args.warm_runs), args.cap, args.bits)
+    cold = run_engine(args.engine, args.snap, args.prompt, args.max_new, 1, args.cap, args.bits, memory_gb=mem_gb)
+    warm = run_engine(args.engine, args.snap, args.prompt, args.max_new, max(1, args.warm_runs), args.cap, args.bits, memory_gb=mem_gb)
 
     if args.shard:
         if "cold" not in disk:
@@ -232,7 +259,7 @@ def main():
            "|---|---|", f"| machine | {info['cpu']} |",
            f"| RAM | {info['ram']} |", f"| cores | {info['cores']} |",
            f"| OS | {info['os']} |", f"| engine | {os.path.basename(args.engine)}, snapshot {args.snap}, cap={args.cap}, bits={args.bits} |",
-           "", f"**Decode (TEMP=0, capped at {args.max_new} tokens, exact count):**", "",
+           "", f"**Decode (COLI_TEMP=0, capped at {args.max_new} tokens, exact count):**", "",
            "| phase | tokens | gen s | tok/s | RSS after load |", "|---|---|---|---|---|"]
     for r in cold:
         out.append(f"| {cold_label} | {r['tokens']} | {r['gen_s']:.2f} | {r['tok_s']:.2f} | {r['rss']:.2f} GB |")
