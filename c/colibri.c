@@ -783,9 +783,13 @@ static double rss_gb(void){
 #ifdef __linux__
 static double current_rss_gb(void) {
   FILE *f = fopen("/proc/self/status", "r");
+  static int announced_proc_failure;
   if (!f) {
-    fprintf(stderr, "[RSS] failed to open /proc/self/status\n");
-    return -1.0;
+    if(!announced_proc_failure) {
+      announced_proc_failure=1;
+      fprintf(stderr, "[RSS] failed to open /proc/self/status, cannot measure current memory usage. Falling back to peak memory usage measurement.\n");
+    }
+    return rss_gb();  /*Return peak memory usage if we can't measure current usage*/
   }
 
   char line[256];
@@ -801,7 +805,11 @@ static double current_rss_gb(void) {
   }
 
   fclose(f);
-  return -1.0;
+  if(!announced_proc_failure) {
+    announced_proc_failure=1;
+    fprintf(stderr, "[RSS] failed to find VmRSS in /proc/self/status, cannot measure current memory usage. Falling back to peak memory usage measurement.\n");
+  }
+  return rss_gb();   /*Return peak memory usage if we can't measure current usage*/
 }
 #endif
 /* ---- PROF=1: opt-in performance profile ----------------------------------
