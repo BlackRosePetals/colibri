@@ -60,6 +60,45 @@ def machine_info():
                     info["ram"] = f"{info['ram_gb']:.0f} GB"
                     break
         info["os"] = platform.platform()
+    elif sys.platform == "win32":
+        # ram_gb sizes the eviction write: a hardcoded 8.0 on a big box means the
+        # "cold" run is measured warm and published as cold (#1042). ctypes+winreg
+        # only — no new dependency.
+        try:
+            import ctypes
+
+            class _MEMSTATUS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            st = _MEMSTATUS()
+            st.dwLength = ctypes.sizeof(_MEMSTATUS)
+            if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+                raise OSError("GlobalMemoryStatusEx failed")
+            info["ram_gb"] = st.ullTotalPhys / 1073741824
+            info["ram"] = f"{info['ram_gb']:.0f} GB"
+        except Exception:
+            info["ram"] = "?"
+            info["ram_gb"] = 8.0
+
+        info["cpu"] = platform.processor() or "?"
+        try:
+            import winreg
+            k = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            info["cpu"] = winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
+            winreg.CloseKey(k)
+        except Exception:
+            pass
+        info["os"] = f"Windows {platform.release()} {platform.version()}"
     else:
         info["cpu"] = platform.processor() or "?"
         info["ram"] = "?"
@@ -105,6 +144,9 @@ def evict_cache(ram_gb, snap_dir=None):
 
     # Fallback: Write temp file larger than RAM
     size_mb = int(ram_gb) * 1024 + 1024
+    print(f"[datapoint] evicting page cache by writing {size_mb / 1024:.0f} GB "
+          f"to a temp file (no direct eviction on this platform; --no-evict skips)",
+          file=sys.stderr)
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=".evict") as f:
             chunk = b"\0" * (1 << 20)

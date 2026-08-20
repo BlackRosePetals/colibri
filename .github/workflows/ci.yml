@@ -501,19 +501,20 @@ jobs:
         # that before reading anything else out of a run.
         run: cd c && SNAP=./glm_tiny TF=1 COLI_TEMP=0 ./colibri 64 16 16
       - name: Structural efficiency tests
-        # test_cpu_vs_cpu_determinism is NOT in this list. Despite the name its
-        # second assertion is a tok/s stability bound (two runs within 25%), and
-        # the tiny replay is 15 ms end to end -- it measured 38.8% between two
-        # identical runs on a quiet local box, so a shared runner would make it
-        # flaky on day one. Its first assertion (hit-rate identical) IS a real
-        # determinism check and does hold; splitting the two is worth doing, but
-        # not silently from a CI change.
+        # test_cpu_vs_cpu_tok_s_stability is NOT in this list: it is a tok/s
+        # bound (two runs within 25%) over a ~15 ms tiny replay -- it measured
+        # 38.8% between two identical runs on a quiet local box, so a shared
+        # runner would make it flaky on day one. The determinism test (hit-rate
+        # identical across two greedy replays) carries no timing assertion any
+        # more, so it CAN run here -- and it is the one that catches stray
+        # threading / uninitialized state.
         run: |
           cd c
           python3 -m unittest -v \
             tests.test_inefficiency.TinyEfficiencyTest.test_telemetry_parses \
             tests.test_inefficiency.TinyEfficiencyTest.test_profile_phases_present_and_nonneg \
-            tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant
+            tests.test_inefficiency.TinyEfficiencyTest.test_disk_wait_not_dominant \
+            tests.test_inefficiency.TinyEfficiencyTest.test_cpu_vs_cpu_determinism
 
   # The token-exact parity gate from #7 (c/tests/test_cluster_sharding.py): the
   # engine's local CPU run must already reproduce the transformers oracle
