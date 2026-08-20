@@ -19,6 +19,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
+                           parse_k3_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
                            render_chat_v4, _dsv4_tool_calls, serve, split_thinking_reply,
                            stop_policy, tune_child_env)
@@ -101,12 +102,100 @@ class TemplateTest(unittest.TestCase):
             "G 1\n",
         )
 
-    def test_kimi_rejects_tools_and_unknown_roles(self):
-        with self.assertRaisesRegex(APIError, "Tool use"):
-            render_chat_kimi([{"role": "user", "content": "Hi"}],
-                             tools=[{"type": "function"}])
+    def test_kimi_renders_tool_declaration_and_choice(self):
+        tools = [{"type": "function", "function": {
+            "name": "get_weather", "parameters": {"type": "object"}}}]
+        body = ("# Tools\nHere are the available tools, described in JSONSchema.\n\n"
+                "```json\n" + json.dumps(tools, ensure_ascii=False, separators=(",", ":"),
+                                         sort_keys=True) + "\n```")
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}], tools=tools)
+        self.assertEqual(prompt, "K3CHAT1\n"
+                         f"Y 12 {len(body.encode('utf-8'))}\ntool-declare{body}"
+                         "M user 2\nHi"
+                         "G 0\n")
+        # tool_choice=none: the tools are not offered at all
+        self.assertEqual(render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                          tools=tools, tool_choice="none"),
+                         "K3CHAT1\nM user 2\nHiG 0\n")
+        # tool_choice=required appends the reference's tool-choice system message
+        prompt = render_chat_kimi([{"role": "user", "content": "Hi"}],
+                                  tools=tools, tool_choice="required")
+        self.assertIn("\ntool-choiceThe system is invoked with `tool_choice=required`.", prompt)
+        self.assertTrue(prompt.endswith("G 0\n"))
+
+    def test_kimi_renders_tool_calls_and_results(self):
+        messages = [
+            {"role": "user", "content": "Weather in Rome?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Rome", "days": 1e2, "metric": true}'}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+        ]
+        prompt = render_chat_kimi(messages)
+        # B: assistant turn carrying the call; V records keep the exact JSON
+        # literal for non-strings (1e2 stays 1e2) and decode strings.
+        self.assertIn("B 0 0 0 1\n", prompt)
+        self.assertIn("F 11 3\nget_weather", prompt)
+        self.assertIn("V 4 6 4\ncitystringRome", prompt)
+        self.assertIn("V 4 6 3\ndaysnumber1e2", prompt)
+        self.assertIn("V 6 7 4\nmetricbooleantrue", prompt)
+        # O: the result resolves its name through tool_call_id
+        self.assertIn("O 1 11 5\nget_weathersunny", prompt)
+
+    def test_kimi_tool_results_resort_by_call_id(self):
+        messages = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "a", "type": "function",
+                 "function": {"name": "first", "arguments": "{}"}},
+                {"id": "b", "type": "function",
+                 "function": {"name": "second", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "b", "content": "B"},
+            {"role": "tool", "tool_call_id": "a", "content": "A"},
+        ]
+        prompt = render_chat_kimi(messages)
+        # Results are re-sorted into tool_calls order, names resolved from ids.
+        self.assertIn("O 1 5 1\nfirstA", prompt)
+        self.assertIn("O 2 6 1\nsecondB", prompt)
+        self.assertLess(prompt.index("O 1 5 1"), prompt.index("O 2 6 1"))
+
+    def test_kimi_json_fallback_for_unparseable_arguments(self):
+        prompt = render_chat_kimi([
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "x", "type": "function", "function": {
+                    "name": "fn", "arguments": "not json"}}]}])
+        self.assertIn("J 2 8\nfnnot json", prompt)
+
+    def test_kimi_still_rejects_unknown_roles(self):
         with self.assertRaisesRegex(APIError, "Unsupported role"):
-            render_chat_kimi([{"role": "tool", "content": "result"}])
+            render_chat_kimi([{"role": "critic", "content": "hm"}])
+        with self.assertRaisesRegex(APIError, "resolvable tool name"):
+            render_chat_kimi([{"role": "tool", "content": "orphan result"}])
+
+    def test_kimi_parses_generated_tool_calls(self):
+        reply = ('Sure.<|open|>tools<|sep|>'
+                 '<|open|>call tool="get_weather" index="1"<|sep|>'
+                 '<|open|>argument key="city" type="string"<|sep|>Rome<|close|>argument<|sep|>'
+                 '<|open|>argument key="days" type="number"<|sep|>1e2<|close|>argument<|sep|>'
+                 '<|close|>call<|sep|>'
+                 '<|close|>tools<|sep|>')
+        text, calls = parse_k3_tool_calls(reply)
+        self.assertEqual(text, "Sure.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "get_weather")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 100.0})
+
+    def test_kimi_parses_json_block_and_unclosed_tail(self):
+        reply = ('<|open|>tools<|sep|>'
+                 '<|open|>call tool="a&amp;b" index="1"<|sep|>'
+                 '<|open|>json type="object"<|sep|>{"x":1}<|close|>json<|sep|>'
+                 '<|close|>call<|sep|>')       # tools block never closed: budget ran out
+        text, calls = parse_k3_tool_calls(reply)
+        self.assertEqual(text, "")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "a&b")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"x":1}')
 
     def test_kimi_preserves_prior_reasoning_channel(self):
         self.assertEqual(

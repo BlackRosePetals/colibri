@@ -2155,6 +2155,41 @@ static void chat_assistant(ChatB *b, const char *reasoning, const char *text){
     cb_close(b,"message"); cb_special(b,b->sp_eom);
 }
 
+/* ---- tool-call XTML (#1143) -----------------------------------------------
+ * Attribute segmentation mirrors the reference renderer (encoding_k3.py):
+ * " key", "=\"", the escaped value, and "\"" are each their OWN text segment.
+ * Segment boundaries are token boundaries under K3's rank-BPE, so the split
+ * is part of the format, not a style choice. Values escape & -> &amp; and
+ * " -> &quot;, exactly the reference's _escape_attr_value. */
+static void cb_attr(ChatB *b, const char *key, const char *val){
+    char kb[80]; snprintf(kb,sizeof kb," %s",key); cb_text(b,kb);
+    cb_text(b,"=\"");
+    size_t n=strlen(val), extra=0;
+    for(size_t i=0;i<n;i++) extra += val[i]=='&'?4u : val[i]=='"'?5u : 0u;
+    char *esc=malloc(n+extra+1);
+    if(!esc){ fprintf(stderr,"OOM chat attr\n"); exit(1); }
+    char *w=esc;
+    for(size_t i=0;i<n;i++){
+        if(val[i]=='&'){ memcpy(w,"&amp;",5); w+=5; }
+        else if(val[i]=='"'){ memcpy(w,"&quot;",6); w+=6; }
+        else *w++=val[i];
+    }
+    *w=0; cb_text(b,esc); free(esc);
+    cb_text(b,"\"");
+}
+/* open tag with caller-supplied attributes: cb_open_begin, cb_attr..., cb_end */
+static void cb_open_begin(ChatB *b, const char *tag){ cb_special(b,b->sp_open); cb_text(b,tag); }
+static void cb_end(ChatB *b){ cb_special(b,b->sp_sep); }
+
+/* Is a generated XTML tag part of the tool-call structure? Open tags carry
+ * attributes ("call tool=\"x\" index=\"1\""), close tags are the bare name. */
+static int k3_tool_tag(const char *t){
+    return (!strncmp(t,"tools",5)   &&(t[5]==0||t[5]==' ')) ||
+           (!strncmp(t,"call",4)    &&(t[4]==0||t[4]==' ')) ||
+           (!strncmp(t,"argument",8)&&(t[8]==0||t[8]==' ')) ||
+           (!strncmp(t,"json",4)    &&(t[4]==0||t[4]==' '));
+}
+
 /* Internal gateway payload. Length framing keeps arbitrary UTF-8/newlines in
  * message content while preserving the segment boundaries required by K3's
  * rank-BPE chat template:
@@ -2194,6 +2229,93 @@ static int chat_build_wire(Tok *T, const char *wire, int nwire, int *thinking,
             memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
             chat_assistant(&b,reason,text);
             free(reason); free(text); p=nl+1+nr+nt; continue;
+        }
+        if(*p=='Y'){                /* typed system message (#1143): tool-declare / tool-choice */
+            int ntp=-1, nb=-1;
+            if(sscanf(p,"Y %d %d",&ntp,&nb)!=2||ntp<1||ntp>64||nb<0||nl+1+ntp+nb>end) return -1;
+            char *typ=malloc((size_t)ntp+1), *body=malloc((size_t)nb+1);
+            if(!typ||!body){ fprintf(stderr,"OOM chat typed-system\n"); exit(1); }
+            memcpy(typ,nl+1,(size_t)ntp); typ[ntp]=0;
+            memcpy(body,nl+1+ntp,(size_t)nb); body[nb]=0;
+            cb_open_begin(&b,"message"); cb_attr(&b,"role","system"); cb_attr(&b,"type",typ); cb_end(&b);
+            cb_text(&b,body);
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            free(typ); free(body); p=nl+1+ntp+nb; continue;
+        }
+        if(*p=='O'){                /* tool result (#1143): O <index> <name-len> <content-len> */
+            int idx=-1, nn=-1, nb=-1;
+            if(sscanf(p,"O %d %d %d",&idx,&nn,&nb)!=3||idx<1||nn<1||nn>256||nb<0||nl+1+nn+nb>end) return -1;
+            char *name=malloc((size_t)nn+1), *body=malloc((size_t)nb+1);
+            if(!name||!body){ fprintf(stderr,"OOM chat tool-result\n"); exit(1); }
+            memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+            memcpy(body,nl+1+nn,(size_t)nb); body[nb]=0;
+            char ib[16]; snprintf(ib,sizeof ib,"%d",idx);
+            cb_open_begin(&b,"message"); cb_attr(&b,"role","tool");
+            cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+            cb_text(&b,body);
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            free(name); free(body); p=nl+1+nn+nb; continue;
+        }
+        if(*p=='B'){                /* assistant WITH tool calls (#1143):
+                                     * B <think> <nr> <nt> <ncalls>\n<reason><text>
+                                     * then ncalls of  F <name-len> <nargs>\n<name>
+                                     *                   (+ nargs of V <key-len> <type-len> <val-len>\n<key><type><val>)
+                                     * or               J <name-len> <json-len>\n<name><json> */
+            int th=-1, nr=-1, nt=-1, nc=-1;
+            if(sscanf(p,"B %d %d %d %d",&th,&nr,&nt,&nc)!=4||th<0||th>1||nr<0||nt<0||
+               nc<1||nc>64||nl+1+nr+nt>end) return -1;
+            char *reason=malloc((size_t)nr+1), *text=malloc((size_t)nt+1);
+            if(!reason||!text){ fprintf(stderr,"OOM chat assistant-tools\n"); exit(1); }
+            memcpy(reason,nl+1,(size_t)nr); reason[nr]=0;
+            memcpy(text,nl+1+nr,(size_t)nt); text[nt]=0;
+            cb_open(&b,"message","assistant");
+            if(th){ cb_open(&b,"think",NULL); cb_text(&b,reason); cb_close(&b,"think"); }
+            cb_open(&b,"response",NULL); cb_text(&b,text); cb_close(&b,"response");
+            free(reason); free(text);
+            cb_open(&b,"tools",NULL);
+            p=nl+1+nr+nt;
+            for(int ci=0;ci<nc;ci++){
+                nl=memchr(p,'\n',(size_t)(end-p)); if(!nl) return -1;
+                char ib[16]; snprintf(ib,sizeof ib,"%d",ci+1);
+                if(*p=='J'){
+                    int nn=-1, nj=-1;
+                    if(sscanf(p,"J %d %d",&nn,&nj)!=2||nn<1||nn>256||nj<0||nl+1+nn+nj>end) return -1;
+                    char *name=malloc((size_t)nn+1), *js=malloc((size_t)nj+1);
+                    if(!name||!js){ fprintf(stderr,"OOM chat tool-call\n"); exit(1); }
+                    memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+                    memcpy(js,nl+1+nn,(size_t)nj); js[nj]=0;
+                    cb_open_begin(&b,"call"); cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+                    cb_open_begin(&b,"json"); cb_attr(&b,"type","object"); cb_end(&b);
+                    cb_text(&b,js); cb_close(&b,"json"); cb_close(&b,"call");
+                    free(name); free(js); p=nl+1+nn+nj;
+                } else if(*p=='F'){
+                    int nn=-1, na=-1;
+                    if(sscanf(p,"F %d %d",&nn,&na)!=2||nn<1||nn>256||na<0||na>64||nl+1+nn>end) return -1;
+                    char *name=malloc((size_t)nn+1);
+                    if(!name){ fprintf(stderr,"OOM chat tool-call\n"); exit(1); }
+                    memcpy(name,nl+1,(size_t)nn); name[nn]=0;
+                    cb_open_begin(&b,"call"); cb_attr(&b,"tool",name); cb_attr(&b,"index",ib); cb_end(&b);
+                    free(name); p=nl+1+nn;
+                    for(int ai=0;ai<na;ai++){
+                        nl=memchr(p,'\n',(size_t)(end-p)); if(!nl) return -1;
+                        int nk=-1, ntp=-1, nv=-1;
+                        if(sscanf(p,"V %d %d %d",&nk,&ntp,&nv)!=3||nk<1||nk>256||ntp<1||ntp>16||
+                           nv<0||nl+1+nk+ntp+nv>end) return -1;
+                        char *key=malloc((size_t)nk+1), *typ=malloc((size_t)ntp+1), *val=malloc((size_t)nv+1);
+                        if(!key||!typ||!val){ fprintf(stderr,"OOM chat tool-arg\n"); exit(1); }
+                        memcpy(key,nl+1,(size_t)nk); key[nk]=0;
+                        memcpy(typ,nl+1+nk,(size_t)ntp); typ[ntp]=0;
+                        memcpy(val,nl+1+nk+ntp,(size_t)nv); val[nv]=0;
+                        cb_open_begin(&b,"argument"); cb_attr(&b,"key",key); cb_attr(&b,"type",typ); cb_end(&b);
+                        cb_text(&b,val); cb_close(&b,"argument");
+                        free(key); free(typ); free(val); p=nl+1+nk+ntp+nv;
+                    }
+                    cb_close(&b,"call");
+                } else return -1;
+            }
+            cb_close(&b,"tools");
+            cb_close(&b,"message"); cb_special(&b,b.sp_eom);
+            continue;
         }
         char role[16]; int nb=-1;
         if(sscanf(p,"M %15s %d",role,&nb)!=2||nb<0||nl+1+nb>end) return -1;
@@ -2426,7 +2548,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         return poll.fatal?-1:0;
     }
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
-    char buf[512], xtag[64];
+    char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
     for(int s=0;s<q->max_tok&&!cancelled;s++){
         int tk=sample_tok(lo,m->c.vocab,q->temp,q->top_p);
@@ -2441,6 +2563,15 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
                     xsup=0; xtag[xtl]=0;
                     if(xopen&&!strcmp(xtag,"response")&&thinking)
                         serve_data(q->id,"</think>",8);
+                    else if(k3_tool_tag(xtag)){
+                        /* #1143: re-emit tool-call structure literally so the gateway can
+                         * parse it back into OpenAI tool_calls. Everything else XTML stays
+                         * suppressed as before; the gateway strips these markers from the
+                         * client-visible deltas the same way the GLM path does. */
+                        char lb[352];
+                        int n=snprintf(lb,sizeof lb,"%s%s<|sep|>",xopen?"<|open|>":"<|close|>",xtag);
+                        if(n>0&&n<(int)sizeof lb) serve_data(q->id,lb,n);
+                    }
                 }
                 show=0;
             } else if(xsup){
