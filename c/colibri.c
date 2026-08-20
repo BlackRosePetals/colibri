@@ -7026,8 +7026,13 @@ static void intr_install(void){}
  * a mux spec turn is running and are reset at each turn boundary, so every other
  * spec_decode caller (chat, run, oracle) sees them permanently 0. */
 static volatile sig_atomic_t g_mux_stop=0, g_mux_cancel=0;
+/* emit callback contract (U7a): `lo` is the vocab-sized logit row the token
+ * was picked or verified from -- live only for the duration of the call.
+ * Accepted DRAFT tokens get their verification row, so the per-token numeric
+ * channel has no gap on the speculative path (they bypass every pick_tok
+ * call site in the mux loop). Callers that don't need it ignore it. */
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
-                       void (*emit)(int,void*), void *ud, int *kv_out, float **logit_out){
+                       void (*emit)(int,const float*,void*), void *ud, int *kv_out, float **logit_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
@@ -7050,9 +7055,9 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
     uint64_t cp_prop0=g_corp_prop, cp_acc0=g_corp_acc; int cp_pause=0;
     while(emitted<n_new && !done && !g_intr && !g_mux_stop && !g_mux_cancel){
         /* g_intr / g_mux_*: stessa uscita del tetto n_new (#678) */
-        int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
-        if((eos>=0 && next==eos) || is_stop(next)) break;
-        emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
+        int next=pick_tok(logit,V,carry_ban); carry_ban=-1;
+        if((eos>=0 && next==eos) || is_stop(next)){ free(logit); logit=NULL; break; }
+        emit(next,logit,ud); free(logit); logit=NULL; all[kv]=next; emitted++; m->n_emit++;
         gr_feed(&g_grd,next);                           /* il walker segue l'output emesso */
         /* One-shot generation does not need logits or KV for the last token.
          * Stateful callers do: their kv_out becomes chat history, feeds MORE,
@@ -7126,7 +7131,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
                    accept = (rndu() < g_pbuf[draft[k]]); }
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
-            emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
+            emit(draft[k],lo+(int64_t)k*V,ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
             gr_feed(&g_grd,draft[k]); k++;
         }
         if(gsrc==1) g_grd.acc+=(uint64_t)k;
@@ -7152,10 +7157,11 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
 
 /* emit callback: accumula in un array (validazione) */
 typedef struct { int *dst; int n; } EmitStore;
-static void emit_store(int t, void *ud){ EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
+static void emit_store(int t, const float *lo, void *ud){ (void)lo; EmitStore *e=(EmitStore*)ud; e->dst[e->n++]=t; }
 /* emit callback: detokenizza e stampa in streaming (chat/run), con heartbeat */
 typedef struct { Tok *T; Model *m; double t0; int count; int quiet; } EmitStream;
-static void emit_stream(int t, void *ud){
+static void emit_stream(int t, const float *lo, void *ud){
+    (void)lo;
     EmitStream *e=(EmitStream*)ud; char dec[64];
     int dn=tok_decode(e->T,&t,1,dec,63); dec[dn]=0; fputs(dec,stdout); fflush(stdout);
     if(!e->quiet && ++e->count%16==0){ double tt=e->m->hits+e->m->miss;
@@ -7942,6 +7948,8 @@ typedef struct {
     float *spec_logit;                   /* continuation logits between chunks; NULL = the last
                                             emitted token sits at hist[len], not yet forwarded */
     unsigned long long id;
+    int logprobs;                        /* per-token numeric channel (U7a): requested
+                                            top-k count from SUBMIT logprobs=k; 0 = off */
     float temp, top_p;
     double started;
     uint64_t hits0, miss0;
@@ -7949,10 +7957,97 @@ typedef struct {
                                             feeds the PROF protocol line and the PROF=1 report */
 } ServeReq;
 
-static void mux_data(Tok *T, unsigned long long id, int token){
+/* Numeric tail shared by opted-in DATA and ECHO frames (U7a): writes
+ * " <lp> <k> [<tid> <tlp>]*k" into dst. lp = log-softmax of `token` over the
+ * logit row; the top-k table selects by logit (identical order to selecting
+ * by log-probability) and is UNSORTED, same as run_ablate_score's tk output.
+ * The token's own entry, when it appears in the table, is the SAME double as
+ * lp printed through the same format -- the bit-identity the harness's
+ * is_greedy check depends on. lo==NULL (an echo's position 0: nothing to
+ * condition on) writes " nan 0"; the server maps that to OpenAI's null.
+ * k is capped by COLI_SUBMIT_TOPK_MAX (=32, run_ablate_score's ceiling). */
+static int logprob_tail(char *dst, size_t cap, const float *lo, int V, int token, int topk){
+    int tk_id[COLI_SUBMIT_TOPK_MAX]; float tk_val[COLI_SUBMIT_TOPK_MAX];
+    int w;
+    if(!lo || token<0 || token>=V) return snprintf(dst,cap," nan 0");
+    if(topk>COLI_SUBMIT_TOPK_MAX) topk=COLI_SUBMIT_TOPK_MAX;
+    if(topk>V) topk=V;
+    float mx=lo[0]; for(int i=1;i<V;i++) if(lo[i]>mx) mx=lo[i];
+    double se=0; for(int i=0;i<V;i++) se+=exp((double)lo[i]-mx);
+    double logZ=(double)mx+log(se);
+    for(int k=0;k<topk;k++){ tk_id[k]=-1; tk_val[k]=-1e30f; }
+    for(int i=0;i<V;i++){ float v=lo[i];
+        int mn=0; for(int k=1;k<topk;k++) if(tk_val[k]<tk_val[mn]) mn=k;
+        if(v>tk_val[mn]){ tk_val[mn]=v; tk_id[mn]=i; } }
+    w=snprintf(dst,cap," %.6f %d",(double)lo[token]-logZ,topk);
+    for(int k=0;k<topk && w>0 && (size_t)w<cap;k++)
+        w+=snprintf(dst+w,cap-(size_t)w," %d %.6f",tk_id[k],(double)tk_val[k]-logZ);
+    return w;
+}
+
+/* One generated token -> one DATA frame. Opted-in requests (SUBMIT logprobs=k)
+ * carry the numeric channel in the header: "DATA <id> <n> <lp> <k> [tid tlp]*k";
+ * opt-out requests keep the exact legacy 3-field frame, byte for byte -- an old
+ * server (whose dispatcher hard-fails on unknown framing) can only ever be
+ * paired with requests that never opt in, so it never sees the extended form. */
+static void mux_data(Tok *T, unsigned long long id, int token,
+                     const float *lo, int V, int topk){
     char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
-    printf("DATA %llu %d\n",id,n); if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
+    if(topk>0 && lo){
+        char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+        printf("DATA %llu %d%s\n",id,n,tail);
+    } else
+        printf("DATA %llu %d\n",id,n);
+    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
     fflush(stdout);
+}
+
+/* Echoed-prompt read-out frame (U7a, opt-in only): "ECHO <id> <n> <pos> <lp>
+ * <k> [tid tlp]*k" + payload framed exactly like DATA (n bytes + '\n').
+ * One frame per prompt position, in position order, BEFORE any DATA frame;
+ * position 0 carries " nan 0" (nothing to condition on). Never emitted unless
+ * the request set SUBMIT logprobs=k, so an old server can never receive one. */
+static void mux_echo(Tok *T, unsigned long long id, int pos, int token,
+                     const float *lo, int V, int topk){
+    char out[256]; int n=tok_decode(T,&token,1,out,sizeof(out));
+    char tail[1024]; logprob_tail(tail,sizeof(tail),lo,V,token,topk);
+    printf("ECHO %llu %d %d%s\n",id,n,pos,tail);
+    if(n>0) fwrite(out,1,(size_t)n,stdout); putchar('\n');
+    fflush(stdout);
+}
+
+/* Opt-in prefill read-out (U7a, SUBMIT logprobs=k): one full-prompt forward
+ * whose per-position hidden states are read out through lm_head -- one ECHO
+ * frame per prompt position. Structurally run_score's loop, but live inside
+ * the serve path and gated per request instead of a launch-env-gated
+ * exit-early mode. Cost: one vocab-sized lm_head matmul per prompt position
+ * (P x vocab, P = prompt length), paid ONLY by requests that opted in; the
+ * opt-out path keeps step()'s single last-position lm_head untouched.
+ * Returns the last position's logits (step()'s contract) as the generation
+ * continuation. The caller resets the slot to len 0 first: the read-out
+ * needs logits at EVERY position, so this path takes no cached-prefix skip
+ * and no cross-slot KV adoption (KV rows [0,nt) are rewritten in full). */
+static float *mux_prefill_echo(Model *m, Tok *T, unsigned long long id,
+                               const int *ids, int nt, int topk){
+    Cfg *c=&m->c; int D=c->hidden, V=c->vocab;
+    float *x=falloc((int64_t)nt*D);
+    for(int s=0;s<nt;s++) embed_row(m, ids[s], x+(int64_t)s*D);
+    layers_forward(m,x,nt,0);
+    if(m->hlast) memcpy(m->hlast, x+(int64_t)(nt-1)*D, D*sizeof(float));
+    if(m->has_mtp && nt>=2 && g_draft>0) mtp_absorb(m, ids+1, x, nt-1, 0);  /* same as step() */
+    float *lo=falloc(V), *row=falloc(D);
+    mux_echo(T,id,0,ids[0],NULL,V,0);
+    double th0=now_s();
+    for(int pos=1; pos<nt; pos++){
+        rmsnorm(row, x+(int64_t)(pos-1)*D, m->final_norm, D, c->eps);
+        matmul_qt(lo, row, &m->lm_head, 1);
+        mux_echo(T,id,pos,ids[pos],lo,V,topk);
+    }
+    rmsnorm(row, x+(int64_t)(nt-1)*D, m->final_norm, D, c->eps);
+    matmul_qt(lo, row, &m->lm_head, 1);
+    m->t_head += now_s()-th0;
+    free(x); free(row);
+    return lo;                           /* last position: the generation continuation */
 }
 
 /* #678: non-blocking stdin poll while a single-slot spec turn is running. Consumes
@@ -8005,10 +8100,13 @@ static void mux_ctl_poll(unsigned long long id){
     }
 }
 
-/* emit callback for the single-slot speculative path: stream straight to the mux protocol */
-typedef struct { Tok *T; unsigned long long id; } MuxEmit;
-static void mux_spec_emit(int t, void *ud){
-    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t);
+/* emit callback for the single-slot speculative path: stream straight to the mux
+ * protocol. `lo` is the row the token was picked/verified from (spec_decode's
+ * emit contract) -- accepted draft tokens included, so opted-in requests get a
+ * numeric value on EVERY generated token, with no speculative-path gap. */
+typedef struct { Tok *T; unsigned long long id; int V, logprobs; } MuxEmit;
+static void mux_spec_emit(int t, const float *lo, void *ud){
+    MuxEmit *e=(MuxEmit*)ud; mux_data(e->T,e->id,t,lo,e->V,e->logprobs);
     mux_ctl_poll(e->id);                 /* #678: honor STOP/CANCEL within ~1 token */
 }
 
@@ -8134,7 +8232,20 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * mid-markup and emitted a bare "<". Retries were identical because the surviving *head*
      * never changes when a client appends to the end (hence "prefill 0" on every retry).
      * Refuse loudly instead; the gateway turns this into a 400 context_length_exceeded. */
-    int nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
+    int nt;
+    if(sub.tok_ids){
+        /* Pre-tokenized intake (SUBMIT ids=1, U7a): the payload is ASCII token
+         * ids fed straight into the same tmp[] buffer the text path fills --
+         * identical embedding/position machinery downstream, no tok_encode, no
+         * detokenize/re-encode round trip. Same one-token headroom contract as
+         * the text arm above (coli_ids_parse reports the cap on overflow). */
+        nt=coli_ids_parse(raw,(size_t)sub.bytes,tmp,maxctx-1,m->c.vocab);
+        if(nt<0){
+            free(tmp); free(raw); free(line);
+            printf("ERROR %llu BAD_REQUEST\n",sub.id); fflush(stdout); return 0;
+        }
+    } else
+        nt=tok_encode(T,raw,(int)sub.bytes,tmp,maxctx-1);
     free(raw); free(line);
     if(nt<1){ free(tmp); printf("ERROR %llu EMPTY_PROMPT\n",sub.id); fflush(stdout); return 0; }
     if(nt>maxctx-2){
@@ -8150,7 +8261,12 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * first with an ERROR, so a request yields exactly one of ACCEPT or an early ERROR -- which
      * lets a CONTEXT_EXCEEDED become a clean HTTP 400 instead of a broken already-200 stream. */
     printf("ACCEPT %llu %d\n",sub.id,nt); fflush(stdout);
-    int prefix=0; while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
+    /* Echo read-out (U7a): needs logits at EVERY prompt position, so the whole
+     * prompt re-prefills from position 0 -- no cached-prefix skip and no
+     * cross-slot adoption below (either would leave positions with no logits). */
+    int echo = sub.logprobs>0;
+    int prefix=0;
+    if(!echo) while(prefix<sc->len && prefix<nt && sc->hist[prefix]==tmp[prefix]) prefix++;
     if(prefix<sc->len){ sc->len=prefix; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
         kv_disk_truncate(m,sc->len); }
     /* Cross-slot prefix adoption (COLI_KV_SHARE=1) — RadixAttention's benefit
@@ -8165,7 +8281,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
      * generated tokens identical to the full-prefill run. */
     static int kvshare=-1;
     if(kvshare<0) kvshare=getenv("COLI_KV_SHARE")?atoi(getenv("COLI_KV_SHARE")):0;
-    if(kvshare && nctx>1 && prefix>=sc->len){
+    if(kvshare && !echo && nctx>1 && prefix>=sc->len){
         int best=-1, blen=sc->len;
         for(int i=0;i<nctx;i++){
             if(i==sub.slot) continue;
@@ -8202,11 +8318,13 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
     if(add>0) memcpy(sc->hist+sc->len,tmp+sc->len,(size_t)add*sizeof(int));
     fprintf(stderr,"[API] KV slot %d prefix %d/%d token, prefill %d\n",sub.slot,sc->len,nt,add);
     free(tmp);
-    float *logit = add>0 ? step(m,sc->hist+sc->len,add,sc->len)
-                         : step(m,sc->hist+sc->len-1,1,sc->len-1);
+    float *logit = echo ? mux_prefill_echo(m,T,sub.id,sc->hist,nt,sub.logprobs)
+                        : add>0 ? step(m,sc->hist+sc->len,add,sc->len)
+                                : step(m,sc->hist+sc->len-1,1,sc->len-1);
     sc->len+=add; sc->first=0;
     ServeReq *r=&req[sub.slot]; memset(r,0,sizeof(*r));
     r->id=sub.id; r->maximum=sub.max_tokens; r->temp=sub.temperature; r->top_p=sub.top_p;
+    r->logprobs=sub.logprobs;
     r->prompt_tokens=nt; r->started=now_s(); r->hits0=m->hits; r->miss0=m->miss;
     prof_base(m,&r->pb);                 /* a few loads: cheap enough to always track */
     /* Clamp to the KV room WITHOUT flagging: length_limited must mean "the
@@ -8228,12 +8346,13 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, GrDraft *g
         r->spec=1; r->spec_logit=logit; r->active=1;
         return 1;
     }
-    int next=pick_tok(logit,m->c.vocab,-1); free(logit);
-    if(r->maximum<=0){ r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
-    if(next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
+    int next=pick_tok(logit,m->c.vocab,-1);
+    if(r->maximum<=0){ free(logit); r->length_limited=1; mux_done(m,sc,r); return 1; }   /* no room at all */
+    if(next==eos || is_stop(next)){ free(logit); mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
     if(grd[sub.slot].on){ grammar_reset(&grd[sub.slot]); gr_feed(&grd[sub.slot],next); }
-    mux_data(T,r->id,next);
+    mux_data(T,r->id,next,logit,m->c.vocab,r->logprobs);
+    free(logit);
     if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
     return 1;
 }
@@ -8329,7 +8448,7 @@ static void run_serve_mux(Model *m, const char *snap){
                 kv_bind(m,&sc->kv);
                 g_temp=r->temp; g_nuc=r->top_p;
                 float *lg=r->spec_logit; r->spec_logit=NULL;   /* spec_decode takes ownership */
-                MuxEmit ud={&T,r->id};
+                MuxEmit ud={&T,r->id,m->c.vocab,r->logprobs};
                 g_mux_stop=0; g_mux_cancel=0;                  /* fresh per turn (#678) */
                 int prod=spec_decode(m,sc->hist,sc->len,r->maximum-r->emitted,eos,lg,
                                      mux_spec_emit,&ud,&sc->len,NULL);
@@ -8370,7 +8489,7 @@ static void run_serve_mux(Model *m, const char *snap){
                     if(next==eos || is_stop(next)){ mux_done(m,sc,r); done=1; break; }
                     r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
                     if(gd->on) gr_feed(gd,next);
-                    mux_data(&T,r->id,next);
+                    mux_data(&T,r->id,next,lo+(int64_t)j*m->c.vocab,m->c.vocab,r->logprobs);
                     if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); done=1; break; }
                     if(j<k){
                         if(next!=draft[j]) break;    /* rejected: seq[j+1..] stale, overwritten next forward */
@@ -8394,7 +8513,7 @@ static void run_serve_mux(Model *m, const char *snap){
             if(next==eos || is_stop(next)){mux_done(m,sc,r);continue;}
             r->pending=next; sc->hist[sc->len]=next; r->emitted++; m->n_emit++;
             if(grd[i].on) gr_feed(&grd[i],next);   /* walker stays in sync when not drafting */
-            mux_data(&T,r->id,next);
+            mux_data(&T,r->id,next,lo+(int64_t)s*m->c.vocab,m->c.vocab,r->logprobs);
             if(r->emitted>=r->maximum){ r->length_limited=1; mux_done(m,sc,r); }
         }
         free(lo);

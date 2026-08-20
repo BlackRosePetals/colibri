@@ -2137,7 +2137,14 @@ class Engine:
                 if not fields:
                     continue
                 kind = fields[0]
-                if kind == "DATA" and len(fields) == 3:
+                if kind == "DATA" and len(fields) >= 3:
+                    # 3 fields: the legacy frame. More: the U7a per-token
+                    # numeric channel ("DATA <id> <n> <lp> <k> [tid tlp]*k"),
+                    # emitted only for requests that opted in via the SUBMIT
+                    # logprobs field. The payload framing is identical; the
+                    # numeric fields are consumed by the server feature half
+                    # (U7b) -- accepted here so the frame never kills the
+                    # dispatcher (and with it every in-flight request).
                     request_id = fields[1]
                     size = int(fields[2])
                     if not 0 <= size <= 65536:
@@ -2149,6 +2156,19 @@ class Engine:
                         events = self.pending.get(request_id)
                     if events is not None:
                         events.put(("data", data))
+                elif kind == "ECHO" and len(fields) >= 6:
+                    # U7a prefill read-out: "ECHO <id> <n> <pos> <lp> <k>
+                    # [tid tlp]*k" plus a DATA-framed payload (n bytes + LF).
+                    # Emitted only for opted-in requests; no current request
+                    # path opts in, so the frame is read (to keep the stream
+                    # in sync) and dropped -- U7b delivers it to the response
+                    # assembly when it wires the opt-in.
+                    size = int(fields[2])
+                    if not 0 <= size <= 65536:
+                        raise RuntimeError("invalid engine DATA size")
+                    self._read_exact(size)
+                    if self._read_exact(1) != b"\n":
+                        raise RuntimeError("invalid engine DATA terminator")
                 elif kind == "ACCEPT" and len(fields) >= 3:
                     # #597: the engine validated the submission (fits context) before prefill.
                     # Keep it pending — DATA/DONE still follow — and let generate() commit the

@@ -804,6 +804,57 @@ class DispatcherTest(unittest.TestCase):
             "attention_s": 0.6, "lm_head_s": 0.2, "forwards": 15,
         }])
 
+    def test_accepts_u7a_echo_and_extended_data_frames(self):
+        # U7a forward-compat: the engine's opt-in per-token numeric channel --
+        # ECHO frames for echoed prompt positions and DATA frames extended
+        # with "<lp> <k> [tid tlp]*k" -- must NOT trip the dispatcher's
+        # catch-all (which kills every in-flight request). Text delivery and
+        # the DONE stats stay exactly as for legacy frames; the numeric
+        # fields are consumed by the server feature half (U7b).
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"ACCEPT " + request_id + b" 3\n")
+            process.stdout.feed(b"ECHO " + request_id + b" 2 0 nan 0\nHi\n")
+            process.stdout.feed(
+                b"ECHO " + request_id +
+                b" 6 1 -0.105361 2 7 -0.105361 9 -2.302585\n world\n")
+            process.stdout.feed(
+                b"ECHO " + request_id +
+                b" 1 2 -1.203973 2 4 -0.803973 6 -1.203973\n!\n")
+            process.stdout.feed(
+                b"DATA " + request_id +
+                b" 2 -0.223144 2 3 -0.223144 8 -1.723144\nok\n")
+            process.stdout.feed(
+                b"DONE " + request_id + b" STAT 1 2.5 0 1.0 3 0\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        chunks = []
+        stats = engine.generate("Hi world!", 4, 0.0, 1.0, chunks.append)
+        self.assertEqual(chunks, ["ok"])
+        self.assertEqual(stats["completion_tokens"], 1)
+        self.assertEqual(stats["prompt_tokens"], 3)
+        self.assertIsNone(engine.dispatcher_error)
+        engine.close()
+
+    def test_unknown_frame_still_stops_dispatcher(self):
+        # The catch-all that makes an unrecognized frame a hard failure is
+        # load-bearing for the U7a compatibility asymmetry (a new engine's
+        # frame reaching an OLD server kills the dispatcher -- the reason the
+        # engine half ships first and stays opt-in). Accepting ECHO/extended
+        # DATA must not have widened acceptance beyond those frames.
+        def respond(process, frame):
+            request_id = frame.split()[1]
+            process.stdout.feed(b"LOGPROB " + request_id + b" 0.5\n")
+
+        process = FakeProcess(respond)
+        with patch("openai_server.subprocess.Popen", return_value=process):
+            engine = Engine("glm", "model")
+        with self.assertRaisesRegex(RuntimeError, "invalid engine response: LOGPROB"):
+            engine.generate("hello", 4, 0.7, 0.9, lambda _: None)
+        engine.close()
+
     def test_cancels_generation_after_consumer_disconnects(self):
         request_id = None
 
