@@ -364,6 +364,16 @@ the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
 `COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
 usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
 
+**Reproducible greedy runs (#1136):** on this engine, greedy text legitimately
+varies with the expert-cache state — hot experts run the vectorized `rows16`
+kernel, cold ones run the reference matvec, the two accumulate in different
+orders, and which experts are hot follows the autopin history (`.coli_usage`,
+rewritten by every run). For byte-identical output across runs, either freeze
+the history (`USAGE_SAVE=0`, after seeding it once) or remove the variable
+entirely (`COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 USAGE_SAVE=0`: reference kernels
+only, no history). Details in
+[deepseek-v4.md — CPU-only behaviour](deepseek-v4.md).
+
 ## OLMoE engine (`olmoe`)
 
 Read **only** by `c/olmoe.c`. This is the sister engine used for streaming-cache research, so most of these are experiment knobs.
