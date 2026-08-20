@@ -4487,8 +4487,55 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         m->t_attn += now_s()-ta0;
         return;
     }
-    float *kvb_all=falloc((int64_t)Tk*kvb_dim);
-    matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    /* #768 follow-up (DSA): the loops below read only the top-keep rows, yet the
+     * one-shot matmul rebuilt ALL Tk rows — the same 30 GB paid for a top-k read.
+     * Past the same ceiling, rebuild only the UNION of selected rows: each row's
+     * rebuild is independent and the read order (jj along each tlist) is unchanged,
+     * so this is bit-identical to the one-shot path. Rows with ns==0 scan their full
+     * causal range and force those rows into the union; if the union does not at
+     * least halve the buffer, fall back to one-shot (gather overhead without the
+     * memory win). kvb_map: row t -> compact index, -1 = not rebuilt (never read). */
+    float *kvb_all=NULL; int32_t *kvb_map=NULL;
+    if(dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576){
+        uint8_t *want=calloc((size_t)kvb_rows,1);
+        if(want){
+            for(int s=0;s<S;s++){
+                int ns=dnsel[s];
+                if(ns>0){ const int *tl=dsel+(int64_t)s*dtopk;
+                    for(int j=0;j<ns;j++){ int64_t r=(int64_t)tl[j]-stL;
+                        if(r>=0&&r<kvb_rows) want[r]=1; } }
+                else { int64_t upto=(int64_t)pos_base+s+1-stL;
+                    if(upto>kvb_rows) upto=kvb_rows;
+                    if(upto>0) memset(want,1,(size_t)upto); }
+            }
+            int64_t un=0; for(int64_t r=0;r<kvb_rows;r++) if(want[r]) un++;
+            if(un>0 && un<kvb_rows/2){
+                kvb_map=malloc((size_t)kvb_rows*sizeof(int32_t));
+                if(kvb_map){
+                    float *Lg=falloc(un*c->kv_lora); int64_t w=0;
+                    for(int64_t r=0;r<kvb_rows;r++){
+                        if(want[r]){ memcpy(Lg+w*c->kv_lora,
+                                m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
+                                (size_t)c->kv_lora*sizeof(float));
+                            kvb_map[r]=(int32_t)w; w++; }
+                        else kvb_map[r]=-1;
+                    }
+                    kvb_all=falloc(un*kvb_dim);
+                    matmul_qt(kvb_all, Lg, &l->kv_b, (int)un);
+                    free(Lg);
+                    static int said_dsa; if(!said_dsa){ said_dsa=1;
+                        fprintf(stderr,"[ATTN] DSA kvb rebuild gathered (#768): %lld of %lld rows "
+                            "(%.1f -> %.1f GB)\n",(long long)un,(long long)kvb_rows,
+                            kvb_need/1e9, un*(double)kvb_dim*4/1e9); }
+                }
+            }
+            free(want);
+        }
+    }
+    if(!kvb_map){
+        kvb_all=falloc((int64_t)Tk*kvb_dim);
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    }
     m->t_kvb += now_s()-tk0;
     /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
      * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
@@ -4507,7 +4554,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-            const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
+            int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;   /* gathered vs absolute row */
+            const float *kn=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
             float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
             for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
@@ -4516,12 +4564,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         softmax(sc,nt);
         float *cx=ctx+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++) cx[d]=0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-            const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
+            int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;
+            const float *vv=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
     matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
-    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
+    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(kvb_map); free(sc_all);
     m->t_attn += now_s()-ta0;
 }
 
