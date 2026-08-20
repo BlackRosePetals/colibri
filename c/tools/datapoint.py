@@ -30,7 +30,10 @@ import sys
 import tempfile
 import time
 
-LOAD_RE = re.compile(r"resident weights loaded in ([\d.]+)s \| RSS after load: ([\d.]+) GB")
+LOAD_RE = re.compile(
+    r"(?:resident weights loaded in|init done in|loaded \d+ layers in|\bloaded\b.*?\bin\b)\s+([\d.]+)s.*?\bRSS\b\s*(?:after load:\s*)?([\d.]+)\s*GB",
+    re.IGNORECASE
+)
 IOBENCH_RE = re.compile(r"-> ([\d.]+) GB/s")
 
 
@@ -62,17 +65,41 @@ def machine_info():
     return info
 
 
-def evict_cache(ram_gb):
+def evict_cache(ram_gb, snap_dir=None):
     """Evict resident page cache pages without privileges.
 
-    macOS `purge` needs root; the portable fallback writes a temp file
-    larger than RAM, which forces the older resident pages out of cache.
+    macOS `purge` needs root; Linux uses posix_fadvise(DONTNEED) over the
+    model's safetensors shards to drop cached pages instantly with 0 disk writes.
+    The fallback writes a temp file larger than RAM when no direct method exists.
     Returns True if an eviction was actually attempted.
     """
     if sys.platform == "darwin":
         r = subprocess.run(["purge"], capture_output=True)
         if r.returncode == 0:
             return True
+
+    # Zero-write Linux eviction using posix_fadvise over model shards
+    if sys.platform.startswith("linux") and snap_dir and os.path.isdir(snap_dir):
+        try:
+            evicted_any = False
+            for name in os.listdir(snap_dir):
+                if name.endswith(".safetensors"):
+                    p = os.path.join(snap_dir, name)
+                    try:
+                        fd = os.open(p, os.O_RDONLY)
+                        try:
+                            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                            evicted_any = True
+                        finally:
+                            os.close(fd)
+                    except OSError:
+                        pass
+            if evicted_any:
+                return True
+        except OSError as e:
+            print(f"[datapoint] Linux fadvise eviction skipped: {e}", file=sys.stderr)
+
+    # Fallback: Write temp file larger than RAM
     size_mb = int(ram_gb) * 1024 + 1024
     try:
         with tempfile.NamedTemporaryFile(delete=True, suffix=".evict") as f:
@@ -90,11 +117,25 @@ def evict_cache(ram_gb):
 
 def run_engine(engine, snap, prompt, max_new, runs, cap, bits):
     results = []
+    engine_name = os.path.basename(engine).lower()
+
     for i in range(runs):
         env = dict(os.environ, CHAT="1", TEMP="0", MAX_NEW=str(max_new), SNAP=snap)
         t0 = time.monotonic()
-        proc = subprocess.run([engine, str(cap), str(bits)], input=prompt + "\n",
-                              capture_output=True, text=True, env=env)
+
+        # Support modern engines and CLI wrappers (coli / deepseek_v4 / colibri)
+        if "coli" in engine_name:
+            cmd = [engine, "run", "--model", snap, prompt, "--ngen", str(max_new)]
+            stdin_input = None
+        elif "deepseek" in engine_name:
+            cmd = [engine, snap, prompt, "--max-tokens", str(max_new), "--memory-gb", "32"]
+            stdin_input = None
+        else:
+            # Legacy positional engines (olmoe, inkling)
+            cmd = [engine, str(cap), str(bits)]
+            stdin_input = prompt + "\n"
+
+        proc = subprocess.run(cmd, input=stdin_input, capture_output=True, text=True, env=env)
         wall = time.monotonic() - t0
         m = LOAD_RE.search(proc.stdout) or LOAD_RE.search(proc.stderr)
         if not m:
@@ -129,7 +170,7 @@ def main():
     args = ap.parse_args()
 
     info = machine_info()
-    evicted = False if args.no_evict else evict_cache(info.get("ram_gb", 8.0))
+    evicted = False if args.no_evict else evict_cache(info.get("ram_gb", 8.0), snap_dir=args.snap)
     cold_label = "cold (cache evicted)" if evicted else "cold (cache not evicted)"
 
     disk = {}
