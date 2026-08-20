@@ -40,6 +40,7 @@
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #ifdef __linux__
 #include <sys/syscall.h>                          /* COLI_NUMA: mbind degli slab expert / expert-slab interleave */
+#include <malloc.h>                               /* Needed to actually free memory if we go over our RAM budget */
 #endif
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
 #include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
@@ -779,6 +780,30 @@ static double rss_gb(void){
 #endif
 #endif
 }
+#ifdef __linux__
+static double current_rss_gb(void) {
+  FILE *f = fopen("/proc/self/status", "r");
+  if (!f) {
+    fprintf(stderr, "[RSS] failed to open /proc/self/status\n");
+    return -1.0;
+  }
+
+  char line[256];
+  unsigned long long kb = 0;
+
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, "VmRSS:", 6) == 0) {
+      if (sscanf(line + 6, "%llu", &kb) == 1) {
+        fclose(f);
+        return (double)kb / (1024.0 * 1024.0);
+      }
+    }
+  }
+
+  fclose(f);
+  return -1.0;
+}
+#endif
 /* ---- PROF=1: opt-in performance profile ----------------------------------
  * Records per-forward decode latency and expert-file bytes fetched, then
  * reports percentiles, I/O totals, phase shares and a tuning verdict next to
@@ -7649,7 +7674,11 @@ static void rss_guard(Model *m){
     if(lim<=0) return;
     if(m->n_emit - g_rssg_last < 16) return;
     g_rssg_last = m->n_emit;
+#ifdef __linux__
+    double rss=current_rss_gb();
+#else
     double rss=rss_gb();
+#endif
     if(rss <= lim*1.02+0.3) return;                       /* tolleranza: 2% + 300MB */
     Cfg *c=&m->c;
     int64_t need=(int64_t)((rss-lim)*1e9), freed=0; int dropped=0;
@@ -7688,6 +7717,9 @@ static void rss_guard(Model *m){
     if(dropped)
         fprintf(stderr,"[RAM-GUARD] RSS %.1f GB over the %.1f GB budget (#403): "
                        "dropped %d cached experts, cap -> %d\n", rss, lim, dropped, m->ecap);
+#ifdef __linux__
+    malloc_trim(1024);
+#endif
 }
 static void repin_pass_limit(Model *m,int limit){
     rss_guard(m);                     /* #403: il budget si fa rispettare sull'RSS MISURATO */
