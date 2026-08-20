@@ -367,15 +367,22 @@ the ones you are most likely to set: `DSV4_CUDA` (GPU tier on/off),
 `COLI_V4_SAVE_USAGE=0` is an engine-specific alias that disables only V4's
 usage rewrite; the shared `USAGE_SAVE=0` covers this engine too.
 
-**Reproducible greedy runs (#1136):** on this engine, greedy text legitimately
-varies with the expert-cache state — hot experts run the vectorized `rows16`
-kernel, cold ones run the reference matvec, the two accumulate in different
-orders, and which experts are hot follows the autopin history (`.coli_usage`,
-rewritten by every run). For byte-identical output across runs, either freeze
-the history (`USAGE_SAVE=0`, after seeding it once) or remove the variable
-entirely (`COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 USAGE_SAVE=0`: reference kernels
-only, no history). Details in
-[deepseek-v4.md — CPU-only behaviour](deepseek-v4.md).
+| Variable | Default | Effect |
+|---|---|---|
+| `COLI_V4_ROWS16` | `1` (on) | Repack hot-pinned experts into the vectorized `rows16` layout. **While this is on, greedy output varies run to run on the same machine** (#1136): rows16 and the reference matvec accumulate in different orders, and which experts take which kernel follows the expert-cache state. `=0` runs the reference matvec for every expert — slower, but the kernel variable is gone. **Set `=0` for any quality A/B on this engine**; throughput A/Bs do not need it. |
+
+**Reproducible greedy runs (#1136):** greedy text on this engine varies with
+the expert-cache state — hot experts run the vectorized `rows16` kernel, cold
+ones run the reference matvec, the two accumulate in different orders, and
+which experts are hot follows the autopin history (`.coli_usage`, rewritten by
+every run). This is a known defect, not a documented trade-off — the house
+rule since the olmoe/inkling IDOT cases (#1044, #1080) is that a fast path
+which changes tokens is opt-in, and a convergence fix (reference path adopting
+rows16's accumulation order) is planned under #1136. Until it lands: for
+byte-identical output across runs, either freeze the history (`USAGE_SAVE=0`,
+after seeding it once) or remove the variable entirely
+(`COLI_V4_ROWS16=0 COLI_V4_AUTOPIN=0 USAGE_SAVE=0`: reference kernels only, no
+history). Details in [deepseek-v4.md — CPU-only behaviour](deepseek-v4.md).
 
 ## OLMoE engine (`olmoe`)
 
