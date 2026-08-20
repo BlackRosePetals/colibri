@@ -14744,6 +14744,136 @@ int coli_v4_qdq_scratch(size_t activation_count, size_t scales_count,
     return 0;
 }
 
+/* ---- #1136 convergence: the reference matvec accumulates in the rows16 order.
+ *
+ * The rows16 kernels and matmul_mxfp4 compute the same math in two float
+ * orders: rows16 folds (x*w)*scale straight into the row accumulator column
+ * by column (identical per-row order on AVX-512, AVX2 and NEON — mul, mul,
+ * add, never fused); matmul_mxfp4 builds 32-column partial sums and scales
+ * them afterwards (plus an 8-lane horizontal reduction on AVX2). Which expert
+ * takes which kernel follows cache residency, so greedy output moved run to
+ * run (#1136). Per the maintainer's call there, the reference path adopts the
+ * rows16 order — same shape as the K1 f32 planar-tail fix — so a hot
+ * (rows16-packed) and a cold (row-major) expert produce identical bits.
+ *
+ * Only rows%16==0 matrices can ever be rows16-packed (the packer refuses the
+ * rest), so the old order is kept verbatim where no divergence is possible.
+ * The AVX2 arm vectorizes ACROSS rows (16 rows = two 8-lane vectors, columns
+ * in order), which preserves each row's scalar operation order exactly — the
+ * rows16 kernels' own trick. The scalar arm splits the two multiplies and the
+ * add into separate statements so no compiler contracts them into an FMA:
+ * every rows16 ISA rounds the product before the add. */
+void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
+                                    const uint8_t *e8s, const float *x,
+                                    int I, int O) {
+    int rb = I / 2, ng = I / 32;
+#ifdef __AVX2__
+    /* Nibble decode borrows matmul_mxfp4's trick — doubled e2m1 values are
+     * exact int8, one pshufb decodes a 16-byte row into 32 codes — but the
+     * 0.5 un-doubling multiplies the DECODED VALUE here (exact: d*0.5 is a
+     * pure exponent shift), never the scale: the accumulation must see the
+     * same w as coli_e2m1_decode so (x*w)*scale rounds identically to the
+     * rows16 kernels. Rows decode row-major (streaming loads), then 8x8
+     * transposes turn them column-major so 16 rows ride two 8-lane vectors
+     * down the column loop in the rows16 per-row order: mul, mul, add. */
+    float e8lut[256];
+    for (int v = 0; v < 256; v++) e8lut[v] = coli_e8m0_decode((uint8_t)v);
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < O / 16; tile++) {
+        const __m128i lut2 = _mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+        for (int base = 0; base < I; base += 32) {
+            float sc[16], tmp[2][32][8];
+            for (int half_rows = 0; half_rows < 2; half_rows++) {
+                __m256 rowv[8][4];
+                for (int r8 = 0; r8 < 8; r8++) {
+                    int64_t row = tile * 16 + half_rows * 8 + r8;
+                    sc[half_rows * 8 + r8] = e8lut[e8s[row * ng + base / 32]];
+                    __m128i by = _mm_loadu_si128(
+                        (const __m128i *)(q4 + row * rb + base / 2));
+                    __m128i lo = _mm_and_si128(by, m4);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+                    __m128i n0 = _mm_shuffle_epi8(lut2, _mm_unpacklo_epi8(lo, hi));
+                    __m128i n1 = _mm_shuffle_epi8(lut2, _mm_unpackhi_epi8(lo, hi));
+                    rowv[r8][0] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(n0)), half);
+                    rowv[r8][1] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(_mm_srli_si128(n0, 8))), half);
+                    rowv[r8][2] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(n1)), half);
+                    rowv[r8][3] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(_mm_srli_si128(n1, 8))), half);
+                }
+                for (int cb = 0; cb < 4; cb++) {
+                    __m256 blk[8];
+                    for (int r8 = 0; r8 < 8; r8++) blk[r8] = rowv[r8][cb];
+                    __m256 t0 = _mm256_unpacklo_ps(blk[0], blk[1]);
+                    __m256 t1 = _mm256_unpackhi_ps(blk[0], blk[1]);
+                    __m256 t2 = _mm256_unpacklo_ps(blk[2], blk[3]);
+                    __m256 t3 = _mm256_unpackhi_ps(blk[2], blk[3]);
+                    __m256 t4 = _mm256_unpacklo_ps(blk[4], blk[5]);
+                    __m256 t5 = _mm256_unpackhi_ps(blk[4], blk[5]);
+                    __m256 t6 = _mm256_unpacklo_ps(blk[6], blk[7]);
+                    __m256 t7 = _mm256_unpackhi_ps(blk[6], blk[7]);
+                    __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3,2,3,2));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 0],
+                                     _mm256_permute2f128_ps(s0, s4, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 1],
+                                     _mm256_permute2f128_ps(s1, s5, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 2],
+                                     _mm256_permute2f128_ps(s2, s6, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 3],
+                                     _mm256_permute2f128_ps(s3, s7, 0x20));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 4],
+                                     _mm256_permute2f128_ps(s0, s4, 0x31));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 5],
+                                     _mm256_permute2f128_ps(s1, s5, 0x31));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 6],
+                                     _mm256_permute2f128_ps(s2, s6, 0x31));
+                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 7],
+                                     _mm256_permute2f128_ps(s3, s7, 0x31));
+                }
+            }
+            __m256 sc0 = _mm256_loadu_ps(sc), sc1 = _mm256_loadu_ps(sc + 8);
+            for (int c = 0; c < 32; c++) {
+                __m256 xv = _mm256_set1_ps(x[base + c]);
+                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
+                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[0][c])), sc0));
+                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
+                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[1][c])), sc1));
+            }
+        }
+        _mm256_storeu_ps(y + tile * 16, sum0);
+        _mm256_storeu_ps(y + tile * 16 + 8, sum1);
+    }
+#else
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const uint8_t *scl = e8s + (int64_t)o * ng;
+        float sum = 0.0f;
+        for (int c = 0; c < I; c++) {
+            uint8_t byte = w[c >> 1];
+            float wv = coli_e2m1_decode((c & 1) ? (uint8_t)(byte >> 4)
+                                                : (uint8_t)(byte & 0xF));
+            float t = x[c] * wv;                 /* separate statements: the   */
+            t = t * coli_e8m0_decode(scl[c / 32]); /* product must round before */
+            sum = sum + t;                       /* the add, as on every ISA   */
+        }
+        y[o] = sum;
+    }
+#endif
+}
+
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                         const float *input) {
     if (!output || !weight || !input ||
@@ -14777,8 +14907,12 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
                                     input, columns, 128) != 0) {
         return -1;
     }
-    matmul_mxfp4(output, activation, weight->data, weight->scales,
-                 1, (int)columns, (int)rows);
+    if (rows % 16 == 0)          /* rows16-packable shape: converge (#1136) */
+        coli_fp4_matvec_rows16_order(output, weight->data, weight->scales,
+                                activation, (int)columns, (int)rows);
+    else
+        matmul_mxfp4(output, activation, weight->data, weight->scales,
+                     1, (int)columns, (int)rows);
     return 0;
 }
 
@@ -14952,10 +15086,17 @@ int coli_fp4_dual_matvec_ref(float *output_a, float *output_b,
                                     input, columns, 128) != 0) {
         return -1;
     }
-    matmul_mxfp4(output_a, activation, a->data, a->scales,
-                 1, (int)columns, (int)rows);
-    matmul_mxfp4(output_b, activation, b->data, b->scales,
-                 1, (int)columns, (int)rows);
+    if (rows % 16 == 0) {        /* rows16-packable shape: converge (#1136) */
+        coli_fp4_matvec_rows16_order(output_a, a->data, a->scales,
+                                activation, (int)columns, (int)rows);
+        coli_fp4_matvec_rows16_order(output_b, b->data, b->scales,
+                                activation, (int)columns, (int)rows);
+    } else {
+        matmul_mxfp4(output_a, activation, a->data, a->scales,
+                     1, (int)columns, (int)rows);
+        matmul_mxfp4(output_b, activation, b->data, b->scales,
+                     1, (int)columns, (int)rows);
+    }
     return 0;
 }
 
