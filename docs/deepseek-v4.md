@@ -138,6 +138,7 @@ $env:COLI_MODEL_MIRROR = "D:\models\DeepSeek-V4-Flash"   # optional second copy
 $env:COLI_CUDA = "1"; $env:COLI_GPU = "0"; $env:CUDA_DENSE = "1"; $env:COLI_CUDA_PIPE = "2"
 $env:COLI_CUDA_ATTN_BATCH = "1"; $env:COLI_CUDA_MOE_BATCH = "1"
 $env:V4_MOE_REFILL_GROUP = "12"; $env:DSV4_CUDA_EXPERT_MIRRORS = "688"
+$env:V4_LOADER_LANES = "3"   # GPU tier: 9-lane default tuned for the CPU path, see the env table
 python ./coli serve --model C:\models\DeepSeek-V4-Flash --ram 32 --ctx 20000
 ```
 
@@ -279,7 +280,7 @@ Defaults in parentheses; all read by `c/deepseek_v4.c` unless noted `.cu`.
 |---|---|
 | `COLI_MODEL_MIRROR`, `SNAP_MIRROR`, `COLI_DISK_WEIGHTS` | dual-SSD read split (see ENVIRONMENT.md) |
 | `V4_MOE_REFILL_GROUP` (6, max 16) | parallel lookups per bank refill group (bounded by pin slots; 12 measured best) |
-| `V4_LOADER_LANES` (3, max 16) | persistent expert-loader threads for decode |
+| `V4_LOADER_LANES` (9, max 16) | persistent expert-loader threads for decode. The default suits the CPU path (1.41× decode, #1097); **with the GPU tier set `3`**: mirrors/RAM absorb most decode misses (9 lanes ≈ +4 % decode) while the extra readers contend with the MoE bank refill for the NVMe queues (~10 % slower prefill; measured on the reference box, v1.7.0) |
 | `V4_EXPERT_UNION` (1) | per-chunk expert union batching on the CPU path |
 | `COLI_V4_DIRECT` (1) | O_DIRECT streaming reads |
 | `COLI_V4_AUTOPIN`, `COLI_V4_PREWARM`, `COLI_V4_SAVE_USAGE` | hot-expert pinning from `.coli_usage` history |
