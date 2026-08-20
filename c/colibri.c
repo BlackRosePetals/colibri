@@ -4406,8 +4406,136 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     /* 2) ricostruzione di k_nope+value per TUTTI i token 0..Tk-1 (un solo matmul su kv_b) */
     m->t_aproj+=now_s()-ta0; double tk0=now_s();
     int stL=m->kv_start[layer];
-    float *kvb_all=falloc((int64_t)Tk*kvb_dim);
-    matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    /* #768 (cause 2): the one-shot kvb_all buffer is Tk*H*(qk_nope+v_head) floats —
+     * 30.1 GB at ctx 262144 — and cap_for_ram reserves it PERMANENTLY even though it
+     * only exists during prefill; that reservation is what starves the expert cache
+     * at long context (5.46 -> 0.86 tok/s). Above KVB_FLASH_MB the reconstruction is
+     * tiled instead: rebuild kv_b for KVB_TILE_MB worth of tokens at a time and fold
+     * scores/values through an online (flash-style) softmax. Same rebuild total (one
+     * matmul pass over the context), same t-order for scores and values; only the
+     * softmax normalisation is applied incrementally, so the output can differ from
+     * the one-shot path by rounding — the same kernel-family divergence class as the
+     * CUDA/Metal attention arms (#510). Peak transient drops from Tk*kvb_dim*4 to the
+     * tile plus 2 floats per (row,head). DSA rows (dnsel) keep the one-shot path: the
+     * top-keep list is scanned in its two-band order and is not tileable by t-range.
+     * KVB_FLASH_MB=0 disables tiling entirely; KVB_FLASH=1 forces it at any size. */
+    int dsa_any=0; if(dnsel) for(int s=0;s<S && !dsa_any;s++) if(dnsel[s]>0) dsa_any=1;
+    int64_t kvb_rows=(int64_t)Tk-stL, kvb_need=kvb_rows*kvb_dim*4;
+    int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
+    int use_flash=!dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576;
+    if(getenv("KVB_FLASH")) use_flash=!dsa_any && atoi(getenv("KVB_FLASH"))!=0;
+    if(use_flash){
+        int64_t tile_mb=getenv("KVB_TILE_MB")?atoll(getenv("KVB_TILE_MB")):512;
+        int64_t tile=tile_mb*1048576/((int64_t)kvb_dim*4);
+        if(tile<256) tile=256; if(tile>kvb_rows) tile=kvb_rows;
+        static int said; if(!said){ said=1;
+            fprintf(stderr,"[ATTN] kvb reconstruction tiled (#768): %.1f GB one-shot buffer "
+                "-> %.0f MB tiles, online softmax (KVB_FLASH_MB=0 restores one-shot)\n",
+                kvb_need/1e9, tile*(double)kvb_dim*4/1048576.0);
+        }
+        m->t_kvb += now_s()-tk0;
+        float *kvb_tile=falloc(tile*kvb_dim);
+        float *ml=falloc((int64_t)S*H*2);              /* running (max, sum) per (row, head) */
+        double tac=now_s(), kvb_acc=0;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+            ml[((int64_t)s*H+h)*2]=-1e30f; ml[((int64_t)s*H+h)*2+1]=0.f;
+            float *cx=ctx+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++) cx[d]=0;
+        }
+        for(int64_t t0=stL; t0<Tk; t0+=tile){
+            int64_t tn=Tk-t0<tile?Tk-t0:tile;
+            double tk1=now_s();
+            matmul_qt(kvb_tile, m->Lc[layer]+t0*c->kv_lora, &l->kv_b, (int)tn);
+            kvb_acc+=now_s()-tk1;
+            #pragma omp parallel for collapse(2) schedule(static,1)
+            for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+                int pos=pos_base+s;
+                int64_t nt=(int64_t)pos+1-stL;         /* causal length of this row */
+                if(t0-stL>=nt) continue;
+                int64_t jn=nt-(t0-stL); if(jn>tn) jn=tn;
+                const float *qp=Q+(int64_t)s*H*qh+(int64_t)h*qh, *qr=qp+c->qk_nope;
+                float *st=ml+((int64_t)s*H+h)*2, *cx=ctx+((int64_t)s*H+h)*vh;
+                float mrun=st[0], lrun=st[1];
+                for(int64_t jj=0;jj<jn;jj++){
+                    const float *kn=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh);
+                    const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
+                    float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
+                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                    a*=c->attn_scale;
+                    const float *vv=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
+                    if(a>mrun){
+                        float rs=expf(mrun-a);
+                        lrun*=rs; for(int d=0;d<vh;d++) cx[d]*=rs;
+                        mrun=a;
+                    }
+                    float w=expf(a-mrun);
+                    lrun+=w; for(int d=0;d<vh;d++) cx[d]+=w*vv[d];
+                }
+                st[0]=mrun; st[1]=lrun;
+            }
+        }
+        #pragma omp parallel for collapse(2) schedule(static)
+        for(int s=0;s<S;s++) for(int h=0;h<H;h++){
+            float lrun=ml[((int64_t)s*H+h)*2+1];
+            float *cx=ctx+((int64_t)s*H+h)*vh;
+            if(lrun>0) for(int d=0;d<vh;d++) cx[d]/=lrun;
+        }
+        free(kvb_tile); free(ml);
+        m->t_kvb+=kvb_acc; m->t_acore+=now_s()-tac-kvb_acc; double tao=now_s();
+        matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
+        free(ctx); free(Q); free(QR); free(comp);
+        m->t_attn += now_s()-ta0;
+        return;
+    }
+    /* #768 follow-up (DSA): the loops below read only the top-keep rows, yet the
+     * one-shot matmul rebuilt ALL Tk rows — the same 30 GB paid for a top-k read.
+     * Past the same ceiling, rebuild only the UNION of selected rows: each row's
+     * rebuild is independent and the read order (jj along each tlist) is unchanged,
+     * so this is bit-identical to the one-shot path. Rows with ns==0 scan their full
+     * causal range and force those rows into the union; if the union does not at
+     * least halve the buffer, fall back to one-shot (gather overhead without the
+     * memory win). kvb_map: row t -> compact index, -1 = not rebuilt (never read). */
+    float *kvb_all=NULL; int32_t *kvb_map=NULL;
+    if(dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576){
+        uint8_t *want=calloc((size_t)kvb_rows,1);
+        if(want){
+            for(int s=0;s<S;s++){
+                int ns=dnsel[s];
+                if(ns>0){ const int *tl=dsel+(int64_t)s*dtopk;
+                    for(int j=0;j<ns;j++){ int64_t r=(int64_t)tl[j]-stL;
+                        if(r>=0&&r<kvb_rows) want[r]=1; } }
+                else { int64_t upto=(int64_t)pos_base+s+1-stL;
+                    if(upto>kvb_rows) upto=kvb_rows;
+                    if(upto>0) memset(want,1,(size_t)upto); }
+            }
+            int64_t un=0; for(int64_t r=0;r<kvb_rows;r++) if(want[r]) un++;
+            if(un>0 && un<kvb_rows/2){
+                kvb_map=malloc((size_t)kvb_rows*sizeof(int32_t));
+                if(kvb_map){
+                    float *Lg=falloc(un*c->kv_lora); int64_t w=0;
+                    for(int64_t r=0;r<kvb_rows;r++){
+                        if(want[r]){ memcpy(Lg+w*c->kv_lora,
+                                m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
+                                (size_t)c->kv_lora*sizeof(float));
+                            kvb_map[r]=(int32_t)w; w++; }
+                        else kvb_map[r]=-1;
+                    }
+                    kvb_all=falloc(un*kvb_dim);
+                    matmul_qt(kvb_all, Lg, &l->kv_b, (int)un);
+                    free(Lg);
+                    static int said_dsa; if(!said_dsa){ said_dsa=1;
+                        fprintf(stderr,"[ATTN] DSA kvb rebuild gathered (#768): %lld of %lld rows "
+                            "(%.1f -> %.1f GB)\n",(long long)un,(long long)kvb_rows,
+                            kvb_need/1e9, un*(double)kvb_dim*4/1e9); }
+                }
+            }
+            free(want);
+        }
+    }
+    if(!kvb_map){
+        kvb_all=falloc((int64_t)Tk*kvb_dim);
+        matmul_qt(kvb_all+(int64_t)stL*kvb_dim, m->Lc[layer]+(int64_t)stL*c->kv_lora, &l->kv_b, Tk-stL);
+    }
     m->t_kvb += now_s()-tk0;
     /* 3) attenzione causale: score = q_pass·k_nope + q_rot·k_rot
      * (punteggi sul heap, per-thread: vedi il commento nel ramo absorb) */
@@ -4426,7 +4554,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         const int *tlist = ns ? dsel+(int64_t)s*dtopk : NULL;
         int nt = ns ? ns : pos+1-st0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-            const float *kn=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh);
+            int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;   /* gathered vs absolute row */
+            const float *kn=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh);
             const float *kr=m->Rc[layer]+(int64_t)t*c->qk_rope;
             float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
             for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
@@ -4435,12 +4564,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         softmax(sc,nt);
         float *cx=ctx+((int64_t)s*H+h)*vh; for(int d=0;d<vh;d++) cx[d]=0;
         for(int jj=0;jj<nt;jj++){ int t = tlist ? tlist[jj] : st0+jj;
-            const float *vv=kvb_all+(int64_t)t*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
+            int64_t ti = kvb_map ? (int64_t)kvb_map[t-stL] : (int64_t)t;
+            const float *vv=kvb_all+ti*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
             float a=sc[jj]; for(int d=0;d<vh;d++) cx[d]+=a*vv[d]; }
     }
     m->t_acore+=now_s()-tac; double tao=now_s();
     matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
-    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(sc_all);
+    free(ctx); free(Q); free(QR); free(comp); free(kvb_all); free(kvb_map); free(sc_all);
     m->t_attn += now_s()-ta0;
 }
 
@@ -9259,6 +9389,15 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(g_expert_budget>0 && g_expert_budget<64) ws_b = (double)(g_expert_budget+4) * (double)eb;
     double kv_b  = kv_pool_bytes(m,max_ctx);
     double kvb_b = (double)max_ctx*c->n_heads*(c->qk_nope+c->v_head)*4.0;
+    /* #768: above KVB_FLASH_MB attention_rows tiles the reconstruction instead of
+     * materialising kvb_all, so the transient to reserve is the flash ceiling plus
+     * one tile and the per-(row,head) running state — not 30 GB at ctx 262144.
+     * The reserve mirrors the trigger in attention_rows: same env, same default. */
+    { int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
+      int64_t tile_mb =getenv("KVB_TILE_MB") ?atoll(getenv("KVB_TILE_MB")) :512;
+      double capped = (double)flash_mb*1048576.0 + (double)tile_mb*1048576.0
+                    + (double)max_ctx*c->n_heads*2*4.0;
+      if(flash_mb>0 && kvb_b>capped) kvb_b = capped; }
     /* RISERVA PAGE-CACHE (misurato 2026-07-06 su Linux): strangolarla fa crollare
      * le pread buffered da ~800 a ~180 MB/s — gli ultimi GB di LRU rendono MENO di
      * quanto costino in banda disco persa. 2.5 GB restano SEMPRE al kernel.
