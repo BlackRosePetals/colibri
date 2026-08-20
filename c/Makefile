@@ -1203,7 +1203,8 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
 	$(addsuffix .o,$(V4_TEST_UNITS)) \
-	COLI_V4_UNIT_NATIVE_QUANT.o
+	COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
 # Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
 # is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
 # native_quant.h resolve through the GPU unit + the DLL loader. Both are inert
@@ -1218,6 +1219,7 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
+		COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
 		$(V4_TEST_EXTRA_TARGETS)
 	$(CC) $(CFLAGS) $< $(V4_TEST_LINK_OBJS) -o $@ -pthread $(LDFLAGS)
 
