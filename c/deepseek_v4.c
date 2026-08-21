@@ -15164,13 +15164,17 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
         const __m256 half = _mm256_set1_ps(0.5f);
         __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
         for (int base = 0; base < I; base += 32) {
-            float sc[16], tmp[2][32][8];
+            /* Consume each transposed 8-row half immediately.  The old
+             * scalar kernel wrote 2 KiB of column vectors to tmp and loaded
+             * them back solely to feed this one activation; keeping the
+             * columns live removes that round trip while preserving each
+             * row's column-by-column accumulation order. */
             for (int half_rows = 0; half_rows < 2; half_rows++) {
+                float sc[8];
                 __m256 rowv[8][4];
                 for (int r8 = 0; r8 < 8; r8++) {
                     int64_t row = tile * 16 + half_rows * 8 + r8;
-                    sc[half_rows * 8 + r8] =
-                        e8lut[e8s[row * ng + base / 32]];
+                    sc[r8] = e8lut[e8s[row * ng + base / 32]];
                     __m128i by = _mm_loadu_si128(
                         (const __m128i *)(q4 + row * rb + base / 2));
                     __m128i lo = _mm_and_si128(by, m4);
@@ -15188,6 +15192,8 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
                     rowv[r8][3] = _mm256_mul_ps(_mm256_cvtepi32_ps(
                         _mm256_cvtepi8_epi32(_mm_srli_si128(n1, 8))), half);
                 }
+                __m256 scale = _mm256_loadu_ps(sc);
+                __m256 partial = half_rows ? sum1 : sum0;
                 for (int cb = 0; cb < 4; cb++) {
                     __m256 blk[8];
                     for (int r8 = 0; r8 < 8; r8++)
@@ -15216,32 +15222,24 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
                         t5, t7, _MM_SHUFFLE(1,0,1,0));
                     __m256 s7 = _mm256_shuffle_ps(
                         t5, t7, _MM_SHUFFLE(3,2,3,2));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 0],
-                                     _mm256_permute2f128_ps(s0, s4, 0x20));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 1],
-                                     _mm256_permute2f128_ps(s1, s5, 0x20));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 2],
-                                     _mm256_permute2f128_ps(s2, s6, 0x20));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 3],
-                                     _mm256_permute2f128_ps(s3, s7, 0x20));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 4],
-                                     _mm256_permute2f128_ps(s0, s4, 0x31));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 5],
-                                     _mm256_permute2f128_ps(s1, s5, 0x31));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 6],
-                                     _mm256_permute2f128_ps(s2, s6, 0x31));
-                    _mm256_storeu_ps(tmp[half_rows][cb * 8 + 7],
-                                     _mm256_permute2f128_ps(s3, s7, 0x31));
+                    __m256 weights[8] = {
+                        _mm256_permute2f128_ps(s0, s4, 0x20),
+                        _mm256_permute2f128_ps(s1, s5, 0x20),
+                        _mm256_permute2f128_ps(s2, s6, 0x20),
+                        _mm256_permute2f128_ps(s3, s7, 0x20),
+                        _mm256_permute2f128_ps(s0, s4, 0x31),
+                        _mm256_permute2f128_ps(s1, s5, 0x31),
+                        _mm256_permute2f128_ps(s2, s6, 0x31),
+                        _mm256_permute2f128_ps(s3, s7, 0x31),
+                    };
+                    for (int column = 0; column < 8; column++) {
+                        __m256 xv = _mm256_set1_ps(
+                            x[base + cb * 8 + column]);
+                        partial = _mm256_add_ps(partial, _mm256_mul_ps(
+                            _mm256_mul_ps(xv, weights[column]), scale));
+                    }
                 }
-            }
-            __m256 sc0 = _mm256_loadu_ps(sc);
-            __m256 sc1 = _mm256_loadu_ps(sc + 8);
-            for (int c = 0; c < 32; c++) {
-                __m256 xv = _mm256_set1_ps(x[base + c]);
-                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[0][c])), sc0));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[1][c])), sc1));
+                if (half_rows) sum1 = partial; else sum0 = partial;
             }
         }
         _mm256_storeu_ps(y + tile * 16, sum0);
