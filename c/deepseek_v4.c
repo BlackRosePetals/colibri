@@ -6980,7 +6980,8 @@ typedef struct {
     uint64_t record_bytes;
     V4ExpertRecord *records;
     V4ExpertSlot *slots;
-    int *slot_by_expert; /* global slot index for resident or in-flight expert */
+    int *slot_by_expert; /* resident/in-flight slot; every StoreOps variant that
+                          * mutates slot identity must maintain this index */
     uint64_t clock;
     unsigned active_leases;
     ColiExpertStoreStats stats;
