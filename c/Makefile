@@ -1208,6 +1208,7 @@ tests/test_native_quant$(EXE): tests/test_native_quant.c deepseek_v4.c native_qu
 ifeq ($(COLI_V4_SUPPORTED),1)
 include Makefile.deepseek-v4.units
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o
+V4_BATCH_TEST_OBJ = COLI_V4_UNIT_NATIVE_QUANT_BATCH_TEST.o
 V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_ST.o \
 	COLI_V4_UNIT_CONFIG.o \
@@ -1215,9 +1216,12 @@ V4_TEST_LINK_OBJS = \
 	COLI_V4_UNIT_SPARSE_ATTENTION.o \
 	COLI_V4_UNIT_RESOURCE_PLAN.o \
 	COLI_V4_UNIT_PROMPT.o \
-	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
+	$(filter-out COLI_V4_UNIT_EXPERT_STORE.o COLI_V4_UNIT_EXPERT.o,$(addsuffix .o,$(V4_TEST_UNITS))) \
 	$(V4_HOT_TEST_OBJ) \
+	$(V4_BATCH_TEST_OBJ) \
+	COLI_V4_UNIT_EXPERT_ROWS16.o \
 	COLI_V4_UNIT_NATIVE_QUANT.o \
+	COLI_V4_UNIT_NATIVE_QUANT_DUAL.o \
 	COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o
 # Windows engine objects are compiled with -DCOLI_V4_GPU_TIER (the CUDA tier
 # is resolved from coli_cuda_dsv4*.dll at runtime), so the matvec references in
@@ -1233,8 +1237,10 @@ tests/test_deepseek_v4$(EXE): tests/test_deepseek_v4.c deepseek_v4.c deepseek_v4
 	$(MAKE) -f Makefile.deepseek-v4 ARCH=$(ARCH) deepseek-v4-test-objs \
 		COLI_V4_UNIT_ST.o COLI_V4_UNIT_CONFIG.o COLI_V4_UNIT_MATH.o COLI_V4_UNIT_SPARSE_ATTENTION.o \
 		COLI_V4_UNIT_RESOURCE_PLAN.o COLI_V4_UNIT_PROMPT.o COLI_V4_UNIT_NATIVE_QUANT.o \
-		COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		COLI_V4_UNIT_NATIVE_QUANT_DUAL.o COLI_V4_UNIT_NATIVE_QUANT_ROWS16.o \
+		COLI_V4_UNIT_EXPERT_ROWS16.o \
 		$(V4_HOT_TEST_OBJ) \
+		$(V4_BATCH_TEST_OBJ) \
 		$(V4_TEST_EXTRA_TARGETS)
 	$(CC) $(CFLAGS) -DCOLI_V4_TEST_HOOKS $< $(V4_TEST_LINK_OBJS) \
 		-o $@ -pthread $(LDFLAGS)
