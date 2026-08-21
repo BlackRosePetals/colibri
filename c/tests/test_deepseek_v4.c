@@ -374,31 +374,44 @@ static int write_all(int fd, const void *data, size_t length) {
 }
 
 static int write_fixture(const char *path) {
-    static const char header[] =
-        "{"
-        "\"layers.0.ffn.experts.0.w1.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[0,1]},"
-        "\"layers.0.ffn.experts.0.w2.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[1,2]},"
-        "\"layers.0.ffn.experts.0.w3.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[2,3]},"
-        "\"resident\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[3,7]},"
-        "\"layers.0.ffn.experts.0.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[7,23]},"
-        "\"layers.0.ffn.experts.0.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[23,39]},"
-        "\"layers.0.ffn.experts.0.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[39,55]},"
-        "\"layers.0.ffn.experts.1.w1.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[55,56]},"
-        "\"layers.0.ffn.experts.1.w2.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[56,57]},"
-        "\"layers.0.ffn.experts.1.w3.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[57,58]},"
-        "\"layers.0.ffn.experts.1.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[58,74]},"
-        "\"layers.0.ffn.experts.1.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[74,90]},"
-        "\"layers.0.ffn.experts.1.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[90,106]},"
-        "\"layers.0.ffn.experts.2.w1.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[106,107]},"
-        "\"layers.0.ffn.experts.2.w2.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[107,108]},"
-        "\"layers.0.ffn.experts.2.w3.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[108,109]},"
-        "\"layers.0.ffn.experts.2.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[109,125]},"
-        "\"layers.0.ffn.experts.2.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[125,141]},"
-        "\"layers.0.ffn.experts.2.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[141,157]}"
-        "}";
-    unsigned char payload[157];
-    for (int i = 0; i < 157; i++) payload[i] = (unsigned char)i;
-    uint64_t header_length = sizeof(header) - 1;
+    static const char *matrix_names[3] = {"w1", "w2", "w3"};
+    char header[16384];
+    size_t used = (size_t)snprintf(
+        header, sizeof(header),
+        "{\"resident\":{\"dtype\":\"F32\",\"shape\":[1],"
+        "\"data_offsets\":[3,7]}");
+    for (int expert = 0; expert < 7; expert++) {
+        int scale = expert ? 4 + expert * 51 : 0;
+        int weight = scale + 3 + (expert ? 0 : 4);
+        for (int matrix = 0; matrix < 3; matrix++) {
+            int count = snprintf(
+                header + used, sizeof(header) - used,
+                ",\"layers.0.ffn.experts.%d.%s.scale\":{"
+                "\"dtype\":\"F8_E8M0\",\"shape\":[1,1],"
+                "\"data_offsets\":[%d,%d]}",
+                expert, matrix_names[matrix], scale + matrix,
+                scale + matrix + 1);
+            if (count < 0 || (size_t)count >= sizeof(header) - used) return -1;
+            used += (size_t)count;
+        }
+        for (int matrix = 0; matrix < 3; matrix++) {
+            int count = snprintf(
+                header + used, sizeof(header) - used,
+                ",\"layers.0.ffn.experts.%d.%s.weight\":{"
+                "\"dtype\":\"I8\",\"shape\":[1,16],"
+                "\"data_offsets\":[%d,%d]}",
+                expert, matrix_names[matrix], weight + matrix * 16,
+                weight + (matrix + 1) * 16);
+            if (count < 0 || (size_t)count >= sizeof(header) - used) return -1;
+            used += (size_t)count;
+        }
+    }
+    if (used + 1 >= sizeof(header)) return -1;
+    header[used++] = '}';
+    header[used] = '\0';
+    unsigned char payload[361];
+    for (int i = 0; i < 361; i++) payload[i] = (unsigned char)i;
+    uint64_t header_length = used;
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
     if (fd < 0) return -1;
     int result = write_all(fd, &header_length, sizeof(header_length)) ||
@@ -406,6 +419,22 @@ static int write_fixture(const char *path) {
                  write_all(fd, payload, sizeof(payload));
     close(fd);
     return result ? -1 : 0;
+}
+
+static int expect_fixture_expert(const ColiExpertView *view, int expert) {
+    int scale = expert ? 4 + expert * 51 : 0;
+    int weight = scale + 3 + (expert ? 0 : 4);
+    return view->gate.format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
+           view->gate.rows == 1 && view->gate.columns == 32 &&
+           view->gate.data_bytes == 16 && view->gate.scale_bytes == 1 &&
+           ((const unsigned char *)view->gate.scales)[0] ==
+               (unsigned char)scale &&
+           ((const unsigned char *)view->gate.data)[0] ==
+               (unsigned char)weight &&
+           ((const unsigned char *)view->down.data)[0] ==
+               (unsigned char)(weight + 16) &&
+           ((const unsigned char *)view->up.data)[0] ==
+               (unsigned char)(weight + 32);
 }
 
 enum {
@@ -526,7 +555,7 @@ static int test_expert_store(void) {
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 3, 153, -1, 0
+        directory, 1, 7, 306, -1, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -553,13 +582,7 @@ static int test_expert_store(void) {
         return 1;
     }
     ColiExpertView *loaded = &same[0].view;
-    if (loaded->gate.format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
-        loaded->gate.rows != 1 || loaded->gate.columns != 32 ||
-        loaded->gate.data_bytes != 16 || loaded->gate.scale_bytes != 1 ||
-        ((const unsigned char *)loaded->gate.scales)[0] != 0 ||
-        ((const unsigned char *)loaded->gate.data)[0] != 7 ||
-        ((const unsigned char *)loaded->down.data)[0] != 23 ||
-        ((const unsigned char *)loaded->up.data)[0] != 39)
+    if (!expect_fixture_expert(loaded, 0))
         { fprintf(stderr, "expert view mismatch: format=%d rows=%lld columns=%lld data=%zu scales=%zu bytes=%u/%u/%u/%u\n",
                   (int)loaded->gate.format, (long long)loaded->gate.rows,
                   (long long)loaded->gate.columns, loaded->gate.data_bytes,
@@ -593,7 +616,7 @@ static int test_expert_store(void) {
     store->ops->stats(store, &stats);
     if (stats.requests != 2 || stats.hits != 1 || stats.misses != 1 ||
         stats.prefetched != 1 || stats.bytes_read != 51 ||
-        stats.resident_bytes != 51 || stats.capacity_bytes != 153)
+        stats.resident_bytes != 51 || stats.capacity_bytes != 306)
         { fprintf(stderr, "expert stats mismatch: requests=%llu hits=%llu misses=%llu prefetched=%llu bytes=%llu resident=%llu capacity=%llu\n",
                   (unsigned long long)stats.requests,
                   (unsigned long long)stats.hits,
@@ -622,9 +645,68 @@ static int test_expert_store(void) {
     store->ops->stats(store, &stats);
     if (stats.requests != 4 || stats.hits != 1 || stats.misses != 3 ||
         stats.prefetched != 1 || stats.bytes_read != 153 ||
-        stats.resident_bytes != 153 || stats.capacity_bytes != 153) {
+        stats.resident_bytes != 153 || stats.capacity_bytes != 306) {
         fprintf(stderr,
                 "concurrent expert stats mismatch: requests=%llu hits=%llu misses=%llu bytes=%llu resident=%llu capacity=%llu\n",
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses,
+                (unsigned long long)stats.bytes_read,
+                (unsigned long long)stats.resident_bytes,
+                (unsigned long long)stats.capacity_bytes);
+        return 1;
+    }
+
+    /* Fill the six-slot cache, make the LRU order deterministic, then force
+     * an eviction. The direct index must forget expert 1, retain expert 2,
+     * and publish expert 6 in the reused slot. */
+    for (int expert = 1; expert <= 2; expert++) {
+        ColiExpertView touched;
+        if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &touched) ||
+            !expect_fixture_expert(&touched, expert))
+            { fprintf(stderr, "indexed cache hit mismatch: expert=%d\n", expert); return 1; }
+        coli_expert_release(store, &touched);
+    }
+    for (int expert = 3; expert <= 5; expert++) {
+        ColiExpertView filled;
+        if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &filled) ||
+            !expect_fixture_expert(&filled, expert))
+            { fprintf(stderr, "cache fill mismatch: expert=%d\n", expert); return 1; }
+        coli_expert_release(store, &filled);
+    }
+    if (coli_expert_lookup(store, key, &view) ||
+        !expect_fixture_expert(&view, 0))
+        { fprintf(stderr, "failed to refresh expert 0 LRU\n"); return 1; }
+    coli_expert_release(store, &view);
+
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 6}, &view) ||
+        !expect_fixture_expert(&view, 6))
+        { fprintf(stderr, "eviction load mismatch\n"); return 1; }
+    coli_expert_release(store, &view);
+    if (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 1}) != -1 ||
+        coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 2}) < 0 ||
+        coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 6}) < 0) {
+        fprintf(stderr, "expert index did not track eviction\n");
+        return 1;
+    }
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 2}, &view) ||
+        !expect_fixture_expert(&view, 2))
+        { fprintf(stderr, "surviving index entry mismatch\n"); return 1; }
+    coli_expert_release(store, &view);
+    if (coli_expert_lookup(store, (ColiExpertKey){0, 1}, &view) ||
+        !expect_fixture_expert(&view, 1))
+        { fprintf(stderr, "reloaded index entry mismatch\n"); return 1; }
+    coli_expert_release(store, &view);
+    if (coli_v4_test_expert_slot_index(store, (ColiExpertKey){0, 1}) < 0) {
+        fprintf(stderr, "reloaded expert was not indexed\n");
+        return 1;
+    }
+    store->ops->stats(store, &stats);
+    if (stats.requests != 13 || stats.hits != 5 || stats.misses != 8 ||
+        stats.prefetched != 1 || stats.bytes_read != 408 ||
+        stats.resident_bytes != 306 || stats.capacity_bytes != 306) {
+        fprintf(stderr,
+                "indexed eviction stats mismatch: requests=%llu hits=%llu misses=%llu bytes=%llu resident=%llu capacity=%llu\n",
                 (unsigned long long)stats.requests,
                 (unsigned long long)stats.hits,
                 (unsigned long long)stats.misses,
