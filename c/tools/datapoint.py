@@ -3,10 +3,12 @@
 
 The default ``persistent`` mode starts one engine through the shared mux
 ``SERVE=1`` protocol and keeps it alive for the complete campaign: one cold
-request, discarded warm-up request(s), then measured warm requests.  Expert,
-KV, GPU-residency and allocator state therefore survive exactly as they do in
-``coli serve``.  The engine's DONE frame supplies the real completion count,
-decode tok/s, expert hit rate and RSS; no output re-tokenization is needed.
+request, a repeated-prompt warm upper bound, then a deterministic rotation of
+different prompts as the primary serving workload.  Expert, KV, GPU-residency
+and allocator state therefore survive exactly as they do in ``coli serve``,
+without letting one repeated prompt define the headline result.  The engine's
+DONE frame supplies the real completion count, decode tok/s, expert hit rate
+and RSS; no output re-tokenization is needed.
 
 ``--mode fresh-process`` preserves the historical runner for startup/cold-cache
 work.  In that mode every row is a new process, so a row labelled warm means
@@ -21,7 +23,7 @@ runs immediately after eviction, before model loading can re-warm the files.
 Usage:
   python tools/datapoint.py --snap models/olmoe_merged
   python tools/datapoint.py --snap models/v4 --engine ./deepseek_v4 \
-      --warm-runs 3
+      --rotating-runs 8
   python tools/datapoint.py --mode fresh-process --snap models/olmoe_merged \
       --engine ./olmoe
 """
@@ -49,6 +51,21 @@ IOBENCH_RE = re.compile(r"-> ([\d.]+) GB/s")
 
 HERE = Path(__file__).resolve().parent
 C_ROOT = HERE.parent
+
+# Fixed order, no network corpus and no RNG: two machines run the same request
+# mix.  The prompts deliberately span reasoning, code, systems and multilingual
+# prose so a MoE cache must serve changing routes instead of memorising one
+# prompt.  --rotate-prompt replaces this suite for model-specific campaigns.
+DEFAULT_ROTATING_PROMPTS = (
+    "Explain how a database transaction can deadlock, give a concrete example, "
+    "and compare two practical prevention strategies in detail.",
+    "Write a Python function that merges overlapping intervals. Explain its "
+    "correctness, time complexity, edge cases, and include two examples.",
+    "A service has high median throughput but poor tail latency under load. "
+    "Develop a step-by-step investigation plan covering CPU, memory, and storage.",
+    "Rispondi in italiano: confronta memoria virtuale e memoria fisica, spiegando "
+    "page fault, cache del filesystem e un esempio pratico.",
+)
 
 
 def machine_info():
@@ -270,9 +287,29 @@ def _measure_persistent_request(engine, prompt, max_new):
     }
 
 
+def _rotating_prompt_suite(prompts=None):
+    selected = tuple(DEFAULT_ROTATING_PROMPTS if prompts is None else prompts)
+    if any(not isinstance(prompt, str) or not prompt.strip() for prompt in selected):
+        raise ValueError("rotating prompts must be non-empty strings")
+    if len(set(selected)) < 2:
+        raise ValueError("rotating workload needs at least two distinct prompts")
+    return selected
+
+
+def _render_prompt(runtime, prompt):
+    return runtime.render_chat_for_arch(
+        [{"role": "user", "content": prompt}], enable_thinking=False)
+
+
 def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
-                          cap, memory_gb=None, runtime=None, physical_cores=None):
-    """Measure multiple requests against one shared SERVE=1 engine process."""
+                          cap, memory_gb=None, runtime=None, physical_cores=None,
+                          rotating_prompts=None, rotating_runs=4):
+    """Measure repeated and rotating requests in one SERVE=1 process."""
+    if rotating_runs < 2:
+        raise ValueError("rotating_runs must be at least 2")
+    rotating_prompt_source = ("custom" if rotating_prompts is not None
+                              else "built-in")
+    rotating_prompts = _rotating_prompt_suite(rotating_prompts)
     runtime = runtime or _load_server_runtime()
     resolved = runtime.resolve_model(snap)
     family = resolved.descriptor
@@ -283,8 +320,9 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
         physical_cores = physical_core_count()
     env = _persistent_environment(family, max_new, memory_gb, physical_cores)
     runtime.ARCH = family.id
-    rendered = runtime.render_chat_for_arch(
-        [{"role": "user", "content": prompt}], enable_thinking=False)
+    rendered = _render_prompt(runtime, prompt)
+    rendered_rotating = [_render_prompt(runtime, item)
+                         for item in rotating_prompts]
 
     started = time.monotonic()
     persistent = runtime.Engine(executable, snap, cap=cap, max_tokens=max_new,
@@ -293,6 +331,7 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
     cold = []
     warmup = []
     warm = []
+    rotating = []
     try:
         print("[datapoint] persistent cold request 1/1", file=sys.stderr)
         cold.append(_measure_persistent_request(persistent, rendered, max_new))
@@ -301,9 +340,16 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
                   file=sys.stderr)
             warmup.append(_measure_persistent_request(persistent, rendered, max_new))
         for index in range(warm_runs):
-            print(f"[datapoint] measured warm request {index + 1}/{warm_runs}",
+            print(f"[datapoint] warm-identical upper bound {index + 1}/{warm_runs}",
                   file=sys.stderr)
             warm.append(_measure_persistent_request(persistent, rendered, max_new))
+        for index in range(rotating_runs):
+            prompt_index = index % len(rendered_rotating)
+            print(f"[datapoint] rotating prompt {index + 1}/{rotating_runs} "
+                  f"(suite {prompt_index + 1}/{len(rendered_rotating)})",
+                  file=sys.stderr)
+            rotating.append(_measure_persistent_request(
+                persistent, rendered_rotating[prompt_index], max_new))
         tiers = dict(persistent.tiers) if getattr(persistent, "tiers", None) else None
         hwinfo = dict(persistent.hwinfo) if getattr(persistent, "hwinfo", None) else None
     finally:
@@ -318,6 +364,9 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
         "cold": cold,
         "warmup": warmup,
         "warm": warm,
+        "rotating": rotating,
+        "rotating_prompt_count": len(rotating_prompts),
+        "rotating_prompt_source": rotating_prompt_source,
         "tiers": tiers,
         "hwinfo": hwinfo,
         "omp_threads": env.get("OMP_NUM_THREADS", "engine runtime auto"),
@@ -400,12 +449,16 @@ def build_parser():
     ap.add_argument("--iobench", default="./iobench", help="iobench binary")
     ap.add_argument("--shard", default=None, help="shard file for iobench")
     ap.add_argument("--prompt", default="Continue this story: The lighthouse keeper climbed the stairs and saw something impossible in the fog. ",
-                    help="prompt used for the decode runs")
+                    help="prompt used for cold and warm-identical requests")
+    ap.add_argument("--rotate-prompt", action="append", dest="rotating_prompts",
+                    help="custom rotating prompt; repeat at least twice to replace the built-in suite")
     ap.add_argument("--max-new", type=int, default=128, help="decode cap per run")
-    ap.add_argument("--warmup-runs", type=int, default=1,
-                    help="discarded warm-up requests in persistent mode (default: 1)")
-    ap.add_argument("--warm-runs", type=int, default=3,
-                    help="measured warm requests after warm-up (default: 3)")
+    ap.add_argument("--warmup-runs", type=int, default=0,
+                    help="extra discarded identical-prompt warm-ups (default: 0; cold already warms it)")
+    ap.add_argument("--warm-runs", type=int, default=1,
+                    help="measured identical-prompt upper-bound requests (default: 1)")
+    ap.add_argument("--rotating-runs", type=int, default=4,
+                    help="measured changing-prompt requests (primary result; default: 4)")
     ap.add_argument("--cap", type=int, default=16, help="per-layer expert cache cap passed to the engine")
     ap.add_argument("--bits", type=int, default=8,
                     help="quant bits passed by fresh-process legacy engines")
@@ -418,6 +471,17 @@ def build_parser():
 def _median(rows, key):
     values = [row[key] for row in rows if row.get(key) is not None]
     return statistics.median(values) if values else None
+
+
+def _percentile(rows, key, quantile):
+    values = sorted(row[key] for row in rows if row.get(key) is not None)
+    if not values:
+        return None
+    position = (len(values) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(values) - 1)
+    fraction = position - lower
+    return values[lower] + (values[upper] - values[lower]) * fraction
 
 
 def _cell(value, suffix="", digits=2):
@@ -435,8 +499,8 @@ def _append_result_row(out, label, result):
     )
 
 
-def _append_profile_summary(out, warm):
-    profiles = [row["profile"] for row in warm if row.get("profile")]
+def _append_profile_summary(out, label, rows):
+    profiles = [row["profile"] for row in rows if row.get("profile")]
     if not profiles:
         return
     fields = (
@@ -446,12 +510,36 @@ def _append_profile_summary(out, warm):
         ("attention", "attention_s"),
         ("lm head", "lm_head_s"),
     )
-    out += ["", "**Warm profile medians (engine telemetry):**", "",
+    out += ["", f"**{label} profile medians (engine telemetry):**", "",
             "| phase | seconds/request |", "|---|---|"]
-    for label, key in fields:
+    for phase, key in fields:
         values = [profile[key] for profile in profiles if key in profile]
         if values:
-            out.append(f"| {label} | {statistics.median(values):.3f} |")
+            out.append(f"| {phase} | {statistics.median(values):.3f} |")
+
+
+def _append_workload_summary(out, campaign):
+    persistent = campaign["mode"] == "persistent"
+    workloads = []
+    if persistent and campaign.get("rotating"):
+        workloads.append(("**rotating prompts (primary)**", campaign["rotating"]))
+    if campaign.get("warm"):
+        label = ("warm-identical (upper bound)" if persistent else
+                 "fresh-process repeats")
+        workloads.append((label, campaign["warm"]))
+    if not workloads:
+        return
+    out += ["", "**Workload summary:**", "",
+            "| workload | n | median tok/s | sigma tok/s | p95 request s | median hit |",
+            "|---|---:|---:|---:|---:|---:|"]
+    for label, rows in workloads:
+        tok_values = [row["tok_s"] for row in rows]
+        sigma = statistics.pstdev(tok_values) if len(tok_values) > 1 else 0.0
+        out.append(
+            f"| {label} | {len(rows)} | {_cell(_median(rows, 'tok_s'))} | "
+            f"{sigma:.3f} | {_cell(_percentile(rows, 'request_s', 0.95))} | "
+            f"{_cell(_median(rows, 'hit'), '%', 1)} |"
+        )
 
 
 def format_report(info, args, campaign, cold_label, disk):
@@ -485,6 +573,11 @@ def format_report(info, args, campaign, cold_label, disk):
         out.append("| expert tiers | "
                    f"VRAM {tiers['vram']} / RAM {tiers['ram']} / disk {tiers['disk']} "
                    f"({tiers['vram_gb']:.2f} + {tiers['ram_gb']:.2f} GB resident) |")
+    if campaign["mode"] == "persistent":
+        out.append("| prompt workload | "
+                   f"{campaign.get('rotating_prompt_count', 0)} "
+                   f"{campaign.get('rotating_prompt_source', 'unknown')} prompts, "
+                   "fixed rotation |")
 
     count_note = ("actual counts from engine" if campaign["mode"] == "persistent"
                   else "legacy count inference")
@@ -495,30 +588,28 @@ def format_report(info, args, campaign, cold_label, disk):
     for result in campaign["cold"]:
         _append_result_row(out, cold_label, result)
     for index, result in enumerate(campaign.get("warmup", ())):
-        _append_result_row(out, f"warm-up {index + 1} (discarded)", result)
+        _append_result_row(out, f"identical warm-up {index + 1} (discarded)", result)
     for index, result in enumerate(campaign["warm"]):
-        _append_result_row(out, f"warm {index + 1}", result)
+        label = (f"warm-identical {index + 1} (upper bound)"
+                 if campaign["mode"] == "persistent" else
+                 f"fresh-process repeat {index + 1}")
+        _append_result_row(out, label, result)
+    for index, result in enumerate(campaign.get("rotating", ())):
+        _append_result_row(out, f"rotating {index + 1} (primary)", result)
 
-    warm = campaign["warm"]
-    if warm:
-        tok_values = [row["tok_s"] for row in warm]
-        sigma = statistics.pstdev(tok_values) if len(tok_values) > 1 else 0.0
-        median_row = {
-            "prompt_tokens": round(_median(warm, "prompt_tokens") or 0),
-            "tokens": round(_median(warm, "tokens") or 0),
-            "request_s": _median(warm, "request_s"),
-            "ttft_s": _median(warm, "ttft_s"),
-            "tok_s": _median(warm, "tok_s"),
-            "hit": _median(warm, "hit"),
-            "rss": _median(warm, "rss"),
-        }
-        _append_result_row(out, f"**warm median (n={len(warm)}, sigma={sigma:.3f} tok/s)**",
-                           median_row)
-    _append_profile_summary(out, warm)
+    _append_workload_summary(out, campaign)
+    if campaign.get("rotating"):
+        _append_profile_summary(out, "Rotating workload", campaign["rotating"])
+    if campaign.get("warm"):
+        profile_label = ("Warm-identical upper bound"
+                         if campaign["mode"] == "persistent" else
+                         "Fresh-process repeats")
+        _append_profile_summary(out, profile_label, campaign["warm"])
 
     if campaign["mode"] == "persistent":
-        out += ["", "Persistent rows intentionally reuse the same engine process and cache slot;",
-                "the warm figures therefore represent serving state, including any valid KV-prefix reuse."]
+        out += ["", "Rotating prompts are the primary serving result: each request changes prompt",
+                "while the engine and expert cache remain alive. Warm-identical intentionally reuses",
+                "the same prompt and cache slot and is reported only as a cache/KV upper bound."]
     else:
         out += ["", "Fresh-process warm rows do not retain the engine's expert, KV, allocator, or GPU state."]
 
@@ -551,6 +642,13 @@ def main(argv=None):
         ap.error("--warm-runs must be positive")
     if args.memory_gb is not None and args.memory_gb <= 0:
         ap.error("--memory-gb must be positive")
+    if args.mode == "persistent":
+        if args.rotating_runs < 2:
+            ap.error("--rotating-runs must be at least 2")
+        try:
+            _rotating_prompt_suite(args.rotating_prompts)
+        except ValueError as error:
+            ap.error(str(error))
 
     info = machine_info()
     info["physical_cores"] = physical_core_count()
@@ -568,7 +666,9 @@ def main(argv=None):
         campaign = run_persistent_engine(
             args.engine, args.snap, args.prompt, args.max_new,
             args.warmup_runs, args.warm_runs, args.cap,
-            memory_gb=mem_gb, physical_cores=info["physical_cores"])
+            memory_gb=mem_gb, physical_cores=info["physical_cores"],
+            rotating_prompts=args.rotating_prompts,
+            rotating_runs=args.rotating_runs)
     else:
         family = None
         engine = args.engine
@@ -587,6 +687,7 @@ def main(argv=None):
             "cold": cold,
             "warmup": [],
             "warm": warm,
+            "rotating": [],
             "tiers": None,
             "hwinfo": None,
             "omp_threads": os.environ.get("OMP_NUM_THREADS", "process default"),

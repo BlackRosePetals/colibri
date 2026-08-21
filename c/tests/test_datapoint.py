@@ -116,20 +116,26 @@ class PersistentDatapointTest(unittest.TestCase):
                 f"rendered:{messages[0]['content']}:{enable_thinking}"),
         )
 
-    def test_default_campaign_reuses_one_engine_for_every_request(self):
+    def test_default_campaign_uses_rotating_prompts_as_primary_workload(self):
         runtime = self._runtime()
         with tempfile.TemporaryDirectory() as tmp:
             executable = Path(tmp) / "deepseek_v4"
             executable.touch()
             with mock.patch.dict(os.environ, {}, clear=True):
                 campaign = datapoint.run_persistent_engine(
-                    str(executable), "/model", "hello", 8, 1, 3, 16,
+                    str(executable), "/model", "hello", 8, 0, 1, 16,
                     memory_gb=64, runtime=runtime, physical_cores=8)
 
         self.assertEqual(len(self.instances), 1)
         engine = self.instances[0]
-        self.assertEqual(len(engine.calls), 5)  # cold + warm-up + 3 measured
-        self.assertTrue(all(call[0] == "rendered:hello:False" for call in engine.calls))
+        self.assertEqual(len(engine.calls), 6)  # cold + identical + 4 rotating
+        self.assertTrue(all(call[0] == "rendered:hello:False"
+                            for call in engine.calls[:2]))
+        self.assertEqual(
+            [call[0] for call in engine.calls[2:]],
+            [f"rendered:{prompt}:False"
+             for prompt in datapoint.DEFAULT_ROTATING_PROMPTS],
+        )
         self.assertTrue(all(call[4] == 0 for call in engine.calls))
         self.assertTrue(engine.closed)
         self.assertEqual(engine.env["RAM_GB"], "64")
@@ -137,11 +143,16 @@ class PersistentDatapointTest(unittest.TestCase):
         self.assertNotIn("OMP_NUM_THREADS", engine.env)  # V4 owns its thread split
         self.assertEqual(runtime.ARCH, "deepseek_v4")
         self.assertEqual(len(campaign["cold"]), 1)
-        self.assertEqual(len(campaign["warmup"]), 1)
-        self.assertEqual(len(campaign["warm"]), 3)
-        self.assertEqual([row["tok_s"] for row in campaign["warm"]], [3.0, 4.0, 5.0])
+        self.assertEqual(len(campaign["warmup"]), 0)
+        self.assertEqual(len(campaign["warm"]), 1)
+        self.assertEqual(len(campaign["rotating"]), 4)
+        self.assertEqual([row["tok_s"] for row in campaign["warm"]], [2.0])
+        self.assertEqual([row["tok_s"] for row in campaign["rotating"]],
+                         [3.0, 4.0, 5.0, 6.0])
         self.assertEqual(campaign["warm"][0]["tokens"], 8)
         self.assertEqual(campaign["warm"][0]["prompt_tokens"], 17)
+        self.assertEqual(campaign["rotating_prompt_count"], 4)
+        self.assertEqual(campaign["rotating_prompt_source"], "built-in")
 
     def test_engine_is_closed_when_a_request_fails(self):
         instances = self.instances
@@ -214,9 +225,48 @@ class PersistentDatapointTest(unittest.TestCase):
     def test_parser_defaults_to_persistent_campaign(self):
         args = datapoint.build_parser().parse_args(["--snap", "/model"])
         self.assertEqual(args.mode, "persistent")
-        self.assertEqual(args.warmup_runs, 1)
-        self.assertEqual(args.warm_runs, 3)
+        self.assertEqual(args.warmup_runs, 0)
+        self.assertEqual(args.warm_runs, 1)
+        self.assertEqual(args.rotating_runs, 4)
+        self.assertIsNone(args.rotating_prompts)
         self.assertIsNone(args.engine)
+
+    def test_custom_rotating_suite_requires_two_distinct_nonempty_prompts(self):
+        self.assertEqual(datapoint._rotating_prompt_suite(["one", "two"]),
+                         ("one", "two"))
+        with self.assertRaisesRegex(ValueError, "two distinct"):
+            datapoint._rotating_prompt_suite(["same", "same"])
+        with self.assertRaisesRegex(ValueError, "two distinct"):
+            datapoint._rotating_prompt_suite([])
+        with self.assertRaisesRegex(ValueError, "non-empty"):
+            datapoint._rotating_prompt_suite(["one", " "])
+
+    def test_report_makes_rotating_primary_and_identical_an_upper_bound(self):
+        args = SimpleNamespace(snap="/model", cap=16, memory_gb=64,
+                               max_new=8, shard=None)
+        row = {"prompt_tokens": 4, "tokens": 8, "request_s": 2.0,
+               "ttft_s": 0.5, "tok_s": 4.0, "hit": 60.0,
+               "rss": 12.0, "profile": {"expert_disk_s": 0.25}}
+        campaign = {
+            "mode": "persistent", "family_name": "DeepSeek V4",
+            "engine": "/tmp/deepseek_v4", "load_s": 1.0,
+            "cold": [row], "warmup": [], "warm": [dict(row, tok_s=9.0)],
+            "rotating": [dict(row, tok_s=value, request_s=10.0 - value)
+                         for value in (3.0, 4.0, 5.0, 6.0)],
+            "rotating_prompt_count": 4, "rotating_prompt_source": "built-in",
+            "tiers": None, "hwinfo": None, "omp_threads": "8",
+            "loader_lanes": "engine default",
+        }
+        info = {"cpu": "test CPU", "ram": "64 GB", "ram_gb": 64,
+                "cores": 16, "physical_cores": 8, "os": "test OS"}
+        report = datapoint.format_report(
+            info, args, campaign, "cold request", {})
+        rotating = report.index("| **rotating prompts (primary)** |")
+        identical = report.index("| warm-identical (upper bound) |")
+        self.assertLess(rotating, identical)
+        self.assertIn("| **rotating prompts (primary)** | 4 | 4.50 |", report)
+        self.assertIn("p95 request s", report)
+        self.assertIn("4 built-in prompts, fixed rotation", report)
 
     def test_every_registered_family_has_the_shared_persistent_adapter(self):
         expected = {"glm", "inkling", "kimi", "olmoe", "qwen36", "deepseek_v4"}
