@@ -3150,6 +3150,9 @@ static int cluster_worker_run(const char *snap,int port,int ebits,int dbits){
 #define URING_REQ_MAX  512
 typedef struct {
     int load, expect;
+    int fd, primary_fd, rep;
+    void *buf;
+    int64_t off;
 } UringRead;
 typedef struct {
     Model *m; ESlot *s; int layer,eid,fatal;
@@ -3177,14 +3180,26 @@ static int uring_load_error(UringLoad *l,int err,const char *what){
     if(l->fatal){ errno=l->error; perror(what); exit(1); }
     return -1;
 }
-static int uring_add_read(UringBatch *b,int li,int fd,void *buf,size_t len,
-                          int64_t off,size_t expect){
+static int uring_add_read(UringBatch *b,int li,int fd,int primary_fd,int rep,
+                          void *buf,size_t len,int64_t off,size_t expect){
     if(b->nreq>=URING_REQ_MAX || expect>INT_MAX){ errno=E2BIG; return -1; }
+    if(rep<0 || rep>=MIR_REPS){ errno=EINVAL; return -1; }
     int ri=b->nreq++;
-    b->req[ri]=(UringRead){li,(int)expect};
+    b->req[ri]=(UringRead){li,(int)expect,fd,primary_fd,rep,buf,off};
     if(coli_uring_prep_read(&b->ring,fd,buf,len,off,(uint64_t)ri+1)) return -1;
     b->load[li].pending++;
     return 0;
+}
+/* Buffered replica read with per-shard fallback.  Keep the actual source in
+ * UringRead: completion accounting, DROP and runtime error fallback must all
+ * describe the fd that was really submitted, not recompute a route later. */
+static int uring_add_rep_read(UringBatch *b,int li,shards *S,int primary_fd,
+                              int rep,void *buf,size_t len,int64_t off,
+                              size_t expect){
+    int fd=st_fd_rep(S,primary_fd,rep);
+    int used=(rep && fd>=0)?rep:0;
+    if(fd<0) fd=primary_fd;
+    return uring_add_read(b,li,fd,primary_fd,used,buf,len,off,expect);
 }
 /* Returns the load index. URING is intentionally a quantized streaming path;
  * unsupported layouts fail instead of silently dropping back to pread. */
@@ -3266,25 +3281,31 @@ static int uring_load_add(UringBatch *b,Model *m,int layer,int eid,ESlot *s,int 
             int64_t base=off0&~4095LL,need=(off0-base)+wtot,len=(need+4095)&~4095LL;
             l->pos[ord[0]]=off0-base; l->pos[ord[1]]=l->pos[ord[0]]+l->tw[ord[0]]->nbytes;
             l->pos[ord[2]]=l->pos[ord[1]]+l->tw[ord[1]]->nbytes;
-            if(uring_add_read(b,li,dfd,s->slab,(size_t)len,base,(size_t)need))
+            if(uring_add_read(b,li,dfd,l->tw[ord[0]]->fd,rep,
+                              s->slab,(size_t)len,base,(size_t)need))
                 return uring_load_error(l,errno,"io_uring direct expert read"),li;
         }else{
             l->pos[ord[0]]=0; l->pos[ord[1]]=l->tw[ord[0]]->nbytes;
             l->pos[ord[2]]=l->pos[ord[1]]+l->tw[ord[1]]->nbytes;
-            if(uring_add_read(b,li,rep_bfd(&m->S,l->tw[ord[0]]->fd,rep),s->slab,(size_t)wtot,off0,(size_t)wtot))
+            if(uring_add_rep_read(b,li,&m->S,l->tw[ord[0]]->fd,rep,
+                                  s->slab,(size_t)wtot,off0,(size_t)wtot))
                 return uring_load_error(l,errno,"io_uring expert read"),li;
         }
     }else{
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a]; l->pos[k]=o;
-            if(uring_add_read(b,li,rep_bfd(&m->S,l->tw[k]->fd,rep),s->slab+o,(size_t)l->tw[k]->nbytes,l->tw[k]->off,(size_t)l->tw[k]->nbytes))
+            if(uring_add_rep_read(b,li,&m->S,l->tw[k]->fd,rep,
+                                  s->slab+o,(size_t)l->tw[k]->nbytes,
+                                  l->tw[k]->off,(size_t)l->tw[k]->nbytes))
                 return uring_load_error(l,errno,"io_uring expert read"),li;
             o+=l->tw[k]->nbytes;
         }
     }
     int64_t fo=0;
     for(int k=0;k<3;k++){
-        if(uring_add_read(b,li,rep_bfd(&m->S,l->tq[k]->fd,rep),s->fslab+fo,(size_t)l->tq[k]->nbytes,l->tq[k]->off,(size_t)l->tq[k]->nbytes))
+        if(uring_add_rep_read(b,li,&m->S,l->tq[k]->fd,rep,
+                              s->fslab+fo,(size_t)l->tq[k]->nbytes,
+                              l->tq[k]->off,(size_t)l->tq[k]->nbytes))
             return uring_load_error(l,errno,"io_uring expert scale read"),li;
         fo+=l->tq[k]->nbytes/4;
     }
@@ -3295,7 +3316,25 @@ static void uring_reap(UringBatch *b){
     while(coli_uring_peek(&b->ring,&cqe)){
         if(!cqe.user_data || cqe.user_data>(uint64_t)b->nreq) continue;
         UringRead *r=&b->req[cqe.user_data-1]; UringLoad *l=&b->load[r->load];
-        if(cqe.res<r->expect && !l->error) l->error=cqe.res<0?-cqe.res:EIO;
+        int served=cqe.res>=r->expect;
+        if(!served && r->rep){
+            /* Match mir_pread's availability contract. A missing replica file
+             * is handled before submission; an I/O error or short completion
+             * discovered here gets one synchronous retry on the primary. This
+             * path is exceptional, so preserving inference is more important
+             * than retaining queue depth while a mirror is degraded. */
+            static _Atomic int warned;
+            if(!atomic_exchange(&warned,1))
+                fprintf(stderr,"[MIRROR] io_uring read error on the mirror copy — falling back to the primary drive\n");
+            if(!pread_full(r->primary_fd,r->buf,r->expect,r->off,
+                           "io_uring mirror fallback")){
+                r->fd=r->primary_fd; r->rep=0; cqe.res=r->expect; served=1;
+            }
+        }
+        if(served){
+            atomic_fetch_add_explicit(&g_mir_bytes[r->rep],cqe.res,memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_mir_nread[r->rep],1,memory_order_relaxed);
+        }else if(!l->error) l->error=cqe.res<0?-cqe.res:EIO;
         if(l->pending>0) l->pending--;
         if(l->pending==0) l->done=1;
     }
@@ -3317,10 +3356,12 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
     if(l->finalized) return 0;
     if(uring_wait_load(b,li)<0){ errno=l->error; if(l->fatal){perror("io_uring expert completion");exit(1);} return -1; }
     if(g_drop){
-        int ord0=0; for(int k=1;k<3;k++) if(l->tw[k]->off<l->tw[ord0]->off) ord0=k;
-        int64_t wtot=l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes;
-        posix_fadvise(l->tw[ord0]->fd,l->tw[ord0]->off,wtot,POSIX_FADV_DONTNEED);
-        for(int k=0;k<3;k++) posix_fadvise(l->tq[k]->fd,l->tq[k]->off,l->tq[k]->nbytes,POSIX_FADV_DONTNEED);
+        /* Each request remembers its final source (mirror, per-shard primary,
+         * or primary after an error retry). Dropping tensor metadata's primary
+         * fd here left the pages actually read from a mirror resident forever. */
+        for(int ri=0;ri<b->nreq;ri++) if(b->req[ri].load==li)
+            posix_fadvise(b->req[ri].fd,b->req[ri].off,
+                          (off_t)b->req[ri].expect,POSIX_FADV_DONTNEED);
     }
     Cfg *c=&l->m->c; int I=c->moe_inter,D=c->hidden; float *fp[3]; int64_t fo=0;
     QT *qt[3]={&s->g,&s->u,&s->d}; int OO[3]={I,I,D},II[3]={D,D,I};
@@ -3334,6 +3375,9 @@ static int uring_finalize_load(UringBatch *b,int li,int publish_eid){
         qt[k]->fmt=fmt; qt[k]->O=OO[k]; qt[k]->I=II[k]; qt[k]->gs=gs; qt[k]->qf=NULL;
         qt[k]->q8=(int8_t*)(s->slab+l->pos[k]); qt[k]->q4=s->slab+l->pos[k]; qt[k]->s=fp[k];
     }
+    atomic_fetch_add_explicit(&g_prof_io,
+        l->tw[0]->nbytes+l->tw[1]->nbytes+l->tw[2]->nbytes+fo*4,
+        memory_order_relaxed);
     if(publish_eid) s->eid=l->eid;
     l->finalized=1; return 0;
 }
