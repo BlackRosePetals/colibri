@@ -54,8 +54,9 @@ COLI_MODEL=/path/to/glm52_i4 ./coli chat
 
 # 3) full automated datapoint — machine info + cold/warm decode + disk, one command:
 python tools/datapoint.py --snap /path/to/model --shard /path/to/container/model-00000.safetensors
-# (stdlib-only; evicts the page cache before the cold run, caps decode at --max-new
-#  tokens so tok/s is exact, and prints a ready-to-paste datapoint block)
+# (stdlib-only; auto-selects GLM, Inkling, Kimi K3, OLMoE, Qwen3.6, or DeepSeek V4
+#  from config.json; evicts the page cache before engine load; then keeps one
+#  SERVE=1 engine alive for a discarded warm-up and 3 measured warm requests)
 
 # 4) record expert usage, then pin the hottest experts in your spare RAM:
 STATS=stats.txt ./coli chat
@@ -64,6 +65,16 @@ PIN=stats.txt PIN_GB=20 ./coli chat        # scale PIN_GB to your free RAM
 # 5) quality benchmarks (MMLU/HellaSwag/ARC):
 ./coli bench
 ```
+
+The default datapoint measures serving behavior, not repeated startup: the same
+engine process and cache slot are used for one cold request, one discarded
+warm-up, and three measured warm requests. The reported completion count,
+decode tok/s, expert hit rate, and RSS come from each engine's `DONE` frame.
+This preserves expert-cache, KV-prefix, GPU-residency, and allocator state and
+makes the warm median comparable across every registered model family. Use
+`--mode fresh-process` only when measuring startup or OS page-cache effects;
+that compatibility mode launches a new engine for every row and therefore does
+not retain in-process caches.
 
 ## Back-of-envelope predictions
 
