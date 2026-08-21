@@ -4015,6 +4015,23 @@ static unsigned metal_fused_layer_fmt_miss(const Layer *l){
     return miss;
 }
 
+/* #1151 follow-up: the flash/gather kvb arms under quantized KV.
+ * kv_lc_rows_f32 dequantizes latent rows [t0, t0+n) into an f32 staging buffer
+ * (the same per-row codecs the one-shot path uses); the roped-key reads
+ * inline the one-shot path's three-way branch so each representation keeps
+ * its exact accumulation order. */
+static void kv_lc_rows_f32(Model *m, int layer, int64_t t0, int64_t n, float *dst, Cfg *c){
+    if(g_tq){
+        int lbb=coli_kvq_row_bytes(c->kv_lora,g_tq_bits,g_tq_codec);
+        for(int64_t t=t0;t<t0+n;t++)
+            coli_kvq_dequant_row(coli_kv_row8(m->Lc8[layer],t,lbb), m->Lsc[layer][t],
+                                 dst+(t-t0)*c->kv_lora, c->kv_lora, g_tq_bits, g_tq_codec);
+    } else {
+        for(int64_t t=t0;t<t0+n;t++)
+            coli_kv8_dequant_row(coli_kv_row8(m->Lc8[layer],t,c->kv_lora), m->Lsc[layer][t],
+                                 dst+(t-t0)*c->kv_lora, c->kv_lora);
+    }
+}
 static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int pos_base,
                            KVState *const *kvs, const int *positions, float *out){
     Cfg *c=&m->c; int H=c->n_heads, D=c->hidden, qh=c->qk_head, vh=c->v_head;
@@ -4622,11 +4639,8 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
     int dsa_any=0; if(dnsel) for(int s=0;s<S && !dsa_any;s++) if(dnsel[s]>0) dsa_any=1;
     int64_t kvb_rows=(int64_t)Tk-stL, kvb_need=kvb_rows*kvb_dim*4;
     int64_t flash_mb=getenv("KVB_FLASH_MB")?atoll(getenv("KVB_FLASH_MB")):2048;
-    int kv_quant = g_kv8 || g_tq;   /* KV8/KV_TQ read Lc via a dequant staging pass:
-                                     * they keep the one-shot path below for now (the
-                                     * flash/gather arms read f32 Lc rows directly). */
-    int use_flash=!dsa_any && !kv_quant && flash_mb>0 && kvb_need>flash_mb*1048576;
-    if(getenv("KVB_FLASH")) use_flash=!dsa_any && !kv_quant && atoi(getenv("KVB_FLASH"))!=0;
+    int use_flash=!dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576;
+    if(getenv("KVB_FLASH")) use_flash=!dsa_any && atoi(getenv("KVB_FLASH"))!=0;
     if(use_flash){
         int64_t tile_mb=getenv("KVB_TILE_MB")?atoll(getenv("KVB_TILE_MB")):512;
         int64_t tile=tile_mb*1048576/((int64_t)kvb_dim*4);
@@ -4638,6 +4652,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         m->t_kvb += now_s()-tk0;
         float *kvb_tile=falloc(tile*kvb_dim);
+        /* quantized KV: dequantize each tile's latent rows into an f32 staging
+         * buffer for the kv_b matmul — same codecs as the one-shot path, tile-
+         * sized instead of context-sized (#1151 follow-up) */
+        float *Lf_tile=(g_kv8||g_tq)?falloc(tile*c->kv_lora):NULL;
         float *ml=falloc((int64_t)S*H*2);              /* running (max, sum) per (row, head) */
         double tac=now_s(), kvb_acc=0;
         #pragma omp parallel for collapse(2) schedule(static)
@@ -4648,7 +4666,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         for(int64_t t0=stL; t0<Tk; t0+=tile){
             int64_t tn=Tk-t0<tile?Tk-t0:tile;
             double tk1=now_s();
-            matmul_qt(kvb_tile, m->Lc[layer]+t0*c->kv_lora, &l->kv_b, (int)tn);
+            if(Lf_tile){
+                kv_lc_rows_f32(m,layer,t0,tn,Lf_tile,c);
+                matmul_qt(kvb_tile, Lf_tile, &l->kv_b, (int)tn);
+            } else
+                matmul_qt(kvb_tile, m->Lc[layer]+t0*c->kv_lora, &l->kv_b, (int)tn);
             kvb_acc+=now_s()-tk1;
             #pragma omp parallel for collapse(2) schedule(static,1)
             for(int s=0;s<S;s++) for(int h=0;h<H;h++){
@@ -4661,9 +4683,20 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 float mrun=st[0], lrun=st[1];
                 for(int64_t jj=0;jj<jn;jj++){
                     const float *kn=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh);
-                    const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
                     float a=0; for(int d=0;d<c->qk_nope;d++) a+=qp[d]*kn[d];
-                    for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                    if(g_tq){
+                        float Rf[512];
+                        coli_kvq_dequant_row(coli_kv_row8(m->Rc8[layer],t0+jj,coli_kvq_row_bytes(c->qk_rope,g_tq_bits,g_tq_codec)),
+                                             m->Rsc[layer][t0+jj], Rf, c->qk_rope, g_tq_bits, g_tq_codec);
+                        for(int d=0;d<c->qk_rope;d++) a+=qr[d]*Rf[d];
+                    } else if(g_kv8){
+                        const uint8_t *kr=coli_kv_row8(m->Rc8[layer],t0+jj,c->qk_rope);
+                        float ar=0; for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
+                        a+=ar*m->Rsc[layer][t0+jj];
+                    } else {
+                        const float *kr=m->Rc[layer]+(t0+jj)*c->qk_rope;
+                        for(int d=0;d<c->qk_rope;d++) a+=qr[d]*kr[d];
+                    }
                     a*=c->attn_scale;
                     const float *vv=kvb_tile+jj*kvb_dim+(int64_t)h*(c->qk_nope+vh)+c->qk_nope;
                     if(a>mrun){
@@ -4683,7 +4716,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float *cx=ctx+((int64_t)s*H+h)*vh;
             if(lrun>0) for(int d=0;d<vh;d++) cx[d]/=lrun;
         }
-        free(kvb_tile); free(ml);
+        free(kvb_tile); free(Lf_tile); free(ml);
         m->t_kvb+=kvb_acc; m->t_acore+=now_s()-tac-kvb_acc; double tao=now_s();
         matmul_qt(out, ctx, &l->o, S); m->t_aout+=now_s()-tao;
         free(ctx); free(Q); free(QR); free(comp);
@@ -4699,7 +4732,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * least halve the buffer, fall back to one-shot (gather overhead without the
      * memory win). kvb_map: row t -> compact index, -1 = not rebuilt (never read). */
     float *kvb_all=NULL; int32_t *kvb_map=NULL;
-    if(dsa_any && !kv_quant && flash_mb>0 && kvb_need>flash_mb*1048576){
+    if(dsa_any && flash_mb>0 && kvb_need>flash_mb*1048576){
         uint8_t *want=calloc((size_t)kvb_rows,1);
         if(want){
             for(int s=0;s<S;s++){
@@ -4717,9 +4750,13 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                 if(kvb_map){
                     float *Lg=falloc(un*c->kv_lora); int64_t w=0;
                     for(int64_t r=0;r<kvb_rows;r++){
-                        if(want[r]){ memcpy(Lg+w*c->kv_lora,
-                                m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
-                                (size_t)c->kv_lora*sizeof(float));
+                        if(want[r]){
+                            if(g_kv8||g_tq)              /* quantized latent: dequant the row (#1151 follow-up) */
+                                kv_lc_rows_f32(m,layer,(int64_t)stL+r,1,Lg+w*c->kv_lora,c);
+                            else
+                                memcpy(Lg+w*c->kv_lora,
+                                    m->Lc[layer]+((int64_t)stL+r)*c->kv_lora,
+                                    (size_t)c->kv_lora*sizeof(float));
                             kvb_map[r]=(int32_t)w; w++; }
                         else kvb_map[r]=-1;
                     }
