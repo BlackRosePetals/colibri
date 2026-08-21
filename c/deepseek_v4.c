@@ -5239,6 +5239,63 @@ int coli_v4_block_window_token_ref(
  *
  * V4_EXPERT_UNION=0 restores the per-position path for A/B timing.
  * ========================================================================= */
+enum { V4_EXPERT_BATCH_MAX = 128 };
+
+static int v4_flush_expert_batch(
+    float *outputs, ColiExpertStore *store, const ColiExpertView *view,
+    const float *batch_inputs, const float *batch_weights,
+    const int *batch_items, float *batch_outputs, int count, int dimension,
+    float swiglu_limit) {
+    if (count < 1) return 0;
+    double began = v4_now_mono();
+    int result = count == 1
+        ? coli_v4_expert_forward_ref(batch_outputs, view, batch_inputs,
+                                     batch_weights[0], swiglu_limit)
+        : coli_v4_expert_forward_batch_ref(
+              batch_outputs, view, batch_inputs, batch_weights, count,
+              swiglu_limit);
+    coli_v4_expert_store_add_matmul(store, v4_now_mono() - began);
+    if (result) return -1;
+    /* Matches were gathered in ascending (item, rank) order.  Accumulate in
+     * that same order so duplicate routes retain scalar-path FP ordering. */
+    for (int match = 0; match < count; match++)
+        for (int column = 0; column < dimension; column++)
+            outputs[(size_t)batch_items[match] * dimension + column] +=
+                batch_outputs[(size_t)match * dimension + column];
+    return 0;
+}
+
+static int v4_apply_expert_batch(
+    float *outputs, ColiExpertStore *store, const ColiExpertView *view,
+    const float *inputs, const int *indices, const float *route_weights,
+    int batch, int topk, int dimension, float swiglu_limit,
+    float *batch_inputs, float *batch_route_weights, int *batch_items,
+    float *batch_outputs, int batch_capacity) {
+    int count = 0;
+    int expert = view->key.expert;
+    for (int item = 0; item < batch; item++)
+        for (int rank = 0; rank < topk; rank++) {
+            size_t route = (size_t)item * topk + rank;
+            if (indices[route] != expert) continue;
+            memcpy(batch_inputs + (size_t)count * dimension,
+                   inputs + (size_t)item * dimension,
+                   (size_t)dimension * sizeof(*batch_inputs));
+            batch_route_weights[count] = route_weights[route];
+            batch_items[count++] = item;
+            if (count == batch_capacity) {
+                if (v4_flush_expert_batch(
+                        outputs, store, view, batch_inputs,
+                        batch_route_weights, batch_items, batch_outputs,
+                        count, dimension, swiglu_limit))
+                    return -1;
+                count = 0;
+            }
+        }
+    return v4_flush_expert_batch(
+        outputs, store, view, batch_inputs, batch_route_weights, batch_items,
+        batch_outputs, count, dimension, swiglu_limit);
+}
+
 static int v4_moe_batch_union(
     float *outputs, const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, ColiExpertStore *store,
@@ -5258,12 +5315,24 @@ static int v4_moe_batch_union(
     float *route_weights = malloc((size_t)batch * topk * sizeof(*route_weights));
     int *indices = malloc((size_t)batch * topk * sizeof(*indices));
     float *shared = malloc((size_t)batch * d * sizeof(*shared));
-    float *expert_output = malloc((size_t)d * sizeof(*expert_output));
+    size_t route_count = (size_t)batch * topk;
+    int expert_batch_capacity = route_count < V4_EXPERT_BATCH_MAX
+        ? (int)route_count : V4_EXPERT_BATCH_MAX;
+    float *expert_inputs = malloc(
+        (size_t)expert_batch_capacity * d * sizeof(*expert_inputs));
+    float *expert_outputs = malloc(
+        (size_t)expert_batch_capacity * d * sizeof(*expert_outputs));
+    float *expert_weights = malloc(
+        (size_t)expert_batch_capacity * sizeof(*expert_weights));
+    int *expert_items = malloc(
+        (size_t)expert_batch_capacity * sizeof(*expert_items));
     unsigned char *used = calloc((size_t)n, 1);
     ColiExpertKey *keys = malloc((size_t)n * sizeof(*keys));
     if (missing_gate || !route_weights || !indices || !shared ||
-        !expert_output || !used || !keys) {
-        free(keys); free(used); free(expert_output); free(shared);
+        !expert_inputs || !expert_outputs || !expert_weights ||
+        !expert_items || !used || !keys) {
+        free(keys); free(used); free(expert_items); free(expert_weights);
+        free(expert_outputs); free(expert_inputs); free(shared);
         free(indices); free(route_weights); free(gate);
         return -1;
     }
@@ -5357,19 +5426,12 @@ static int v4_moe_batch_union(
             else
                 active[slot] = 1;
         }
-        int expert = view.key.expert;
-        for (int item = 0; !result && item < batch; item++)
-            for (int rank = 0; !result && rank < topk; rank++) {
-                if (indices[(size_t)item * topk + rank] != expert) continue;
-                result = coli_v4_expert_forward_ref(
-                    expert_output, &view, inputs + (size_t)item * d,
-                    route_weights[(size_t)item * topk + rank],
-                    config->swiglu_limit);
-                if (!result)
-                    for (int column = 0; column < d; column++)
-                        outputs[(size_t)item * d + column] +=
-                            expert_output[column];
-            }
+        if (!result)
+            result = v4_apply_expert_batch(
+                outputs, store, &view, inputs, indices, route_weights,
+                batch, topk, d, config->swiglu_limit, expert_inputs,
+                expert_weights, expert_items, expert_outputs,
+                expert_batch_capacity);
         coli_expert_release(store, &view);
     }
     for (int slot = 0; slot < dual_loader_lanes(); slot++)
@@ -5384,19 +5446,11 @@ static int v4_moe_batch_union(
             result = -1;
             break;
         }
-        int expert = keys[current].expert;
-        for (int item = 0; !result && item < batch; item++)
-            for (int rank = 0; !result && rank < topk; rank++) {
-                if (indices[(size_t)item * topk + rank] != expert) continue;
-                result = coli_v4_expert_forward_ref(
-                    expert_output, &view, inputs + (size_t)item * d,
-                    route_weights[(size_t)item * topk + rank],
-                    config->swiglu_limit);
-                if (!result)
-                    for (int column = 0; column < d; column++)
-                        outputs[(size_t)item * d + column] +=
-                            expert_output[column];
-            }
+        result = v4_apply_expert_batch(
+            outputs, store, &view, inputs, indices, route_weights,
+            batch, topk, d, config->swiglu_limit, expert_inputs,
+            expert_weights, expert_items, expert_outputs,
+            expert_batch_capacity);
         coli_expert_release(store, &view);
     }
 #endif
@@ -5406,7 +5460,8 @@ static int v4_moe_batch_union(
                 outputs[(size_t)item * d + column] +
                 shared[(size_t)item * d + column]);
 
-    free(keys); free(used); free(expert_output); free(shared);
+    free(keys); free(used); free(expert_items); free(expert_weights);
+    free(expert_outputs); free(expert_inputs); free(shared);
     free(indices); free(route_weights); free(gate);
     return result ? -1 : 0;
 }
@@ -8441,6 +8496,71 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
     free(activated); free(up); free(gate);
     return result ? -1 : 0;
 #endif
+}
+
+int coli_v4_expert_forward_batch_ref(float *outputs,
+                                     const ColiExpertView *expert,
+                                     const float *inputs,
+                                     const float *route_weights,
+                                     int batch, float swiglu_limit) {
+    if (!outputs || !expert || !inputs || !route_weights || batch < 1 ||
+        batch > 128 || swiglu_limit < 0.0f || expert->gate.rows < 1 ||
+        expert->gate.columns < 1 || expert->gate.rows != expert->up.rows ||
+        expert->gate.columns != expert->up.columns ||
+        expert->down.columns != expert->gate.rows ||
+        expert->down.rows != expert->gate.columns)
+        return -1;
+
+    /* Hot pinned experts use the private rows16 layout.  Its scalar kernel is
+     * already bit-converged with row-major FP4, but the batch kernel does not
+     * understand that packing yet, so preserve the established path. */
+    if (expert->gate.block_rows != 1 || expert->up.block_rows != 1 ||
+        expert->down.block_rows != 1) {
+        for (int item = 0; item < batch; item++)
+            if (coli_v4_expert_forward_ref(
+                    outputs + (size_t)item * expert->down.rows, expert,
+                    inputs + (size_t)item * expert->gate.columns,
+                    route_weights[item], swiglu_limit))
+                return -1;
+        return 0;
+    }
+
+    size_t intermediate = (size_t)expert->gate.rows;
+    if ((size_t)batch > SIZE_MAX / intermediate) return -1;
+    size_t cells = (size_t)batch * intermediate;
+    if (cells > SIZE_MAX / (3 * sizeof(float))) return -1;
+    float *workspace = malloc(3 * cells * sizeof(*workspace));
+    if (!workspace) return -1;
+    float *gate = workspace;
+    float *up = gate + cells;
+    float *activated = up + cells;
+
+    int result = coli_fp4_matmul_batch_ref(
+        gate, &expert->gate, inputs, batch);
+    if (!result)
+        result = coli_fp4_matmul_batch_ref(
+            up, &expert->up, inputs, batch);
+    for (int item = 0; !result && item < batch; item++) {
+        float *item_gate = gate + (size_t)item * intermediate;
+        float *item_up = up + (size_t)item * intermediate;
+        float *item_activated = activated + (size_t)item * intermediate;
+        coli_bf16_round_array(item_gate, intermediate);
+        coli_bf16_round_array(item_up, intermediate);
+        result = coli_v4_swiglu(item_activated, item_gate, item_up,
+                                (int)intermediate, swiglu_limit);
+        if (!result)
+            for (size_t column = 0; column < intermediate; column++)
+                item_activated[column] = coli_bf16_round(
+                    item_activated[column] * route_weights[item]);
+    }
+    if (!result)
+        result = coli_fp4_matmul_batch_ref(
+            outputs, &expert->down, activated, batch);
+    if (!result)
+        coli_bf16_round_array(
+            outputs, (size_t)batch * (size_t)expert->down.rows);
+    free(workspace);
+    return result ? -1 : 0;
 }
 #endif /* COLI_V4_UNIT_EXPERT_ROWS16 */
 
@@ -14870,10 +14990,12 @@ int coli_v4_qdq_scratch(size_t activation_count, size_t scales_count,
  * in order), which preserves each row's scalar operation order exactly — the
  * rows16 kernels' own trick. The scalar arm splits the two multiplies and the
  * add into separate statements so no compiler contracts them into an FMA:
- * every rows16 ISA rounds the product before the add. */
-void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
-                                    const uint8_t *e8s, const float *x,
-                                    int I, int O) {
+ * every rows16 ISA rounds the product before the add.  The batch form keeps
+ * one accumulator per activation while decoding each weight tile once, so it
+ * preserves that order without streaming the matrix once per activation. */
+void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
+                                        const uint8_t *e8s, const float *x,
+                                        int S, int I, int O) {
     int rb = I / 2, ng = I / 32;
 #ifdef __AVX2__
     /* Nibble decode borrows matmul_mxfp4's trick — doubled e2m1 values are
@@ -14891,7 +15013,11 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
         const __m128i lut2 = _mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
         const __m128i m4 = _mm_set1_epi8(0x0F);
         const __m256 half = _mm256_set1_ps(0.5f);
-        __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+        __m256 sum0[128], sum1[128];
+        for (int s = 0; s < S; s++) {
+            sum0[s] = _mm256_setzero_ps();
+            sum1[s] = _mm256_setzero_ps();
+        }
         for (int base = 0; base < I; base += 32) {
             float sc[16], tmp[2][32][8];
             for (int half_rows = 0; half_rows < 2; half_rows++) {
@@ -14953,33 +15079,49 @@ void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
             }
             __m256 sc0 = _mm256_loadu_ps(sc), sc1 = _mm256_loadu_ps(sc + 8);
             for (int c = 0; c < 32; c++) {
-                __m256 xv = _mm256_set1_ps(x[base + c]);
-                sum0 = _mm256_add_ps(sum0, _mm256_mul_ps(
-                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[0][c])), sc0));
-                sum1 = _mm256_add_ps(sum1, _mm256_mul_ps(
-                    _mm256_mul_ps(xv, _mm256_loadu_ps(tmp[1][c])), sc1));
+                __m256 weight0 = _mm256_loadu_ps(tmp[0][c]);
+                __m256 weight1 = _mm256_loadu_ps(tmp[1][c]);
+                for (int s = 0; s < S; s++) {
+                    __m256 xv = _mm256_set1_ps(
+                        x[(int64_t)s * I + base + c]);
+                    sum0[s] = _mm256_add_ps(sum0[s], _mm256_mul_ps(
+                        _mm256_mul_ps(xv, weight0), sc0));
+                    sum1[s] = _mm256_add_ps(sum1[s], _mm256_mul_ps(
+                        _mm256_mul_ps(xv, weight1), sc1));
+                }
             }
         }
-        _mm256_storeu_ps(y + tile * 16, sum0);
-        _mm256_storeu_ps(y + tile * 16 + 8, sum1);
+        for (int s = 0; s < S; s++) {
+            _mm256_storeu_ps(y + (int64_t)s * O + tile * 16, sum0[s]);
+            _mm256_storeu_ps(y + (int64_t)s * O + tile * 16 + 8, sum1[s]);
+        }
     }
 #else
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const uint8_t *w = q4 + (int64_t)o * rb;
         const uint8_t *scl = e8s + (int64_t)o * ng;
-        float sum = 0.0f;
+        float sums[128] = {0};
         for (int c = 0; c < I; c++) {
             uint8_t byte = w[c >> 1];
             float wv = coli_e2m1_decode((c & 1) ? (uint8_t)(byte >> 4)
                                                 : (uint8_t)(byte & 0xF));
-            float t = x[c] * wv;                 /* separate statements: the   */
-            t = t * coli_e8m0_decode(scl[c / 32]); /* product must round before */
-            sum = sum + t;                       /* the add, as on every ISA   */
+            float scale = coli_e8m0_decode(scl[c / 32]);
+            for (int s = 0; s < S; s++) {
+                float t = x[(int64_t)s * I + c] * wv;
+                t = t * scale;
+                sums[s] = sums[s] + t;
+            }
         }
-        y[o] = sum;
+        for (int s = 0; s < S; s++) y[(int64_t)s * O + o] = sums[s];
     }
 #endif
+}
+
+void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
+                                  const uint8_t *e8s, const float *x,
+                                  int I, int O) {
+    coli_fp4_matmul_batch_rows16_order(y, q4, e8s, x, 1, I, O);
 }
 
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
@@ -15310,6 +15452,10 @@ int coli_fp8_dual_matvec_ref(float *output_a, float *output_b,
 #pragma GCC diagnostic pop
 #endif
 
+#ifdef COLI_V4_TEST_HOOKS
+uint64_t coli_v4_test_fp4_batch_calls;
+#endif
+
 /* Validazione condivisa fra _ref e _pre (stessi controlli di sempre).
  * EN: shared shape/format validation between _ref and _pre. */
 static int fp8_batch_validate(const ColiTensorView *weight, int batch) {
@@ -15440,6 +15586,9 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
         !weight->data || !weight->scales || weight->rows < 1 ||
         weight->columns < 1 || weight->columns % 128 ||
         weight->block_rows != 1 || weight->block_columns != 32) return -1;
+#ifdef COLI_V4_TEST_HOOKS
+    coli_v4_test_fp4_batch_calls++;
+#endif
     size_t rows = (size_t)weight->rows, columns = (size_t)weight->columns;
     size_t packed_stride = columns / 2, scale_stride = columns / 32;
     if (weight->data_bytes != rows * packed_stride ||
@@ -15455,8 +15604,13 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
                 inputs + (size_t)item * columns, columns, 128) != 0) {
             return -1;
         }
-    matmul_mxfp4(outputs, activations, weight->data, weight->scales,
-                 batch, (int)columns, (int)rows);
+    if (rows % 16 == 0)
+        coli_fp4_matmul_batch_rows16_order(
+            outputs, weight->data, weight->scales, activations,
+            batch, (int)columns, (int)rows);
+    else
+        matmul_mxfp4(outputs, activations, weight->data, weight->scales,
+                     batch, (int)columns, (int)rows);
     return 0;
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_BATCH */

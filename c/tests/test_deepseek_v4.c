@@ -219,6 +219,81 @@ static int test_expert(void) {
     return 0;
 }
 
+/* The production prefill path must use the dormant FP4 batch kernel without
+ * moving a single result bit.  Varied packed nibbles, scales, activations and
+ * route weights prevent a uniform fixture from hiding an ordering change. */
+static int test_expert_batch(void) {
+    /* 4096 columns are intentional: the old 32-column-partial batch order
+     * matched a 128-column toy by accident but diverged at Flash width. */
+    enum { DIMENSION = 4096, INTERMEDIATE = 128, BATCH = 5 };
+    static uint8_t gate_data[INTERMEDIATE * DIMENSION / 2];
+    static uint8_t up_data[INTERMEDIATE * DIMENSION / 2];
+    static uint8_t down_data[DIMENSION * INTERMEDIATE / 2];
+    static uint8_t gate_scale[INTERMEDIATE * DIMENSION / 32];
+    static uint8_t up_scale[INTERMEDIATE * DIMENSION / 32];
+    static uint8_t down_scale[DIMENSION * INTERMEDIATE / 32];
+    ColiExpertView expert = {0};
+    make_tensor(&expert.gate, gate_data, gate_scale,
+                INTERMEDIATE, DIMENSION, 0);
+    make_tensor(&expert.up, up_data, up_scale,
+                INTERMEDIATE, DIMENSION, 0);
+    make_tensor(&expert.down, down_data, down_scale,
+                DIMENSION, INTERMEDIATE, 0);
+    uint32_t state = 0x1159u;
+    uint8_t *data[] = {gate_data, up_data, down_data};
+    uint8_t *scales[] = {gate_scale, up_scale, down_scale};
+    for (int matrix = 0; matrix < 3; matrix++) {
+        for (size_t i = 0; i < sizeof(gate_data); i++) {
+            state = state * 1664525u + 1013904223u;
+            data[matrix][i] = (uint8_t)(state >> 24);
+        }
+        for (size_t i = 0; i < sizeof(gate_scale); i++) {
+            state = state * 1664525u + 1013904223u;
+            scales[matrix][i] = (uint8_t)(125 + ((state >> 24) % 5));
+        }
+    }
+    float inputs[BATCH * DIMENSION];
+    float route_weights[BATCH] = {0.125f, 0.5f, 0.75f, 1.0f, 1.375f};
+    float scalar[BATCH * DIMENSION], batched[BATCH * DIMENSION];
+    for (int item = 0; item < BATCH; item++)
+        for (int column = 0; column < DIMENSION; column++)
+            inputs[(size_t)item * DIMENSION + column] =
+                0.0078125f * (float)(((item + 3) * (column + 5)) % 29 - 14);
+    for (int item = 0; item < BATCH; item++)
+        if (coli_v4_expert_forward_ref(
+                scalar + (size_t)item * DIMENSION, &expert,
+                inputs + (size_t)item * DIMENSION, route_weights[item],
+                10.0f))
+            return 1;
+    coli_v4_test_fp4_batch_calls = 0;
+    if (coli_v4_expert_forward_batch_ref(
+            batched, &expert, inputs, route_weights, BATCH, 10.0f))
+        return 1;
+    if (coli_v4_test_fp4_batch_calls != 3) {
+        fprintf(stderr, "expected 3 FP4 batch matrices, got %llu\n",
+                (unsigned long long)coli_v4_test_fp4_batch_calls);
+        return 1;
+    }
+    if (memcmp(scalar, batched, sizeof(scalar)) != 0) {
+        for (int i = 0; i < BATCH * DIMENSION; i++)
+            if (scalar[i] != batched[i]) {
+                fprintf(stderr,
+                        "expert batch mismatch item=%d column=%d: %.9g vs %.9g\n",
+                        i / DIMENSION, i % DIMENSION,
+                        (double)scalar[i], (double)batched[i]);
+                break;
+            }
+        return 1;
+    }
+    uint64_t calls = coli_v4_test_fp4_batch_calls;
+    if (coli_v4_expert_forward_batch_ref(
+            batched, &expert, inputs, route_weights, 0, 10.0f) == 0 ||
+        coli_v4_test_fp4_batch_calls != calls)
+        return 1;
+    puts("DeepSeek-V4 expert batch: ok (3 matrices, scalar-exact bits)");
+    return 0;
+}
+
 /* #1136: a rows16-packed copy and the row-major original of the SAME matrix
  * must produce bit-identical matvec outputs — the reference path accumulates
  * in the rows16 order now, so which kernel an expert takes (cache residency)
@@ -1092,6 +1167,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert() != 0) {
         fprintf(stderr, "FAIL: test_expert\n");
+        return 1;
+    }
+    if (test_expert_batch() != 0) {
+        fprintf(stderr, "FAIL: test_expert_batch\n");
         return 1;
     }
     if (test_rows16_convergence() != 0) {

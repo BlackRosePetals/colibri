@@ -43,6 +43,11 @@ int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
 void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
                                   const uint8_t *e8s, const float *x,
                                   int I, int O);
+/* Batch-major companion: independent scalar-order accumulators share each
+ * decoded weight tile, so the matrix is streamed once for the whole batch. */
+void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
+                                        const uint8_t *e8s, const float *x,
+                                        int batch, int I, int O);
 
 /* Correctness-first FP8 matvec for native 128x128 E4M3 weight blocks with
  * UE8M0 scales and dynamically quantized E4M3 activations. */

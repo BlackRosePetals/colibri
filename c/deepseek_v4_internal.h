@@ -563,6 +563,15 @@ int coli_v4_expert_forward_ref(float *output, const ColiExpertView *expert,
                                const float *input, float route_weight,
                                float swiglu_limit);
 
+/* Batch-major routed-expert forward.  The row-major FP4 path streams each
+ * matrix once for all items; unsupported packed layouts fall back to the
+ * scalar entry point without changing its numerical contract. */
+int coli_v4_expert_forward_batch_ref(float *outputs,
+                                     const ColiExpertView *expert,
+                                     const float *inputs,
+                                     const float *route_weights,
+                                     int batch, float swiglu_limit);
+
 int coli_v4_shared_expert_forward_ref(float *output,
                                       const ColiTensorView *gate,
                                       const ColiTensorView *down,
@@ -956,6 +965,7 @@ extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
 extern void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
 extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
+extern uint64_t coli_v4_test_fp4_batch_calls;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
