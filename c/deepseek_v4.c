@@ -6965,6 +6965,7 @@ typedef struct {
 
 typedef struct {
     int expert;
+    int loading_expert;
     unsigned references;
     uint64_t used;
     unsigned char *slab;
@@ -6983,6 +6984,7 @@ typedef struct {
     unsigned active_leases;
     ColiExpertStoreStats stats;
     pthread_mutex_t mutex;
+    pthread_cond_t load_ready;
     double disk_sec;   /* cumulative wall time spent reading expert bytes from disk */
     double matmul_sec; /* cumulative expert-forward compute time (#890): the phase the
                         * dashboard needs alongside disk_sec so it stops folding
@@ -7283,6 +7285,7 @@ static void destroy(ColiExpertStore *store) {
                 compat_aligned_free(state->slots[i].slab);
             else
                 free(state->slots[i].slab);
+        pthread_cond_destroy(&state->load_ready);
         pthread_mutex_destroy(&state->mutex);
         coli_st_index_close(state->index);
         free(state->records);
@@ -7312,6 +7315,13 @@ int coli_deepseek_v4_expert_store_open(
         return set_error(error, error_size, "out of memory creating ExpertStore");
     }
     pthread_mutex_init(&state->mutex, NULL);
+    if (pthread_cond_init(&state->load_ready, NULL) != 0) {
+        pthread_mutex_destroy(&state->mutex);
+        free(state);
+        free(store);
+        return set_error(error, error_size,
+                         "cannot initialize ExpertStore load condition");
+    }
     state->layers = options->layers;
     state->experts_per_layer = options->experts_per_layer;
     if (coli_st_index_open(&state->index, options->model_dir, error, error_size) != 0)
@@ -7361,8 +7371,10 @@ int coli_deepseek_v4_expert_store_open(
         set_error(error, error_size, "out of memory creating expert cache slots");
         goto fail;
     }
-    for (int i = 0; i < state->layers * state->slots_per_layer; i++)
+    for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
         state->slots[i].expert = -1;
+        state->slots[i].loading_expert = -1;
+    }
     size_t telemetry_cells =
         (size_t)state->layers * state->experts_per_layer;
     state->ehit = calloc(telemetry_cells, sizeof(*state->ehit));
@@ -7384,6 +7396,7 @@ fail:
     free(state->ehit);
     free(state->eheat);
     coli_st_index_close(state->index);
+    pthread_cond_destroy(&state->load_ready);
     pthread_mutex_destroy(&state->mutex);
     free(state);
     free(store);
@@ -7536,6 +7549,11 @@ static uint64_t v4_direct_reads;
 static uint64_t v4_direct_flock_reads;
 static uint64_t v4_direct_payload_bytes;
 static uint64_t v4_direct_fallbacks;
+
+#ifdef COLI_V4_TEST_HOOKS
+void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
+void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
+#endif
 
 static int v4_pread_full_try(int fd, void *destination, size_t length,
                              uint64_t offset) {
@@ -7827,7 +7845,9 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         hot_repin_locked(policy, state, key.layer);
 
     V4ExpertSlot *slots = layer_slots(state, key.layer);
-    V4ExpertSlot *slot = NULL;
+    V4ExpertSlot *slot;
+retry_lookup:
+    slot = NULL;
     for (int i = 0; i < state->slots_per_layer; i++) {
         if (slots[i].slab && slots[i].expert == key.expert) {
             slot = &slots[i]; slot->references++;
@@ -7841,6 +7861,24 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
             hot_fill_view(&view->up, record, slot, V4_W3, policy, state);
             view->lease = slot;
             pthread_mutex_unlock(&state->mutex); return 0;
+        }
+    }
+    /* Another caller may already be filling a cache slot for this expert.
+     * Wait for that single loader to publish (or abandon) the slot instead
+     * of issuing the same SSD read into a second slab. Different experts do
+     * not match this reservation and continue to load concurrently. */
+    for (int i = 0; i < state->slots_per_layer; i++) {
+        if (slots[i].loading_expert == key.expert) {
+#ifdef COLI_V4_TEST_HOOKS
+            if (coli_v4_test_expert_wait_hook)
+                coli_v4_test_expert_wait_hook(key);
+#endif
+            if (pthread_cond_wait(&state->load_ready, &state->mutex) != 0) {
+                pthread_mutex_unlock(&state->mutex);
+                memset(view, 0, sizeof(*view));
+                return -1;
+            }
+            goto retry_lookup;
         }
     }
     for (int i = 0; i < state->slots_per_layer; i++)
@@ -7871,13 +7909,18 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         state->stats.resident_bytes += state->record_bytes;
     }
     policy->packed[hot_slot_index(state, slot)] = 0;
-    slot->expert = -1; slot->references = 1;
+    slot->expert = -1; slot->loading_expert = key.expert;
+    slot->references = 1;
     state->active_leases++;
     slot->used = ++state->clock;
     pthread_mutex_unlock(&state->mutex);
     int rep = coli_st_expert_route(key.layer, key.expert);
     struct timespec disk_t0;
     clock_gettime(CLOCK_MONOTONIC, &disk_t0);
+#ifdef COLI_V4_TEST_HOOKS
+    if (coli_v4_test_expert_read_hook)
+        coli_v4_test_expert_read_hook(key);
+#endif
     int read_result = v4_read_expert_record(state, record, slot, rep);
     struct timespec disk_t1;
     clock_gettime(CLOCK_MONOTONIC, &disk_t1);
@@ -7887,7 +7930,8 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     unsigned char *v4_pack_buf = NULL;
     /* Not when the GPU tier mirrors experts: pinned experts run from their
      * fp4 mirror, and a rows16-repacked slab could not be uploaded. */
-    if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
+    if (!read_result &&
+        hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
         v4_pack_buf = hot_pack_slot_prepare(record, slot);
     pthread_mutex_lock(&state->mutex);
     state->disk_sec +=
@@ -7895,13 +7939,16 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
     if (read_result) {
         slot->references = 0; slot->expert = -1;
+        slot->loading_expert = -1;
         if (state->active_leases) state->active_leases--;
         free(v4_pack_buf);
+        pthread_cond_broadcast(&state->load_ready);
         pthread_mutex_unlock(&state->mutex);
         memset(view, 0, sizeof(*view));
         return -1;
     }
-    slot->expert = key.expert; slot->used = ++state->clock;
+    slot->expert = key.expert; slot->loading_expert = -1;
+    slot->used = ++state->clock;
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
     hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
     v4_pack_buf = NULL;
@@ -7910,6 +7957,7 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
     hot_fill_view(&view->down, record, slot, V4_W2, policy, state);
     hot_fill_view(&view->up, record, slot, V4_W3, policy, state);
     view->lease = slot;
+    pthread_cond_broadcast(&state->load_ready);
     pthread_mutex_unlock(&state->mutex); return 0;
 }
 

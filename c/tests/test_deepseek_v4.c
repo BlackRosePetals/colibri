@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -306,10 +307,22 @@ static int write_fixture(const char *path) {
         "\"resident\":{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[3,7]},"
         "\"layers.0.ffn.experts.0.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[7,23]},"
         "\"layers.0.ffn.experts.0.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[23,39]},"
-        "\"layers.0.ffn.experts.0.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[39,55]}"
+        "\"layers.0.ffn.experts.0.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[39,55]},"
+        "\"layers.0.ffn.experts.1.w1.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[55,56]},"
+        "\"layers.0.ffn.experts.1.w2.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[56,57]},"
+        "\"layers.0.ffn.experts.1.w3.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[57,58]},"
+        "\"layers.0.ffn.experts.1.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[58,74]},"
+        "\"layers.0.ffn.experts.1.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[74,90]},"
+        "\"layers.0.ffn.experts.1.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[90,106]},"
+        "\"layers.0.ffn.experts.2.w1.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[106,107]},"
+        "\"layers.0.ffn.experts.2.w2.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[107,108]},"
+        "\"layers.0.ffn.experts.2.w3.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[1,1],\"data_offsets\":[108,109]},"
+        "\"layers.0.ffn.experts.2.w1.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[109,125]},"
+        "\"layers.0.ffn.experts.2.w2.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[125,141]},"
+        "\"layers.0.ffn.experts.2.w3.weight\":{\"dtype\":\"I8\",\"shape\":[1,16],\"data_offsets\":[141,157]}"
         "}";
-    unsigned char payload[55];
-    for (int i = 0; i < 55; i++) payload[i] = (unsigned char)i;
+    unsigned char payload[157];
+    for (int i = 0; i < 157; i++) payload[i] = (unsigned char)i;
     uint64_t header_length = sizeof(header) - 1;
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
     if (fd < 0) return -1;
@@ -320,16 +333,125 @@ static int write_fixture(const char *path) {
     return result ? -1 : 0;
 }
 
+enum {
+    TEST_READ_SAME_EXPERT,
+    TEST_READ_DISTINCT_EXPERTS
+};
+
+static pthread_mutex_t expert_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t expert_hook_ready = PTHREAD_COND_INITIALIZER;
+static int expert_hook_mode;
+static int expert_hook_reads;
+static int expert_hook_waits;
+static int expert_hook_active;
+static int expert_hook_max_active;
+static int expert_hook_abort;
+
+static void reset_expert_hooks(int mode) {
+    pthread_mutex_lock(&expert_hook_mutex);
+    expert_hook_mode = mode;
+    expert_hook_reads = 0;
+    expert_hook_waits = 0;
+    expert_hook_active = 0;
+    expert_hook_max_active = 0;
+    expert_hook_abort = 0;
+    pthread_mutex_unlock(&expert_hook_mutex);
+}
+
+static void abort_expert_hooks(void) {
+    pthread_mutex_lock(&expert_hook_mutex);
+    expert_hook_abort = 1;
+    pthread_cond_broadcast(&expert_hook_ready);
+    pthread_mutex_unlock(&expert_hook_mutex);
+}
+
+static void test_expert_read_hook(ColiExpertKey key) {
+    (void)key;
+    pthread_mutex_lock(&expert_hook_mutex);
+    expert_hook_reads++;
+    expert_hook_active++;
+    if (expert_hook_active > expert_hook_max_active)
+        expert_hook_max_active = expert_hook_active;
+    pthread_cond_broadcast(&expert_hook_ready);
+    if (expert_hook_mode == TEST_READ_SAME_EXPERT) {
+        while (!expert_hook_abort && !expert_hook_waits &&
+               expert_hook_reads < 2)
+            pthread_cond_wait(&expert_hook_ready, &expert_hook_mutex);
+    } else {
+        /* A wait here means distinct experts were incorrectly coalesced. */
+        while (!expert_hook_abort && expert_hook_reads < 2 &&
+               !expert_hook_waits)
+            pthread_cond_wait(&expert_hook_ready, &expert_hook_mutex);
+    }
+    expert_hook_active--;
+    pthread_cond_broadcast(&expert_hook_ready);
+    pthread_mutex_unlock(&expert_hook_mutex);
+}
+
+static void test_expert_wait_hook(ColiExpertKey key) {
+    (void)key;
+    pthread_mutex_lock(&expert_hook_mutex);
+    expert_hook_waits++;
+    pthread_cond_broadcast(&expert_hook_ready);
+    pthread_mutex_unlock(&expert_hook_mutex);
+}
+
+typedef struct {
+    ColiExpertStore *store;
+    ColiExpertKey key;
+    ColiExpertView view;
+    int result;
+} ExpertLookupJob;
+
+static void *expert_lookup_worker(void *opaque) {
+    ExpertLookupJob *job = opaque;
+    job->result = coli_expert_lookup(job->store, job->key, &job->view);
+    return NULL;
+}
+
+static int run_parallel_lookups(ColiExpertStore *store,
+                                ColiExpertKey first, ColiExpertKey second,
+                                ExpertLookupJob jobs[2]) {
+    pthread_t threads[2];
+    memset(jobs, 0, 2 * sizeof(*jobs));
+    jobs[0].store = jobs[1].store = store;
+    jobs[0].key = first;
+    jobs[1].key = second;
+    coli_v4_test_expert_read_hook = test_expert_read_hook;
+    coli_v4_test_expert_wait_hook = test_expert_wait_hook;
+    if (pthread_create(&threads[0], NULL, expert_lookup_worker, &jobs[0])) {
+        coli_v4_test_expert_read_hook = NULL;
+        coli_v4_test_expert_wait_hook = NULL;
+        return -1;
+    }
+    if (pthread_create(&threads[1], NULL, expert_lookup_worker, &jobs[1])) {
+        abort_expert_hooks();
+        pthread_join(threads[0], NULL);
+        if (!jobs[0].result) coli_expert_release(store, &jobs[0].view);
+        coli_v4_test_expert_read_hook = NULL;
+        coli_v4_test_expert_wait_hook = NULL;
+        return -1;
+    }
+    int join_result = pthread_join(threads[0], NULL) |
+                      pthread_join(threads[1], NULL);
+    coli_v4_test_expert_read_hook = NULL;
+    coli_v4_test_expert_wait_hook = NULL;
+    return join_result || jobs[0].result || jobs[1].result ? -1 : 0;
+}
+
 static int test_expert_store(void) {
     /* Native MinGW binaries do not resolve the MSYS /tmp mount. */
     char directory[] = "colibri-v4-store-XXXXXX";
     char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
     if (!mkdtemp(directory)) { perror("mkdtemp"); return 1; }
     snprintf(path, sizeof(path), "%s/model.safetensors", directory);
     if (write_fixture(path) != 0) { perror("write_fixture"); return 1; }
 
     ColiDeepSeekV4ExpertStoreOptions options = {
-        directory, 1, 1, 51, -1, 0
+        directory, 1, 3, 153, -1, 0
     };
     ColiExpertStore *store = NULL;
     if (coli_deepseek_v4_expert_store_open(&options, &store,
@@ -342,36 +464,46 @@ static int test_expert_store(void) {
     if (store->ops->prefetch(store, &key, 1) != 1) {
         fprintf(stderr, "prefetch failed\n"); return 1;
     }
-    if (coli_expert_lookup(store, key, &view) != 0) {
-        fprintf(stderr, "lookup failed\n"); return 1;
+    ExpertLookupJob same[2];
+    reset_expert_hooks(TEST_READ_SAME_EXPERT);
+    if (run_parallel_lookups(store, key, key, same) != 0) {
+        fprintf(stderr, "parallel same-expert lookup failed\n"); return 1;
     }
-    if (view.gate.format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
-        view.gate.rows != 1 || view.gate.columns != 32 ||
-        view.gate.data_bytes != 16 || view.gate.scale_bytes != 1 ||
-        ((const unsigned char *)view.gate.scales)[0] != 0 ||
-        ((const unsigned char *)view.gate.data)[0] != 7 ||
-        ((const unsigned char *)view.down.data)[0] != 23 ||
-        ((const unsigned char *)view.up.data)[0] != 39)
+    if (expert_hook_reads != 1 || expert_hook_waits < 1 ||
+        expert_hook_max_active != 1) {
+        fprintf(stderr,
+                "same-expert load was not single-flight: reads=%d waits=%d active=%d\n",
+                expert_hook_reads, expert_hook_waits,
+                expert_hook_max_active);
+        return 1;
+    }
+    ColiExpertView *loaded = &same[0].view;
+    if (loaded->gate.format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
+        loaded->gate.rows != 1 || loaded->gate.columns != 32 ||
+        loaded->gate.data_bytes != 16 || loaded->gate.scale_bytes != 1 ||
+        ((const unsigned char *)loaded->gate.scales)[0] != 0 ||
+        ((const unsigned char *)loaded->gate.data)[0] != 7 ||
+        ((const unsigned char *)loaded->down.data)[0] != 23 ||
+        ((const unsigned char *)loaded->up.data)[0] != 39)
         { fprintf(stderr, "expert view mismatch: format=%d rows=%lld columns=%lld data=%zu scales=%zu bytes=%u/%u/%u/%u\n",
-                  (int)view.gate.format, (long long)view.gate.rows,
-                  (long long)view.gate.columns, view.gate.data_bytes,
-                  view.gate.scale_bytes,
-                  ((const unsigned char *)view.gate.scales)[0],
-                  ((const unsigned char *)view.gate.data)[0],
-                  ((const unsigned char *)view.down.data)[0],
-                  ((const unsigned char *)view.up.data)[0]); return 1; }
-    coli_expert_release(store, &view);
+                  (int)loaded->gate.format, (long long)loaded->gate.rows,
+                  (long long)loaded->gate.columns, loaded->gate.data_bytes,
+                  loaded->gate.scale_bytes,
+                  ((const unsigned char *)loaded->gate.scales)[0],
+                  ((const unsigned char *)loaded->gate.data)[0],
+                  ((const unsigned char *)loaded->down.data)[0],
+                  ((const unsigned char *)loaded->up.data)[0]); return 1; }
+    coli_expert_release(store, &same[0].view);
     {
         static const ColiExpertView zero;
-        if (memcmp(&view, &zero, sizeof(view)) != 0) {
+        if (memcmp(&same[0].view, &zero, sizeof(same[0].view)) != 0) {
             fprintf(stderr, "release did not clear view\n");
             return 1;
         }
     }
     /* Double release of a cleared view is a no-op. */
-    coli_expert_release(store, &view);
-    if (coli_expert_lookup(store, key, &view) != 0) return 1;
-    coli_expert_release(store, &view);
+    coli_expert_release(store, &same[0].view);
+    coli_expert_release(store, &same[1].view);
     /* Invalid key lookup must fail and clear the view. */
     memset(&view, 0x3c, sizeof(view));
     if (coli_expert_lookup(store, (ColiExpertKey){9, 9}, &view) == 0) return 1;
@@ -386,7 +518,7 @@ static int test_expert_store(void) {
     store->ops->stats(store, &stats);
     if (stats.requests != 2 || stats.hits != 1 || stats.misses != 1 ||
         stats.prefetched != 1 || stats.bytes_read != 51 ||
-        stats.resident_bytes != 51 || stats.capacity_bytes != 51)
+        stats.resident_bytes != 51 || stats.capacity_bytes != 153)
         { fprintf(stderr, "expert stats mismatch: requests=%llu hits=%llu misses=%llu prefetched=%llu bytes=%llu resident=%llu capacity=%llu\n",
                   (unsigned long long)stats.requests,
                   (unsigned long long)stats.hits,
@@ -395,6 +527,37 @@ static int test_expert_store(void) {
                   (unsigned long long)stats.bytes_read,
                   (unsigned long long)stats.resident_bytes,
                   (unsigned long long)stats.capacity_bytes); return 1; }
+
+    ExpertLookupJob distinct[2];
+    reset_expert_hooks(TEST_READ_DISTINCT_EXPERTS);
+    if (run_parallel_lookups(store, (ColiExpertKey){0, 1},
+                             (ColiExpertKey){0, 2}, distinct) != 0) {
+        fprintf(stderr, "parallel distinct-expert lookup failed\n"); return 1;
+    }
+    if (expert_hook_reads != 2 || expert_hook_waits != 0 ||
+        expert_hook_max_active != 2) {
+        fprintf(stderr,
+                "distinct expert loads did not overlap: reads=%d waits=%d active=%d\n",
+                expert_hook_reads, expert_hook_waits,
+                expert_hook_max_active);
+        return 1;
+    }
+    coli_expert_release(store, &distinct[0].view);
+    coli_expert_release(store, &distinct[1].view);
+    store->ops->stats(store, &stats);
+    if (stats.requests != 4 || stats.hits != 1 || stats.misses != 3 ||
+        stats.prefetched != 1 || stats.bytes_read != 153 ||
+        stats.resident_bytes != 153 || stats.capacity_bytes != 153) {
+        fprintf(stderr,
+                "concurrent expert stats mismatch: requests=%llu hits=%llu misses=%llu bytes=%llu resident=%llu capacity=%llu\n",
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses,
+                (unsigned long long)stats.bytes_read,
+                (unsigned long long)stats.resident_bytes,
+                (unsigned long long)stats.capacity_bytes);
+        return 1;
+    }
     store->ops->destroy(store);
     unlink(path);
     rmdir(directory);

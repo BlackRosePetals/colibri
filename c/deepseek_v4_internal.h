@@ -954,6 +954,8 @@ int coli_st_read_at_engine(ColiV4Engine *engine,
 extern int coli_v4_test_fail_expert_store_open;
 extern int coli_v4_test_skip_expert_store_open;
 extern int coli_v4_test_closed_owned_index;
+extern void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
+extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);
 void coli_v4_test_session_bare_destroy(ColiV4Session *session);
