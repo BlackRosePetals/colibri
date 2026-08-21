@@ -285,6 +285,17 @@ static int test_expert_batch(void) {
             }
         return 1;
     }
+    /* The public batch entry keeps batch-one on the dedicated matvec path;
+     * protect its exact-output contract alongside the separate perf check. */
+    float scalar_matrix[INTERMEDIATE], batch_one[INTERMEDIATE];
+    coli_fp4_matvec_rows16_order(
+        scalar_matrix, gate_data, gate_scale, inputs, DIMENSION, INTERMEDIATE);
+    coli_fp4_matmul_batch_rows16_order(
+        batch_one, gate_data, gate_scale, inputs, 1, DIMENSION, INTERMEDIATE);
+    if (memcmp(scalar_matrix, batch_one, sizeof(scalar_matrix)) != 0) {
+        fputs("FP4 batch-one dispatch diverged from scalar matvec\n", stderr);
+        return 1;
+    }
     uint64_t calls = coli_v4_test_fp4_batch_calls;
     if (coli_v4_expert_forward_batch_ref(
             batched, &expert, inputs, route_weights, 0, 10.0f) == 0 ||

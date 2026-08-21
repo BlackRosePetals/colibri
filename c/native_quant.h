@@ -11,6 +11,8 @@ extern "C" {
 #endif
 
 float coli_e8m0_decode(uint8_t value);
+/* Process-wide immutable decode table shared by split native-quant units. */
+const float *coli_e8m0_table(void);
 float coli_e2m1_decode(uint8_t nibble);
 float coli_e4m3fn_decode(uint8_t value);
 uint8_t coli_e4m3fn_encode(float value);
