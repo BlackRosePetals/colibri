@@ -14752,6 +14752,7 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
 
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef __AVX2__
@@ -14761,6 +14762,24 @@ int coli_v4_config_load(ColiDeepSeekV4Config *config, const char *model_dir,
 float coli_e8m0_decode(uint8_t value) {
     if (value == 0xff) return NAN;
     return ldexpf(1.0f, (int)value - 127);
+}
+
+/* Every FP4 matvec used to rebuild this table locally, including 255 calls
+ * to ldexpf.  Decode performs three matvecs per routed expert, so batch-one
+ * decode paid that setup hundreds of thousands of times per response.  A
+ * process-wide immutable table keeps the exact decoder as its single source
+ * of truth while making both scalar and batched kernels reuse the result. */
+static float coli_e8m0_lut[256];
+static pthread_once_t coli_e8m0_lut_once = PTHREAD_ONCE_INIT;
+
+static void coli_e8m0_lut_initialize(void) {
+    for (int value = 0; value < 256; value++)
+        coli_e8m0_lut[value] = coli_e8m0_decode((uint8_t)value);
+}
+
+const float *coli_e8m0_table(void) {
+    pthread_once(&coli_e8m0_lut_once, coli_e8m0_lut_initialize);
+    return coli_e8m0_lut;
 }
 
 float coli_e2m1_decode(uint8_t nibble) {
@@ -14996,7 +15015,17 @@ int coli_v4_qdq_scratch(size_t activation_count, size_t scales_count,
 void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
                                         const uint8_t *e8s, const float *x,
                                         int S, int I, int O) {
+    /* Decode is always batch-one.  Keep it on the register-resident kernel;
+     * the runtime-sized accumulator arrays below necessarily spill on AVX2.
+     * Prefill still shares decoded weights whenever two or more positions
+     * route to the same expert. */
+    if (S == 1) {
+        coli_fp4_matvec_rows16_order(y, q4, e8s, x, I, O);
+        return;
+    }
     int rb = I / 2, ng = I / 32;
+    float e8lut[256];
+    memcpy(e8lut, coli_e8m0_table(), sizeof(e8lut));
 #ifdef __AVX2__
     /* Nibble decode borrows matmul_mxfp4's trick — doubled e2m1 values are
      * exact int8, one pshufb decodes a 16-byte row into 32 codes — but the
@@ -15006,8 +15035,6 @@ void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
      * rows16 kernels. Rows decode row-major (streaming loads), then 8x8
      * transposes turn them column-major so 16 rows ride two 8-lane vectors
      * down the column loop in the rows16 per-row order: mul, mul, add. */
-    float e8lut[256];
-    for (int v = 0; v < 256; v++) e8lut[v] = coli_e8m0_decode((uint8_t)v);
     #pragma omp parallel for schedule(static)
     for (int64_t tile = 0; tile < O / 16; tile++) {
         const __m128i lut2 = _mm_setr_epi8(0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
@@ -15106,7 +15133,7 @@ void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
             uint8_t byte = w[c >> 1];
             float wv = coli_e2m1_decode((c & 1) ? (uint8_t)(byte >> 4)
                                                 : (uint8_t)(byte & 0xF));
-            float scale = coli_e8m0_decode(scl[c / 32]);
+            float scale = e8lut[scl[c / 32]];
             for (int s = 0; s < S; s++) {
                 float t = x[(int64_t)s * I + c] * wv;
                 t = t * scale;
@@ -15121,7 +15148,120 @@ void coli_fp4_matmul_batch_rows16_order(float *y, const uint8_t *q4,
 void coli_fp4_matvec_rows16_order(float *y, const uint8_t *q4,
                                   const uint8_t *e8s, const float *x,
                                   int I, int O) {
-    coli_fp4_matmul_batch_rows16_order(y, q4, e8s, x, 1, I, O);
+    int rb = I / 2, ng = I / 32;
+    float e8lut[256];
+    memcpy(e8lut, coli_e8m0_table(), sizeof(e8lut));
+#ifdef __AVX2__
+    /* Batch-one has its own loop so sum0/sum1 remain YMM registers for the
+     * whole row tile.  Do not fold this back into the runtime-S kernel: even
+     * when its caller passes one, the OpenMP worker cannot specialize S and
+     * reloads/stores the accumulator arrays in every column iteration. */
+    #pragma omp parallel for schedule(static)
+    for (int64_t tile = 0; tile < O / 16; tile++) {
+        const __m128i lut2 = _mm_setr_epi8(
+            0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12);
+        const __m128i m4 = _mm_set1_epi8(0x0F);
+        const __m256 half = _mm256_set1_ps(0.5f);
+        __m256 sum0 = _mm256_setzero_ps(), sum1 = _mm256_setzero_ps();
+        for (int base = 0; base < I; base += 32) {
+            /* Consume each transposed 8-row half immediately.  The old
+             * scalar kernel wrote 2 KiB of column vectors to tmp and loaded
+             * them back solely to feed this one activation; keeping the
+             * columns live removes that round trip while preserving each
+             * row's column-by-column accumulation order. */
+            for (int half_rows = 0; half_rows < 2; half_rows++) {
+                float sc[8];
+                __m256 rowv[8][4];
+                for (int r8 = 0; r8 < 8; r8++) {
+                    int64_t row = tile * 16 + half_rows * 8 + r8;
+                    sc[r8] = e8lut[e8s[row * ng + base / 32]];
+                    __m128i by = _mm_loadu_si128(
+                        (const __m128i *)(q4 + row * rb + base / 2));
+                    __m128i lo = _mm_and_si128(by, m4);
+                    __m128i hi = _mm_and_si128(_mm_srli_epi16(by, 4), m4);
+                    __m128i n0 = _mm_shuffle_epi8(
+                        lut2, _mm_unpacklo_epi8(lo, hi));
+                    __m128i n1 = _mm_shuffle_epi8(
+                        lut2, _mm_unpackhi_epi8(lo, hi));
+                    rowv[r8][0] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(n0)), half);
+                    rowv[r8][1] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(_mm_srli_si128(n0, 8))), half);
+                    rowv[r8][2] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(n1)), half);
+                    rowv[r8][3] = _mm256_mul_ps(_mm256_cvtepi32_ps(
+                        _mm256_cvtepi8_epi32(_mm_srli_si128(n1, 8))), half);
+                }
+                __m256 scale = _mm256_loadu_ps(sc);
+                __m256 partial = half_rows ? sum1 : sum0;
+                for (int cb = 0; cb < 4; cb++) {
+                    __m256 blk[8];
+                    for (int r8 = 0; r8 < 8; r8++)
+                        blk[r8] = rowv[r8][cb];
+                    __m256 t0 = _mm256_unpacklo_ps(blk[0], blk[1]);
+                    __m256 t1 = _mm256_unpackhi_ps(blk[0], blk[1]);
+                    __m256 t2 = _mm256_unpacklo_ps(blk[2], blk[3]);
+                    __m256 t3 = _mm256_unpackhi_ps(blk[2], blk[3]);
+                    __m256 t4 = _mm256_unpacklo_ps(blk[4], blk[5]);
+                    __m256 t5 = _mm256_unpackhi_ps(blk[4], blk[5]);
+                    __m256 t6 = _mm256_unpacklo_ps(blk[6], blk[7]);
+                    __m256 t7 = _mm256_unpackhi_ps(blk[6], blk[7]);
+                    __m256 s0 = _mm256_shuffle_ps(
+                        t0, t2, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s1 = _mm256_shuffle_ps(
+                        t0, t2, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s2 = _mm256_shuffle_ps(
+                        t1, t3, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s3 = _mm256_shuffle_ps(
+                        t1, t3, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s4 = _mm256_shuffle_ps(
+                        t4, t6, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s5 = _mm256_shuffle_ps(
+                        t4, t6, _MM_SHUFFLE(3,2,3,2));
+                    __m256 s6 = _mm256_shuffle_ps(
+                        t5, t7, _MM_SHUFFLE(1,0,1,0));
+                    __m256 s7 = _mm256_shuffle_ps(
+                        t5, t7, _MM_SHUFFLE(3,2,3,2));
+                    __m256 weights[8] = {
+                        _mm256_permute2f128_ps(s0, s4, 0x20),
+                        _mm256_permute2f128_ps(s1, s5, 0x20),
+                        _mm256_permute2f128_ps(s2, s6, 0x20),
+                        _mm256_permute2f128_ps(s3, s7, 0x20),
+                        _mm256_permute2f128_ps(s0, s4, 0x31),
+                        _mm256_permute2f128_ps(s1, s5, 0x31),
+                        _mm256_permute2f128_ps(s2, s6, 0x31),
+                        _mm256_permute2f128_ps(s3, s7, 0x31),
+                    };
+                    for (int column = 0; column < 8; column++) {
+                        __m256 xv = _mm256_set1_ps(
+                            x[base + cb * 8 + column]);
+                        partial = _mm256_add_ps(partial, _mm256_mul_ps(
+                            _mm256_mul_ps(xv, weights[column]), scale));
+                    }
+                }
+                if (half_rows) sum1 = partial; else sum0 = partial;
+            }
+        }
+        _mm256_storeu_ps(y + tile * 16, sum0);
+        _mm256_storeu_ps(y + tile * 16 + 8, sum1);
+    }
+#else
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; o++) {
+        const uint8_t *w = q4 + (int64_t)o * rb;
+        const uint8_t *scl = e8s + (int64_t)o * ng;
+        float sum = 0.0f;
+        for (int c = 0; c < I; c++) {
+            uint8_t byte = w[c >> 1];
+            float wv = coli_e2m1_decode((c & 1)
+                ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF));
+            float t = x[c] * wv;
+            t = t * e8lut[scl[c / 32]];
+            sum = sum + t;
+        }
+        y[o] = sum;
+    }
+#endif
 }
 
 int coli_fp4_matvec_ref(float *output, const ColiTensorView *weight,
@@ -15631,6 +15771,7 @@ int coli_fp4_matmul_batch_ref(float *outputs, const ColiTensorView *weight,
 #endif
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int source_valid(const ColiTensorView *weight) {
     if (!weight || weight->format != COLI_TENSOR_FP4_NATIVE_BLOCK ||
@@ -15678,7 +15819,7 @@ int coli_fp4_pack_rows16_v10(unsigned char *packed_data,
 static void decode_tables(__m512 *fp4_table, float e8[256]) {
     float fp4[16];
     for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
-    for (int i = 0; i < 256; i++) e8[i] = coli_e8m0_decode((uint8_t)i);
+    memcpy(e8, coli_e8m0_table(), 256 * sizeof(*e8));
     *fp4_table = _mm512_loadu_ps(fp4);
 }
 
@@ -15706,8 +15847,7 @@ typedef struct Avx2Rows16Tables {
 static void avx2_rows16_tables(Avx2Rows16Tables *tables) {
     for (int i = 0; i < 16; i++)
         tables->fp4[i] = coli_e2m1_decode((uint8_t)i);
-    for (int i = 0; i < 256; i++)
-        tables->e8[i] = coli_e8m0_decode((uint8_t)i);
+    memcpy(tables->e8, coli_e8m0_table(), sizeof(tables->e8));
 }
 
 static inline void avx2_decode_rows16(__m256 values[2],
@@ -15756,7 +15896,7 @@ typedef struct NeonRows16Tables {
 static void neon_rows16_tables(NeonRows16Tables *tables) {
     float fp4[16];
     for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
-    for (int i = 0; i < 256; i++) tables->e8[i] = coli_e8m0_decode((uint8_t)i);
+    memcpy(tables->e8, coli_e8m0_table(), sizeof(tables->e8));
     const unsigned char *bytes = (const unsigned char *)fp4;
     for (int group = 0; group < 4; group++)
         tables->fp4_bytes.val[group] = vld1q_u8(bytes + 16 * group);
