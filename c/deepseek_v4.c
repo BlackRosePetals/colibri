@@ -15930,10 +15930,15 @@ int coli_fp4_pack_rows16_v10(unsigned char *packed_data,
 
 #ifdef __AVX512F__
 static void decode_tables(__m512 *fp4_table, float e8[256]) {
-    float fp4[16];
-    for (int i = 0; i < 16; i++) fp4[i] = coli_e2m1_decode((uint8_t)i);
+    /* e8: memcpy from the shared table (#1171) rather than 256 decode calls. */
     memcpy(e8, coli_e8m0_table(), 256 * sizeof(*e8));
-    *fp4_table = _mm512_loadu_ps(fp4);
+    /* Keep the E2M1 table out of an instrumented stack frame.  GCC 13 ASan
+     * can fault while lowering a 64-byte AVX-512 load from a local array;
+     * constructing the identical register directly also removes 16 scalar
+     * decode calls from every rows16 matvec. */
+    *fp4_table = _mm512_setr_ps(
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f);
 }
 
 static __m512 decode_fp4_rows16(const unsigned char *data, int high,
