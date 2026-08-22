@@ -7040,8 +7040,10 @@ typedef struct {
     V4ExpertSlot *slots;
     int *slot_by_expert; /* resident/in-flight slot; every StoreOps variant that
                           * mutates slot identity must maintain this index */
-    int *allocated_per_layer;
-    int *lru_head;
+    int *allocated_per_layer; /* shared by the embedded base and hot StoreOps:
+                               * every slab allocation must advance this cursor */
+    int *lru_head; /* every recency update in either StoreOps must touch the
+                    * intrusive list while state->mutex is held */
     int *lru_tail;
     uint64_t clock;
     unsigned active_leases;
@@ -13914,6 +13916,11 @@ int coli_v4_shared_expert_forward_ref(float *output,
 
 #ifdef COLI_V4_UNIT_EXPERT_STORE
 /* ######## deepseek_v4_expert_store.c ######## */
+/* Legacy standalone unit with its own private V4ExpertStoreState.  The target
+ * binary and DeepSeek-V4 tests use COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16,
+ * which embeds the indexed base StoreOps above; never register these ops on
+ * that unit's state, whose slot index, allocation cursor, and intrusive LRU
+ * have stricter mutation invariants. */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif

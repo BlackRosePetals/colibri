@@ -833,12 +833,13 @@ static int test_expert_store_miss_scaling(void) {
         return 1;
     }
     int result = run_expert_miss_scaling_case(directory, 256, 44) ||
-                 run_expert_miss_scaling_case(directory, 256, 219);
+                 run_expert_miss_scaling_case(directory, 256, 104) ||
+                 run_expert_miss_scaling_case(directory, 256, 208);
     unlink(path);
     rmdir(directory);
     if (result) return 1;
     puts("DeepSeek-V4 ExpertStore miss scaling: ok "
-         "(44 slots=1 probe, 219 slots=1 probe)");
+         "(44/104/208 slots=1 probe each)");
     return 0;
 }
 /* ==== end test_deepseek_v4_expert_store.c ==== */
