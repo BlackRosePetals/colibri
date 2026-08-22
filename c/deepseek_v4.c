@@ -7025,6 +7025,9 @@ typedef struct {
     uint64_t used;
     unsigned char *slab;
     int aligned_slab;
+    int lru_previous;
+    int lru_next;
+    unsigned char in_lru;
 } V4ExpertSlot;
 
 typedef struct {
@@ -7037,6 +7040,9 @@ typedef struct {
     V4ExpertSlot *slots;
     int *slot_by_expert; /* resident/in-flight slot; every StoreOps variant that
                           * mutates slot identity must maintain this index */
+    int *allocated_per_layer;
+    int *lru_head;
+    int *lru_tail;
     uint64_t clock;
     unsigned active_leases;
     ColiExpertStoreStats stats;
@@ -7135,6 +7141,74 @@ static V4ExpertSlot *layer_slots(V4ExpertStoreState *state, int layer) {
     return state->slots + (size_t)layer * state->slots_per_layer;
 }
 
+#ifdef COLI_V4_TEST_HOOKS
+uint64_t coli_v4_test_expert_victim_probes;
+#define V4_COUNT_VICTIM_PROBE() (coli_v4_test_expert_victim_probes++)
+#else
+#define V4_COUNT_VICTIM_PROBE() ((void)0)
+#endif
+
+/* All LRU helpers are called with state->mutex held.  Slabs are allocated in
+ * slot order and never freed before store destruction, so the next empty slot
+ * is O(1).  Allocated slots form one exact LRU list per layer: moving a slot to
+ * the tail is equivalent to assigning the old monotonically increasing used
+ * timestamp, without searching the whole cache for its minimum on a miss. */
+static void touch_lru_slot(V4ExpertStoreState *state, int layer,
+                           V4ExpertSlot *slot) {
+    int index = (int)(slot - state->slots);
+    int layer_begin = layer * state->slots_per_layer;
+    int layer_end = layer_begin + state->slots_per_layer;
+    assert(index >= layer_begin && index < layer_end);
+    if (slot->in_lru) {
+        if (slot->lru_previous >= 0)
+            state->slots[slot->lru_previous].lru_next = slot->lru_next;
+        else
+            state->lru_head[layer] = slot->lru_next;
+        if (slot->lru_next >= 0)
+            state->slots[slot->lru_next].lru_previous = slot->lru_previous;
+        else
+            state->lru_tail[layer] = slot->lru_previous;
+    } else {
+        slot->in_lru = 1;
+    }
+    slot->lru_previous = state->lru_tail[layer];
+    slot->lru_next = -1;
+    if (state->lru_tail[layer] >= 0)
+        state->slots[state->lru_tail[layer]].lru_next = index;
+    else
+        state->lru_head[layer] = index;
+    state->lru_tail[layer] = index;
+}
+
+static V4ExpertSlot *next_empty_slot(V4ExpertStoreState *state, int layer) {
+    int next = state->allocated_per_layer[layer];
+    if (next >= state->slots_per_layer) return NULL;
+    return layer_slots(state, layer) + next;
+}
+
+static void mark_slot_allocated(V4ExpertStoreState *state, int layer,
+                                V4ExpertSlot *slot) {
+    assert(slot == layer_slots(state, layer) +
+                   state->allocated_per_layer[layer]);
+    state->allocated_per_layer[layer]++;
+    touch_lru_slot(state, layer, slot);
+}
+
+/* Only referenced (in-use/in-flight) slots can precede the victim.  Therefore
+ * passive cache capacity -- and consequently configured RAM -- does not add
+ * work to an ordinary miss. */
+static V4ExpertSlot *oldest_unreferenced_slot(V4ExpertStoreState *state,
+                                              int layer) {
+    int index = state->lru_head[layer];
+    while (index >= 0) {
+        V4ExpertSlot *slot = &state->slots[index];
+        V4_COUNT_VICTIM_PROBE();
+        if (!slot->references) return slot;
+        index = slot->lru_next;
+    }
+    return NULL;
+}
+
 /* All index helpers are called with state->mutex held.  A single table entry
  * covers both a published expert and its in-flight reservation, so the hot
  * path and the single-flight path are O(1) in cache capacity. */
@@ -7209,18 +7283,14 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     }
     pthread_mutex_lock(&state->mutex);
     state->stats.requests++;
-    V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot = indexed_expert_slot(state, key);
     if (slot && slot->slab && slot->expert == key.expert)
         state->stats.hits++;
     else
         slot = NULL;
     if (!slot) {
-        for (int i = 0; i < state->slots_per_layer; i++) {
-            if (!slots[i].references && (!slot || !slots[i].slab ||
-                                         (slot->slab && slots[i].used < slot->used)))
-                slot = &slots[i];
-        }
+        slot = next_empty_slot(state, key.layer);
+        if (!slot) slot = oldest_unreferenced_slot(state, key.layer);
         if (!slot) {
             pthread_mutex_unlock(&state->mutex);
             memset(view, 0, sizeof(*view));
@@ -7233,6 +7303,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
                 memset(view, 0, sizeof(*view));
                 return -1;
             }
+            mark_slot_allocated(state, key.layer, slot);
             state->stats.resident_bytes += state->record_bytes;
         }
         /* A short read must never expose a partially overwritten old slot. */
@@ -7273,6 +7344,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
+    touch_lru_slot(state, key.layer, slot);
     if (state->ehit) {
         size_t expert_index =
             (size_t)key.layer * state->experts_per_layer + key.expert;
@@ -7384,6 +7456,9 @@ static void destroy(ColiExpertStore *store) {
         free(state->records);
         free(state->slots);
         free(state->slot_by_expert);
+        free(state->allocated_per_layer);
+        free(state->lru_head);
+        free(state->lru_tail);
         free(state->ehit);
         free(state->eheat);
         free(state);
@@ -7461,13 +7536,24 @@ int coli_deepseek_v4_expert_store_open(
         state->slots_per_layer = state->experts_per_layer;
     state->slots = calloc((size_t)state->layers * state->slots_per_layer,
                           sizeof(*state->slots));
-    if (!state->slots) {
+    state->allocated_per_layer = calloc(
+        (size_t)state->layers, sizeof(*state->allocated_per_layer));
+    state->lru_head = malloc((size_t)state->layers * sizeof(*state->lru_head));
+    state->lru_tail = malloc((size_t)state->layers * sizeof(*state->lru_tail));
+    if (!state->slots || !state->allocated_per_layer || !state->lru_head ||
+        !state->lru_tail) {
         set_error(error, error_size, "out of memory creating expert cache slots");
         goto fail;
+    }
+    for (int layer = 0; layer < state->layers; layer++) {
+        state->lru_head[layer] = -1;
+        state->lru_tail[layer] = -1;
     }
     for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
         state->slots[i].expert = -1;
         state->slots[i].loading_expert = -1;
+        state->slots[i].lru_previous = -1;
+        state->slots[i].lru_next = -1;
     }
     size_t telemetry_cells =
         (size_t)state->layers * state->experts_per_layer;
@@ -7492,6 +7578,9 @@ fail:
     if (state->slots) free(state->slots);
     free(state->records);
     free(state->slot_by_expert);
+    free(state->allocated_per_layer);
+    free(state->lru_head);
+    free(state->lru_tail);
     free(state->ehit);
     free(state->eheat);
     coli_st_index_close(state->index);
@@ -7907,14 +7996,37 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
         if (expert < 0) continue;
         V4ExpertSlot *slot = indexed_expert_slot(
             state, (ColiExpertKey){layer, expert});
-        if (slot && slot->slab && slot->expert == expert)
+        if (slot && slot->slab && slot->expert == expert) {
             slot->used = ++state->clock;
+            touch_lru_slot(state, layer, slot);
+        }
     }
     uint64_t decay_interval = policy->repin_interval * 64;
     if (decay_interval && policy->layer_requests[layer] &&
         policy->layer_requests[layer] % decay_interval == 0)
         for (int expert = 0; expert < state->experts_per_layer; expert++)
             usage[expert] = (usage[expert] + 1) / 2;
+}
+
+/* Return the exact oldest unreferenced, non-pinned slot.  The fallback is the
+ * exact oldest unreferenced slot, matching the previous three-scan policy when
+ * every available slot is pinned.  Each skipped node is either an active
+ * lease/in-flight load or one of the small bounded pin set -- never merely an
+ * extra slot made possible by more RAM. */
+static V4ExpertSlot *hot_oldest_victim(V4ExpertStoreState *state,
+                                       const V4HotPolicy *policy, int layer) {
+    V4ExpertSlot *fallback = NULL;
+    int index = state->lru_head[layer];
+    while (index >= 0) {
+        V4ExpertSlot *slot = &state->slots[index];
+        V4_COUNT_VICTIM_PROBE();
+        if (!slot->references) {
+            if (!fallback) fallback = slot;
+            if (!hot_is_pinned(policy, layer, slot->expert)) return slot;
+        }
+        index = slot->lru_next;
+    }
+    return fallback;
 }
 
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
@@ -7946,7 +8058,6 @@ static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
         layer_requests % policy->repin_interval == 0)
         hot_repin_locked(policy, state, key.layer);
 
-    V4ExpertSlot *slots = layer_slots(state, key.layer);
     V4ExpertSlot *slot;
 retry_lookup:
     slot = indexed_expert_slot(state, key);
@@ -7954,6 +8065,7 @@ retry_lookup:
         slot->references++;
         state->active_leases++;
         slot->used = ++state->clock; state->stats.hits++;
+        touch_lru_slot(state, key.layer, slot);
         if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
             hot_pack_slot_locked(policy, state, record, slot);
         memset(view, 0, sizeof(*view)); view->key = key;
@@ -7979,17 +8091,8 @@ retry_lookup:
         }
         goto retry_lookup;
     }
-    for (int i = 0; i < state->slots_per_layer; i++)
-        if (!slots[i].references && !slots[i].slab) { slot = &slots[i]; break; }
-    if (!slot)
-        for (int i = 0; i < state->slots_per_layer; i++)
-            if (!slots[i].references &&
-                !hot_is_pinned(policy, key.layer, slots[i].expert) &&
-                (!slot || slots[i].used < slot->used)) slot = &slots[i];
-    if (!slot)
-        for (int i = 0; i < state->slots_per_layer; i++)
-            if (!slots[i].references && (!slot || slots[i].used < slot->used))
-                slot = &slots[i];
+    slot = next_empty_slot(state, key.layer);
+    if (!slot) slot = hot_oldest_victim(state, policy, key.layer);
     if (!slot) {
         pthread_mutex_unlock(&state->mutex);
         memset(view, 0, sizeof(*view));
@@ -8004,6 +8107,7 @@ retry_lookup:
             return -1;
         }
         slot->aligned_slab = 1;
+        mark_slot_allocated(state, key.layer, slot);
         state->stats.resident_bytes += state->record_bytes;
     }
     policy->packed[hot_slot_index(state, slot)] = 0;
@@ -8013,6 +8117,7 @@ retry_lookup:
     slot->references = 1;
     state->active_leases++;
     slot->used = ++state->clock;
+    touch_lru_slot(state, key.layer, slot);
     pthread_mutex_unlock(&state->mutex);
     int rep = coli_st_expert_route(key.layer, key.expert);
     struct timespec disk_t0;
@@ -8050,6 +8155,7 @@ retry_lookup:
     }
     slot->expert = key.expert; slot->loading_expert = -1;
     slot->used = ++state->clock;
+    touch_lru_slot(state, key.layer, slot);
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
     hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
     v4_pack_buf = NULL;
