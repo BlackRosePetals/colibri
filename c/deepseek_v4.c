@@ -3838,6 +3838,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (!scratch_ptr || !raw_weights)
         return set_error(error, error_size, "out of memory scoring indexer batch");
 
+    scratch_ptr = (char *)(((uintptr_t)scratch_ptr + 31) & ~(uintptr_t)31);
+
     float *queries = (float *)scratch_ptr; scratch_ptr += sz_queries;
     float *sq = (float *)scratch_ptr; scratch_ptr += sz_sq;
     float *head_weights = (float *)scratch_ptr; scratch_ptr += sz_head_weights;
