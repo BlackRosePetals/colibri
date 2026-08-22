@@ -966,6 +966,7 @@ extern int coli_v4_test_closed_owned_index;
 extern void (*coli_v4_test_expert_read_hook)(ColiExpertKey key);
 extern void (*coli_v4_test_expert_wait_hook)(ColiExpertKey key);
 extern uint64_t coli_v4_test_fp4_batch_calls;
+extern uint64_t coli_v4_test_expert_victim_probes;
 int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key);
 
 ColiV4Session *coli_v4_test_session_bare_create(ColiV4Engine *engine);

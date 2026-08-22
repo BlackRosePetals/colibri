@@ -384,52 +384,75 @@ static int write_all(int fd, const void *data, size_t length) {
     return 0;
 }
 
-static int write_fixture(const char *path) {
+static int write_fixture_experts(const char *path, int expert_count) {
     static const char *matrix_names[3] = {"w1", "w2", "w3"};
-    char header[16384];
+    if (expert_count < 1 || (size_t)expert_count > SIZE_MAX / 1024) return -1;
+    size_t header_capacity = 256 + (size_t)expert_count * 1024;
+    char *header = malloc(header_capacity);
+    size_t payload_size = 4 + (size_t)expert_count * 51;
+    unsigned char *payload = malloc(payload_size);
+    if (!header || !payload) {
+        free(payload);
+        free(header);
+        return -1;
+    }
     size_t used = (size_t)snprintf(
-        header, sizeof(header),
+        header, header_capacity,
         "{\"resident\":{\"dtype\":\"F32\",\"shape\":[1],"
         "\"data_offsets\":[3,7]}");
-    for (int expert = 0; expert < 7; expert++) {
-        int scale = expert ? 4 + expert * 51 : 0;
-        int weight = scale + 3 + (expert ? 0 : 4);
+    for (int expert = 0; expert < expert_count; expert++) {
+        size_t scale = expert ? 4 + (size_t)expert * 51 : 0;
+        size_t weight = scale + 3 + (expert ? 0 : 4);
         for (int matrix = 0; matrix < 3; matrix++) {
             int count = snprintf(
-                header + used, sizeof(header) - used,
+                header + used, header_capacity - used,
                 ",\"layers.0.ffn.experts.%d.%s.scale\":{"
                 "\"dtype\":\"F8_E8M0\",\"shape\":[1,1],"
-                "\"data_offsets\":[%d,%d]}",
+                "\"data_offsets\":[%zu,%zu]}",
                 expert, matrix_names[matrix], scale + matrix,
                 scale + matrix + 1);
-            if (count < 0 || (size_t)count >= sizeof(header) - used) return -1;
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1;
+            }
             used += (size_t)count;
         }
         for (int matrix = 0; matrix < 3; matrix++) {
             int count = snprintf(
-                header + used, sizeof(header) - used,
+                header + used, header_capacity - used,
                 ",\"layers.0.ffn.experts.%d.%s.weight\":{"
                 "\"dtype\":\"I8\",\"shape\":[1,16],"
-                "\"data_offsets\":[%d,%d]}",
+                "\"data_offsets\":[%zu,%zu]}",
                 expert, matrix_names[matrix], weight + matrix * 16,
                 weight + (matrix + 1) * 16);
-            if (count < 0 || (size_t)count >= sizeof(header) - used) return -1;
+            if (count < 0 || (size_t)count >= header_capacity - used) {
+                free(payload); free(header); return -1;
+            }
             used += (size_t)count;
         }
     }
-    if (used + 1 >= sizeof(header)) return -1;
+    if (used + 1 >= header_capacity) {
+        free(payload); free(header); return -1;
+    }
     header[used++] = '}';
     header[used] = '\0';
-    unsigned char payload[361];
-    for (int i = 0; i < 361; i++) payload[i] = (unsigned char)i;
+    for (size_t i = 0; i < payload_size; i++)
+        payload[i] = (unsigned char)i;
     uint64_t header_length = used;
     int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | COMPAT_O_BINARY, 0600);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        free(payload); free(header); return -1;
+    }
     int result = write_all(fd, &header_length, sizeof(header_length)) ||
                  write_all(fd, header, (size_t)header_length) ||
-                 write_all(fd, payload, sizeof(payload));
+                 write_all(fd, payload, payload_size);
     close(fd);
+    free(payload);
+    free(header);
     return result ? -1 : 0;
+}
+
+static int write_fixture(const char *path) {
+    return write_fixture_experts(path, 7);
 }
 
 static int expect_fixture_expert(const ColiExpertView *view, int expert) {
@@ -730,6 +753,93 @@ static int test_expert_store(void) {
     unlink(path);
     rmdir(directory);
     puts("DeepSeek-V4 ExpertStore tests: ok");
+    return 0;
+}
+
+static int run_expert_miss_scaling_case(const char *directory, int experts,
+                                        int slots) {
+    char error[256];
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, 1, experts, (uint64_t)slots * 51, -1, UINT64_MAX
+    };
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(&options, &store,
+                                            error, sizeof(error))) {
+        fprintf(stderr, "scaling store open failed: slots=%d error=%s\n",
+                slots, error);
+        return 1;
+    }
+    coli_v4_test_expert_victim_probes = 0;
+    for (int expert = 0; expert < slots; expert++) {
+        ColiExpertView view;
+        if (coli_expert_lookup(store, (ColiExpertKey){0, expert}, &view)) {
+            fprintf(stderr, "scaling fill failed: slots=%d expert=%d\n",
+                    slots, expert);
+            store->ops->destroy(store);
+            return 1;
+        }
+        coli_expert_release(store, &view);
+    }
+    if (coli_v4_test_expert_victim_probes != 0) {
+        fprintf(stderr,
+                "empty-slot fill searched residents: slots=%d probes=%llu\n",
+                slots, (unsigned long long)coli_v4_test_expert_victim_probes);
+        store->ops->destroy(store);
+        return 1;
+    }
+
+    coli_v4_test_expert_victim_probes = 0;
+    ColiExpertView view;
+    if (coli_expert_lookup(store, (ColiExpertKey){0, experts - 1}, &view)) {
+        fprintf(stderr, "scaling eviction failed: slots=%d\n", slots);
+        store->ops->destroy(store);
+        return 1;
+    }
+    uint64_t probes = coli_v4_test_expert_victim_probes;
+    coli_expert_release(store, &view);
+    ColiExpertStoreStats stats;
+    store->ops->stats(store, &stats);
+    int failed = probes != 1 || stats.requests != (uint64_t)slots + 1 ||
+        stats.hits != 0 || stats.misses != (uint64_t)slots + 1 ||
+        stats.bytes_read != ((uint64_t)slots + 1) * 51 ||
+        stats.resident_bytes != (uint64_t)slots * 51 ||
+        stats.capacity_bytes != (uint64_t)slots * 51;
+    if (failed)
+        fprintf(stderr,
+                "miss scaling mismatch: slots=%d probes=%llu requests=%llu "
+                "hits=%llu misses=%llu bytes=%llu resident=%llu capacity=%llu\n",
+                slots, (unsigned long long)probes,
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses,
+                (unsigned long long)stats.bytes_read,
+                (unsigned long long)stats.resident_bytes,
+                (unsigned long long)stats.capacity_bytes);
+    store->ops->destroy(store);
+    return failed;
+}
+
+static int test_expert_store_miss_scaling(void) {
+    char directory[] = "colibri-v4-scaling-XXXXXX";
+    char path[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp scaling"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture_experts(path, 256)) {
+        perror("write scaling fixture");
+        rmdir(directory);
+        return 1;
+    }
+    int result = run_expert_miss_scaling_case(directory, 256, 44) ||
+                 run_expert_miss_scaling_case(directory, 256, 104) ||
+                 run_expert_miss_scaling_case(directory, 256, 208);
+    unlink(path);
+    rmdir(directory);
+    if (result) return 1;
+    puts("DeepSeek-V4 ExpertStore miss scaling: ok "
+         "(44/104/208 slots=1 probe each)");
     return 0;
 }
 /* ==== end test_deepseek_v4_expert_store.c ==== */
@@ -1190,6 +1300,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store() != 0) {
         fprintf(stderr, "FAIL: test_expert_store\n");
+        return 1;
+    }
+    if (test_expert_store_miss_scaling() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_miss_scaling\n");
         return 1;
     }
     if (test_kv_cache() != 0) {
