@@ -8,6 +8,8 @@
 
 typedef struct { float score; int index; } IndexScore;
 
+#define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
+
 // --- Baseline Implementation: Dynamic Malloc/Free per call ---
 double indexer_select_batch_baseline(int batch, int need, int heads, int dimension, int max_count, int cols) {
     size_t qn = (size_t)heads * dimension;
@@ -50,11 +52,15 @@ typedef struct {
     size_t cap;
 } ScratchBuf;
 
-static void ensure_capacity(ScratchBuf *s, size_t needed) {
+static int ensure_capacity(ScratchBuf *s, size_t needed) {
     if (s->cap < needed) {
-        s->cap = needed < 65536 ? 65536 : needed * 2;
-        s->buf = realloc(s->buf, s->cap);
+        size_t new_cap = needed < 65536 ? 65536 : needed * 2;
+        void *new_buf = realloc(s->buf, new_cap);
+        if (!new_buf) return 0;
+        s->buf = new_buf;
+        s->cap = new_cap;
     }
+    return 1;
 }
 
 static ScratchBuf g_scratch = {NULL, 0};
@@ -62,37 +68,39 @@ static ScratchBuf g_scratch = {NULL, 0};
 double indexer_select_batch_optimized(int batch, int need, int heads, int dimension, int max_count, int cols) {
     size_t qn = (size_t)heads * dimension;
 
-    size_t sz_queries = (size_t)batch * qn * sizeof(float);
-    size_t sz_sq = (size_t)need * qn * sizeof(float);
-    size_t sz_head_weights = (size_t)need * heads * sizeof(float);
-    size_t sz_scounts = (size_t)need * sizeof(int);
-    size_t sz_stoken = (size_t)need * sizeof(int);
-    size_t sz_scores = (size_t)need * max_count * sizeof(float);
-    size_t sz_ranked = (size_t)max_count * sizeof(IndexScore);
-    size_t sz_scales = (size_t)dimension / 32;
-    size_t sz_qdq = (size_t)dimension * sizeof(float);
-    size_t sz_xq = (size_t)need * cols * sizeof(float);
-    size_t sz_yq = (size_t)need * qn * sizeof(float);
-    size_t sz_xs = (size_t)need * (cols / 128);
+    size_t sz_queries = ALIGN32((size_t)batch * qn * sizeof(float));
+    size_t sz_sq = ALIGN32((size_t)need * qn * sizeof(float));
+    size_t sz_head_weights = ALIGN32((size_t)need * heads * sizeof(float));
+    size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
+    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    size_t sz_scales = ALIGN32((size_t)dimension / 32);
+    size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
+    size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
+    size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
+    size_t sz_xs = (need <= 1024) ? ALIGN32((size_t)need * (cols / 128)) : 0;
 
-    size_t total = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
-                   sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs;
+    size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
+                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
 
-    ensure_capacity(&g_scratch, total);
+    if (!ensure_capacity(&g_scratch, total_scratch)) return 0.0;
 
-    char *ptr = (char *)g_scratch.buf;
-    volatile float *queries = (volatile float *)ptr; ptr += sz_queries;
-    volatile float *sq = (volatile float *)ptr; ptr += sz_sq;
-    volatile float *head_weights = (volatile float *)ptr; ptr += sz_head_weights;
-    volatile int *scounts = (volatile int *)ptr; ptr += sz_scounts;
-    volatile int *stoken = (volatile int *)ptr; ptr += sz_stoken;
-    volatile float *scores = (volatile float *)ptr; ptr += sz_scores;
-    volatile IndexScore *ranked = (volatile IndexScore *)ptr; ptr += sz_ranked;
-    volatile uint8_t *scales = (volatile uint8_t *)ptr; ptr += sz_scales;
-    volatile float *qdq = (volatile float *)ptr; ptr += sz_qdq;
-    volatile float *xq = (volatile float *)ptr; ptr += sz_xq;
-    volatile float *yq = (volatile float *)ptr; ptr += sz_yq;
-    volatile uint8_t *xs = (volatile uint8_t *)ptr;
+    char *scratch_ptr = (char *)g_scratch.buf;
+    scratch_ptr = (char *)(((uintptr_t)scratch_ptr + 31) & ~(uintptr_t)31);
+
+    volatile float *queries = (volatile float *)scratch_ptr; scratch_ptr += sz_queries;
+    volatile float *sq = (volatile float *)scratch_ptr; scratch_ptr += sz_sq;
+    volatile float *head_weights = (volatile float *)scratch_ptr; scratch_ptr += sz_head_weights;
+    volatile int *scounts = (volatile int *)scratch_ptr; scratch_ptr += sz_scounts;
+    volatile int *stoken = (volatile int *)scratch_ptr; scratch_ptr += sz_stoken;
+    volatile float *scores = (volatile float *)scratch_ptr; scratch_ptr += sz_scores;
+    volatile IndexScore *ranked = (volatile IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
+    volatile uint8_t *scales = (volatile uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
+    volatile float *qdq = (volatile float *)scratch_ptr; scratch_ptr += sz_qdq;
+    volatile float *xq = (volatile float *)scratch_ptr; scratch_ptr += sz_xq;
+    volatile float *yq = (volatile float *)scratch_ptr; scratch_ptr += sz_yq;
+    volatile uint8_t *xs = (volatile uint8_t *)scratch_ptr;
 
     // Write & read memory to prevent compiler DCE
     queries[0] = 1.0f;
