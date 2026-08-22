@@ -3817,19 +3817,22 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t qn = (size_t)heads * dimension;
     size_t cols = (size_t)wq.columns;
 
-    size_t sz_queries = (size_t)batch * qn * sizeof(float);
-    size_t sz_sq = (size_t)need * qn * sizeof(float);
-    size_t sz_head_weights = (size_t)need * heads * sizeof(float);
-    size_t sz_scounts = (size_t)need * sizeof(int);
-    size_t sz_stoken = (size_t)need * sizeof(int);
-    size_t sz_scores = (size_t)need * max_count * sizeof(float);
-    size_t sz_ranked = (size_t)max_count * sizeof(IndexScore);
-    size_t sz_scales = (size_t)dimension / 32;
-    size_t sz_qdq = (size_t)dimension * sizeof(float);
-    size_t sz_gpu = (need <= 1024) ? ((size_t)need * cols * sizeof(float) + (size_t)need * qn * sizeof(float) + (size_t)need * (cols / 128)) : 0;
+#define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
+    size_t sz_queries = ALIGN32((size_t)batch * qn * sizeof(float));
+    size_t sz_sq = ALIGN32((size_t)need * qn * sizeof(float));
+    size_t sz_head_weights = ALIGN32((size_t)need * heads * sizeof(float));
+    size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
+    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    size_t sz_scales = ALIGN32((size_t)dimension / 32);
+    size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
+    size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
+    size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
+    size_t sz_xs = (need <= 1024) ? ALIGN32((size_t)need * (cols / 128)) : 0;
 
     size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
-                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_gpu + 256;
+                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
     if (!scratch_ptr || !raw_weights)
@@ -3855,8 +3858,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int projected = 0;
 #ifdef COLI_V4_GPU_TIER
     if (!result && need <= 1024) {
-        float *xq = (float *)scratch_ptr; scratch_ptr += (size_t)need * cols * sizeof(*xq);
-        float *yq = (float *)scratch_ptr; scratch_ptr += (size_t)need * qn * sizeof(*yq);
+        float *xq = (float *)scratch_ptr; scratch_ptr += sz_xq;
+        float *yq = (float *)scratch_ptr; scratch_ptr += sz_yq;
         uint8_t *xs = (uint8_t *)scratch_ptr;
         int qok = xq && yq && xs;
         if (qok) {
