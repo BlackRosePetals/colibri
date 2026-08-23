@@ -124,7 +124,11 @@ typedef struct {
     int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
     float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
 } Slot;
-typedef struct { Slot *slots; int n, cap; } LCache;
+typedef struct {
+    Slot *slots;
+    int *slot_by_expert;                  /* expert id -> local slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -919,7 +923,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 cap, (double)cap*slotb*nsp/1e9);
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        lc->cap = cap;
+        lc->slots = calloc(cap, sizeof(Slot));
+        if (c->sparse[i]) {
+            lc->slot_by_expert = malloc((size_t)E * sizeof(int));
+            if (!lc->slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+            for (int e = 0; e < E; e++) lc->slot_by_expert[e] = -1;
+        }
+    }
     /* container mode: slot storage is one page-aligned slab per sparse layer
      * (weights) plus one for the row scales, with every slot's pointers carved
      * out up front. Slots then recycle their region on eviction — no per-slot
@@ -977,18 +990,35 @@ static double mem_avail_bytes(void) {
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
-static Slot *slot_find(Model *m, int layer, int eid) {
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#define SLOT_INDEX_PROBE() (g_slot_index_probes++)
+#else
+#define SLOT_INDEX_PROBE() ((void)0)
+#endif
+/* Cache identity is mutated only by slot_acquire(), which keeps this index in
+ * lockstep with the slot. Fills change bytes/filled but never identity. The
+ * validation makes a stale/corrupt entry a miss instead of serving another
+ * expert's weights; production slot_find then touches the LRU clock. */
+static Slot *slot_indexed(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
-    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        lc->slots[i].used = ++m->clock;
-        return &lc->slots[i];
-    }
-    return NULL;
+    if (eid < 0 || eid >= m->c.n_experts || !lc->slot_by_expert) return NULL;
+    SLOT_INDEX_PROBE();
+    int i = lc->slot_by_expert[eid];
+    if (i < 0 || i >= lc->n || lc->slots[i].eid != eid) return NULL;
+    return &lc->slots[i];
+}
+static Slot *slot_find(Model *m, int layer, int eid) {
+    Slot *s = slot_indexed(m, layer, eid);
+    if (s) s->used = ++m->clock;
+    return s;
 }
 
 /* allocate a slot (or evict the LRU non-pinned one); serial callers only */
 static Slot *slot_acquire(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
+    if (eid < 0 || eid >= c->n_experts || !lc->slot_by_expert) {
+        fprintf(stderr,"layer %d: invalid expert id %d for cache index\n",layer,eid); exit(1); }
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     Slot *s;
     if (lc->n < lc->cap) {
@@ -1005,7 +1035,12 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
         if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
         s = &lc->slots[lru];
     }
+    int si = (int)(s - lc->slots);
+    if (s->eid >= 0 && s->eid < c->n_experts &&
+        lc->slot_by_expert[s->eid] == si)
+        lc->slot_by_expert[s->eid] = -1;
     s->eid = eid; s->used = ++m->clock; s->filled = 0; s->pinned = 0;
+    lc->slot_by_expert[eid] = si;
     return s;
 }
 
@@ -1078,8 +1113,7 @@ static void pins_load(Model *m, const char *snap) {
         for (int r = 0; r < m->npin; r++) {                /* top-N selection */
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < E; e++) {
-                int taken = 0;
-                for (int z = 0; z < r; z++) if (ps[np-r+z]->eid == e) { taken = 1; break; }
+                int taken = slot_indexed(m, i, e) != NULL;
                 if (!taken && tmp[e] >= bv && tmp[e] > 0) { bv = tmp[e]; best = e; }
             }
             if (best < 0) break;
@@ -2078,10 +2112,9 @@ static void serve_tiers_emap(Model *m) {
     char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->sparse[i]) continue;
-        LCache *lc = &m->cache[i];
         for (int e = 0; e < E; e++) {
-            int tier = 0;
-            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e && lc->slots[z].filled) { tier = 1; break; }
+            Slot *resident = slot_indexed(m, i, e);
+            int tier = resident && resident->filled;
             uint32_t u = m->eusage[i] ? m->eusage[i][e] : 0;
             int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
             int b = (tier << 6) | heat;

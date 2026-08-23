@@ -181,7 +181,11 @@ typedef struct { int eid; uint8_t *buf, *base; uint64_t used; int pinned; } Slot
  * tok/s when the pins came from a single prompt). */
                           /* base = 4K-aligned allocation (O_DIRECT target);
                            * buf = expert data view inside it (= base + off%4K) */
-typedef struct { Slot *s; int n, cap; } LCache;
+typedef struct {
+    Slot *s;
+    int *slot_by_expert;                  /* expert id -> local slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -1066,7 +1070,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       m->ecache=calloc((size_t)ncl,sizeof(LCache)); }
     for(int i=0;i<c->n_layers;i++) if(m->L[i].sparse){
         m->ecache[i].cap=cap; m->ecache[i].s=calloc(cap,sizeof(Slot));
+        m->ecache[i].slot_by_expert=malloc((size_t)c->n_experts*sizeof(int));
+        if(!m->ecache[i].s||!m->ecache[i].slot_by_expert){
+            fprintf(stderr,"OOM expert cache/index\n"); exit(1); }
         for(int j2=0;j2<cap;j2++) m->ecache[i].s[j2].eid=-1;
+        for(int e=0;e<c->n_experts;e++) m->ecache[i].slot_by_expert[e]=-1;
     }
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
@@ -1411,10 +1419,45 @@ static void kda_forward(Model *m, Layer *l, int li, const float *x, int C, float
  * slots) and, when K3_DIRECT=1 (default) and st.h has an O_DIRECT twin fd,
  * bypass the page cache: measured on the box 7.1 GB/s direct vs 2.9 buffered
  * (and ~1.8 effective once the resident weights leave no cache headroom). */
-static Slot *slot_find(Model *m, int li, int eid){
+/* Cache slots are serially published by cache_promote() or pin_seed(). Expert
+ * reads land in ws[] first and never enter this index until their bytes are
+ * complete. Validate both the local range and identity before returning: a
+ * broken invariant must become a miss, never another expert's weights. */
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#define SLOT_INDEX_PROBE() (g_slot_index_probes++)
+#else
+#define SLOT_INDEX_PROBE() ((void)0)
+#endif
+static Slot *slot_indexed(Model *m, int li, int eid){
     LCache *lc=&m->ecache[li];
-    for(int i=0;i<lc->n;i++) if(lc->s[i].eid==eid){ m->hits++; lc->s[i].used=++m->clock; return &lc->s[i]; }
-    return NULL;
+    if(eid<0||eid>=m->c.n_experts||!lc->slot_by_expert) return NULL;
+    SLOT_INDEX_PROBE();
+    int i=lc->slot_by_expert[eid];
+    if(i<0||i>=lc->n||lc->s[i].eid!=eid) return NULL;
+    return &lc->s[i];
+}
+static Slot *slot_find(Model *m, int li, int eid){
+    Slot *s=slot_indexed(m,li,eid);
+    if(s){ m->hits++; s->used=++m->clock; }
+    return s;
+}
+static void cache_unindex(Model *m,int li,Slot *s){
+    LCache *lc=&m->ecache[li]; int i=(int)(s-lc->s);
+    if(s->eid>=0&&s->eid<m->c.n_experts&&lc->slot_by_expert[s->eid]==i)
+        lc->slot_by_expert[s->eid]=-1;
+}
+static void cache_index(Model *m,int li,Slot *s){
+    LCache *lc=&m->ecache[li]; int i=(int)(s-lc->s);
+    if(s->eid<0||s->eid>=m->c.n_experts||i<0||i>=lc->n){
+        fprintf(stderr,"layer %d: invalid expert cache publication\n",li); exit(1); }
+    lc->slot_by_expert[s->eid]=i;
+}
+static void cache_promote(Model *m,int li,Slot *dst,Slot *loaded){
+    cache_unindex(m,li,dst);
+    Slot tmp=*dst; *dst=*loaded; *loaded=tmp;
+    dst->used=++m->clock;
+    cache_index(m,li,dst);
 }
 static void expert_read(Model *m, int li, int eid, Slot *s){
     if(!s->base){
@@ -1727,8 +1770,7 @@ static void experts_apply_union(Model *m, int li, int nu, const int *uids,
                 if(lru<0) break;                    /* every slot pinned: keep the read */
                 dst=&lc->s[lru];
             }
-            Slot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp;
-            dst->used=++m->clock;
+            cache_promote(m,li,dst,&m->ws[q]);
         }
     }
     free(zq_all); free(zsc_all);
@@ -1792,15 +1834,14 @@ static void pin_seed(Model *m, int64_t hist){
             int best=-1; uint32_t bestc=0;
             for(int e=0;e<c->n_experts;e++){
                 if(u[e]<=bestc) continue;
-                int taken=0;
-                for(int i=0;i<lc->n;i++) if(lc->s[i].eid==e){ taken=1; break; }
+                int taken=slot_indexed(m,li,e)!=NULL;
                 if(!taken){ best=e; bestc=u[e]; }
             }
             if(best<0) break;                       /* history is exhausted */
             Slot *d=&lc->s[lc->n];
             expert_read(m,li,best,d);
             d->eid=best; d->used=++m->clock; d->pinned=1;
-            lc->n++; pinned_total++;
+            lc->n++; cache_index(m,li,d); pinned_total++;
         }
     }
     if(pinned_total)
