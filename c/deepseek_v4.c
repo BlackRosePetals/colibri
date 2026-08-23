@@ -3514,6 +3514,8 @@ struct ColiDeepSeekV4Indexer {
     int capacity;
     int count;
     float *compressed;
+    /* Persistent arena scratch buffer for coli_v4_indexer_select_batch.
+     * Assumes single-threaded execution per indexer instance (standard in SERVE chunk prefill). */
     void *scratch_buf;
     size_t scratch_cap;
 };
