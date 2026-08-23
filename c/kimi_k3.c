@@ -214,9 +214,9 @@ static double now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
  * reported numbers without a 600 GB checkpoint. Returns the cap; writes the
  * bytes left for experts through `for_experts_out` when non-NULL.
  *
- * reserve = page cache + activations + KV, all in GB. `cap_requested` is what
- * K3_EXPERT_GB asked for: this only ever LOWERS it, never raises it, so an
- * explicit small cache stays small. */
+ * reserve = page cache + activations + KV + optional recurrent checkpoints,
+ * all in GB. `cap_requested` is what K3_EXPERT_GB asked for: this only ever
+ * LOWERS it, never raises it, so an explicit small cache stays small. */
 static int k3_cap_for_ram(double budget_gb, double resident_gb, double reserve_gb,
                           double slot_gb, int nmoe, int cap_requested,
                           int n_experts, double *for_experts_out){
@@ -479,6 +479,7 @@ static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute 
 static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
 enum { K3_CKPT_MAX = 8 };
 static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
+static double k3_ckpt_reserve_gb(const Model *m, int slots);
 static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
                                           * slots. STRICTLY OPT-IN, 0 = off (default,
                                           * engine behaves exactly as before). */
@@ -996,8 +997,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
         double kv_gb = (double)nkv*(double)max_t*(double)(c->kv_lora+c->qk_rope)*4.0/1e9;
         /* 2.5 GB page cache -- measured on Linux 2026-07-06: strangling it drops
          * buffered pread from ~800 to ~180 MB/s and the last GB of LRU costs
-         * more in lost bandwidth than it returns. 1.2 GB activations/logits. */
-        double reserve = 2.5 + 1.2 + kv_gb;
+         * more in lost bandwidth than it returns. 1.2 GB activations/logits.
+         * Checkpoints allocate lazily after this plan, so reserve all enabled
+         * slots now: RAM_GB is a whole-process ceiling even for opt-in memory. */
+        double ckpt_gb = k3_ckpt_reserve_gb(m,g_k3_ckpt_slots);
+        double reserve = 2.5 + 1.2 + kv_gb + ckpt_gb;
         double for_experts = 0.0;
 
         double slot_gb = (double)m->e_slot/1e9;
@@ -1008,9 +1012,11 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
             /* Name every term. The user's number is not being ignored, it is
              * being clamped, and they cannot check the clamp without the parts. */
             fprintf(stderr,"[K3][RAM_GB=%.1f%s] resident %.1f GB + reserve %.1f GB "
-                "(page cache 2.5, activations 1.2, KV %dx%d %.1f) -> %.1f GB for experts; "
+                "(page cache 2.5, activations 1.2, KV %dx%d %.1f, checkpoints %d %.1f) "
+                "-> %.1f GB for experts; "
                 "cache %d->%d/layer (%.1f MB/slot, %d layers; projected peak %.1f GB)\n",
                 budget, ram_env>0?"":" auto", resident, reserve, nkv, max_t, kv_gb,
+                g_k3_ckpt_slots,ckpt_gb,
                 for_experts>0?for_experts:0.0, cap, cap_fit>0?cap_fit:1,
                 slot_gb*1000.0, nmoe,
                 resident + reserve + (double)(cap_fit>0?cap_fit:1)*slot_gb*nmoe);
@@ -2448,6 +2454,11 @@ static size_t k3_ckpt_blob_floats(const Model *m){
               +3u*(size_t)c->kda_proj*c->conv_k, n=0;
     for(int i=0;i<c->n_layers;i++) if(m->L[i].kda) n+=per;
     return n;
+}
+
+static double k3_ckpt_reserve_gb(const Model *m, int slots){
+    if(slots<1) return 0.0;
+    return (double)slots*(double)k3_ckpt_blob_floats(m)*sizeof(float)/1e9;
 }
 
 static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
