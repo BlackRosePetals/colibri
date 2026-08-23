@@ -848,6 +848,14 @@ int coli_v4_gpu_route(float *route_weights, int *indices, const float *input,
  * fp4 path. Only block_rows==1 views are mirrored; rows16-packed slots are
  * skipped. */
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view);
+/* lookup-only twin: reports residency, never uploads (hybrid q* split) */
+int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
+/* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
+ * unit, read by the serve unit's per-turn stderr line. */
+int coli_v4_hybrid_enabled(void);
+extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
+extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
+extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
 /* Dspark (MTP) resident-expert mirrors: a separate bounded LRU so drafting can
  * never evict the target model's learned expert mirrors. ensure() lazily
  * allocates the cache on the first V4_MTP_GPU=1 draft; attach mirrors one

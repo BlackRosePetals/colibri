@@ -4202,6 +4202,7 @@ int coli_v4_sparse_attention_ref(float *output, const float *queries,
 #define coli_v4_block_window_token_ref coli_v4_block_window_token_serial_ref
 /* ---- begin include deepseek_v4_block.c ---- */
 #include "deepseek_v4_internal.h"
+#include "deepseek_v4_hybrid.h"
 
 #include <stdarg.h>
 #include <stdint.h>
@@ -4831,6 +4832,29 @@ static int profiled_expert_load_finish(ExpertLoadHandle *handle) {
     return result;
 }
 
+#ifdef COLI_V4_GPU_TIER
+/* DSV4_HYBRID=1 (opt-in): on a decode miss, split the missing experts between
+ * a PCIe-fill set (upload, compute on GPU with the residents) and a host set
+ * (compute on CPU) instead of today's all-or-nothing, sized by the q* policy
+ * in deepseek_v4_hybrid.h from live bandwidth EMAs. Off by default until the
+ * split is validated on real GPUs; when off, the engine byte-for-byte keeps
+ * its historical behaviour. */
+int coli_v4_hybrid_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("DSV4_HYBRID");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
+}
+/* Non-static on purpose: the serve unit prints these counters, and under the
+ * per-unit amalgam build that is a different object file. */
+double g_v4_hyb_fill_bw;   /* experts/s uploaded, EMA */
+double g_v4_hyb_host_bw;   /* experts/s host-computed, EMA */
+unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
+unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;
+#endif
+
 static int moe_token_pipeline(float *output,
                               const ColiDeepSeekV4LayerWeights *weights,
                               const ColiDeepSeekV4Config *config,
@@ -4984,8 +5008,14 @@ static int moe_token_pipeline(float *output,
             if (jobs[slot].result) { result = -1; break; }
             views[current] = jobs[slot].view;
 #ifdef COLI_V4_GPU_TIER
-            if (store->gpu)
-                coli_v4_gpu_expert_attach(store, &views[current]);
+            if (store->gpu) {
+                if (coli_v4_hybrid_enabled())
+                    /* peek only: uploads are decided once the token's full
+                     * miss count is known, by the q* pass below */
+                    coli_v4_gpu_expert_peek(store, &views[current]);
+                else
+                    coli_v4_gpu_expert_attach(store, &views[current]);
+            }
 #endif
             if (!views[current].gate.gpu || !views[current].up.gpu ||
                 !views[current].down.gpu)
@@ -5013,6 +5043,51 @@ static int moe_token_pipeline(float *output,
             }
     }
 #ifdef COLI_V4_GPU_TIER
+    int hybrid_gpu_count = 0;
+    if (!result && coli_v4_hybrid_enabled() && store->gpu && !gpu_compute) {
+        /* q* pass: the peeks above established which of the token's experts
+         * are already resident. Upload only fill = q*(m) of the m misses;
+         * the rest stay host-side on purpose. Uploads are timed to feed the
+         * fill-bandwidth EMA. While the host bandwidth is still unmeasured,
+         * leave one expert on the CPU so it CAN be measured, otherwise
+         * fill == m forever and the policy never engages. */
+        int *missing = malloc((size_t)selected * sizeof(*missing));
+        if (missing) {
+            int miss_n = 0;
+            for (int i = 0; i < selected; i++)
+                if (!views[i].gate.gpu || !views[i].up.gpu ||
+                    !views[i].down.gpu)
+                    missing[miss_n++] = i;
+            int fill = coli_v4_hybrid_fill_count(
+                miss_n, g_v4_hyb_fill_bw, g_v4_hyb_host_bw);
+            if (g_v4_hyb_host_bw <= 0.0 && fill >= miss_n && miss_n > 1)
+                fill = miss_n - 1;
+            for (int i = 0; i < fill; i++) {
+                int v = missing[i];
+                struct timespec f0, f1;
+                clock_gettime(CLOCK_MONOTONIC, &f0);
+                if (coli_v4_gpu_expert_attach(store, &views[v]) == 0 &&
+                    views[v].gate.gpu && views[v].up.gpu &&
+                    views[v].down.gpu) {
+                    clock_gettime(CLOCK_MONOTONIC, &f1);
+                    double dt = (f1.tv_sec - f0.tv_sec) +
+                                (f1.tv_nsec - f0.tv_nsec) * 1e-9;
+                    if (dt > 0.0)
+                        g_v4_hyb_fill_bw = coli_v4_hybrid_ema(
+                            g_v4_hyb_fill_bw, 1.0 / dt);
+                    g_v4_hyb_upload_n++;
+                }
+            }
+            if (miss_n > fill)
+                g_v4_hyb_skip_n += (unsigned long long)(miss_n - fill);
+            free(missing);
+        }
+        for (int i = 0; i < selected; i++)
+            if (views[i].gate.gpu && views[i].up.gpu && views[i].down.gpu)
+                hybrid_gpu_count++;
+        if (hybrid_gpu_count == selected)
+            gpu_compute = 1;    /* every expert made it: use the fused path */
+    }
     if (!result && gpu_compute && store->gpu) {
         void *sg = coli_v4_layer_gpu(weights, "ffn.shared_experts.w1");
         void *su = coli_v4_layer_gpu(weights, "ffn.shared_experts.w2");
@@ -5055,6 +5130,73 @@ static int moe_token_pipeline(float *output,
                     output[i] = coli_bf16_round(expert_output[i]);
         }
         free(gates); free(ups); free(downs);
+    } else if (!result && hybrid_gpu_count > 0 && store->gpu) {
+        /* Hybrid split: the GPU computes the resident subset as one weighted
+         * group while the CPU computes the rest; the two partial sums merge
+         * by addition, the same order-of-addition class that already
+         * separates the fused GPU path from the CPU reference. The CPU half
+         * is timed to feed the host-bandwidth EMA. A backend failure on the
+         * GPU half degrades that subset to the CPU loop instead of failing
+         * the token. */
+        int gpu_n = hybrid_gpu_count, cpu_n = selected - hybrid_gpu_count;
+        void **gates = malloc((size_t)gpu_n * sizeof(*gates));
+        void **ups = malloc((size_t)gpu_n * sizeof(*ups));
+        void **downs = malloc((size_t)gpu_n * sizeof(*downs));
+        float *gpu_weights = malloc((size_t)gpu_n * sizeof(*gpu_weights));
+        float *gpu_sum = malloc((size_t)d * sizeof(*gpu_sum));
+        int gpu_ok = gates && ups && downs && gpu_weights && gpu_sum;
+        if (gpu_ok) {
+            int k = 0;
+            for (int i = 0; i < selected; i++)
+                if (views[i].gate.gpu && views[i].up.gpu &&
+                    views[i].down.gpu) {
+                    gates[k] = views[i].gate.gpu;
+                    ups[k] = views[i].up.gpu;
+                    downs[k] = views[i].down.gpu;
+                    gpu_weights[k] = expert_weights[i];
+                    k++;
+                }
+            extern int dsv4_cuda_expert_group(
+                void *const *gate, void *const *up, void *const *down,
+                const float *weights, int count, float limit,
+                float *y, const float *x);
+            if (!dsv4_cuda_expert_group(gates, ups, downs, gpu_weights,
+                gpu_n, config->swiglu_limit, gpu_sum, input)) gpu_ok = 0;
+        }
+        struct timespec h0, h1;
+        clock_gettime(CLOCK_MONOTONIC, &h0);
+        for (int current = 0; !result && current < selected; current++) {
+            int on_gpu = views[current].gate.gpu && views[current].up.gpu &&
+                         views[current].down.gpu;
+            if (on_gpu && gpu_ok) continue;   /* covered by the group above */
+            result = coli_v4_expert_forward_ref(
+                expert_output, &views[current], input,
+                expert_weights[current], config->swiglu_limit);
+            if (!result)
+                for (int i = 0; i < d; i++) output[i] += expert_output[i];
+        }
+        if (!result && gpu_ok && cpu_n > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &h1);
+            double dt = (h1.tv_sec - h0.tv_sec) +
+                        (h1.tv_nsec - h0.tv_nsec) * 1e-9;
+            if (dt > 0.0)
+                g_v4_hyb_host_bw = coli_v4_hybrid_ema(
+                    g_v4_hyb_host_bw, (double)cpu_n / dt);
+        }
+        if (!result) {
+            if (gpu_ok) {
+                for (int i = 0; i < d; i++)
+                    output[i] = coli_bf16_round(
+                        output[i] + gpu_sum[i] + shared_output[i]);
+                g_v4_hyb_gpu_n += (unsigned long long)gpu_n;
+                g_v4_hyb_cpu_n += (unsigned long long)cpu_n;
+            } else {
+                for (int i = 0; i < d; i++)
+                    output[i] = coli_bf16_round(output[i] + shared_output[i]);
+            }
+        }
+        free(gates); free(ups); free(downs);
+        free(gpu_weights); free(gpu_sum);
     } else
 #endif
     {
@@ -10023,6 +10165,32 @@ int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
         (V4GpuExpertMirrorCache *)store->gpu, view);
 }
 
+/* Lookup-only twin of attach: report whether {layer, expert} is already
+ * mirrored, touching its LRU stamp, but NEVER uploading on a miss. The
+ * hybrid decode split peeks the whole token first and decides its uploads
+ * afterwards with the q* policy, instead of paying a blocking PCIe copy per
+ * miss the moment it is discovered. */
+int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
+    if (!store || !view || !store->gpu) return -1;
+    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    pthread_mutex_lock(&cache->mutex);
+    for (int i = 0; i < cache->count; i++) {
+        if (cache->entries[i].layer == view->key.layer &&
+            cache->entries[i].expert == view->key.expert &&
+            cache->entries[i].gate && cache->entries[i].up &&
+            cache->entries[i].down) {
+            cache->entries[i].clock = ++cache->clock;
+            view->gate.gpu = cache->entries[i].gate;
+            view->up.gpu = cache->entries[i].up;
+            view->down.gpu = cache->entries[i].down;
+            pthread_mutex_unlock(&cache->mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&cache->mutex);
+    return -1;
+}
+
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
     if (!view) return -1;
     return v4_gpu_expert_attach_cached((V4GpuExpertMirrorCache *)cache, view);
@@ -13394,6 +13562,15 @@ static int v4_serve_one(ColiV4Engine *engine, ColiV4Session *session,
         : 0.0;
     v4_prof_emit(elapsed, stats.prompt_tokens, completion,
                  expert_disk_s, expert_matmul_s);
+#ifdef COLI_V4_GPU_TIER
+    if (coli_v4_hybrid_enabled() && (g_v4_hyb_gpu_n + g_v4_hyb_cpu_n +
+                           g_v4_hyb_upload_n + g_v4_hyb_skip_n))
+        fprintf(stderr, "v4_hybrid gpu=%llu cpu=%llu uploads=%llu "
+                        "skipped=%llu fill_bw=%.1f/s host_bw=%.1f/s "
+                        "(cumulative)\n",
+                g_v4_hyb_gpu_n, g_v4_hyb_cpu_n, g_v4_hyb_upload_n,
+                g_v4_hyb_skip_n, g_v4_hyb_fill_bw, g_v4_hyb_host_bw);
+#endif
     coli_v4_expert_store_emit_hits(engine->experts);
     coli_v4_expert_store_emit_emap(engine->experts);
     coli_v4_expert_store_emit_tiers(engine->experts);
