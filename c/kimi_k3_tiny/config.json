@@ -5,7 +5,7 @@
   ],
   "hidden_size": 128,
   "num_hidden_layers": 6,
-  "vocab_size": 256,
+  "vocab_size": 320,
   "first_k_dense_replace": 2,
   "intermediate_size": 64,
   "num_attention_heads": 4,

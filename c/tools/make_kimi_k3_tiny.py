@@ -49,7 +49,7 @@ import numpy as np
 
 SEED = 20260823
 
-VOCAB = 256
+VOCAB = 320
 HIDDEN = 128
 LAYERS = 6
 FIRST_DENSE = 2          # layers 0..1 use the dense MLP path

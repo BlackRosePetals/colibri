@@ -64,6 +64,13 @@
  *   K3_LOGITS=path       dump f32 logits per PREFILL position (teacher-forced
  *                        bit-width comparisons; use with --ngen 0)
  *   K3_MAXT=N            KV/context capacity (default prompt+ngen)
+ *   COLI_K3_CKPT=N       OPT-IN recurrent-state checkpoints for serve: keep N
+ *                        photos of the KDA state at turn boundaries so a
+ *                        divergent prompt (agentic edit) resumes from the
+ *                        deepest valid photo instead of re-prefilling from
+ *                        token 0. Unset/0 (default) = feature off, engine
+ *                        byte-identical to before. ~434 MB per photo on the
+ *                        full model, which is why it is opt-in.
  *   COLI_TEMP=F          0 = greedy (default), else softmax temperature
  */
 #define _GNU_SOURCE
@@ -470,6 +477,11 @@ static int g_k3_direct=-1;               /* K3_DIRECT: O_DIRECT expert reads */
 static int g_k3_idot=1;                  /* K3_IDOT: int8-activation expert matmuls */
 static int g_k3_pipe=1;                  /* K3_PIPE: overlap loads with compute */
 static float g_k3_topp=0.f;              /* K3_TOPP: routed-expert top-p pruning */
+enum { K3_CKPT_MAX = 8 };
+static size_t k3_ckpt_blob_floats(const Model *m); /* def. with the ckpt block */
+static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
+                                          * slots. STRICTLY OPT-IN, 0 = off (default,
+                                          * engine behaves exactly as before). */
 
 static int k3_mmap_backend_allowed(int mmap_enabled, int vk_enabled, int cuda_enabled){
     return !mmap_enabled || (!vk_enabled && !cuda_enabled);
@@ -774,6 +786,12 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
 #endif
     g_k3_direct = getenv("K3_DIRECT")?atoi(getenv("K3_DIRECT")):1;
     g_k3_idot  = getenv("K3_IDOT")?atoi(getenv("K3_IDOT")):1;
+    { /* Recurrent-state checkpoints are strictly OPT-IN: unset or 0 keeps
+       * the engine byte-identical to before the feature existed. */
+      const char *e=getenv("COLI_K3_CKPT");
+      g_k3_ckpt_slots=e?atoi(e):0;
+      if(g_k3_ckpt_slots<0) g_k3_ckpt_slots=0;
+      if(g_k3_ckpt_slots>K3_CKPT_MAX) g_k3_ckpt_slots=K3_CKPT_MAX; }
     g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
     g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
     if(g_k3_topp>0.f)
@@ -1030,6 +1048,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     }
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
+    if(g_k3_ckpt_slots>0)
+        fprintf(stderr,"[K3-CKPT] enabled: %d recurrent-state slots (%.1f MB each)\n",
+                g_k3_ckpt_slots,k3_ckpt_blob_floats(m)*sizeof(float)/1048576.0);
     /* Phase 9: layer validation init */
     { const char *vl=getenv("K3_VALIDATE_LAYER");
       const char *vt=getenv("K3_VALIDATE_TOKEN");
@@ -2389,6 +2410,116 @@ static void model_state_reset(Model *m){
     }
 }
 
+/* ---------- recurrent-state checkpoints (OPT-IN, COLI_K3_CKPT=N) ----------
+ *
+ * kv_prefix reuse is all-or-nothing because the 69 KDA layers carry a single
+ * RECURRENT state that exists only at "now": a prompt that diverges anywhere
+ * before the fed length cannot be resumed, so today it resets everything and
+ * re-prefills from token 0 — on a streaming engine that is minutes of disk
+ * reads for an agentic edit that changed one tool result near the end.
+ *
+ * A checkpoint is a photograph of that recurrent state (kstate + the three
+ * conv windows of every KDA layer) taken at a turn boundary, together with
+ * its OWN copy of the token ids that produced it. On a divergent prompt the
+ * deepest photo still valid for the shared prefix is restored and only the
+ * tail is re-prefilled.
+ *
+ * Validity needs BOTH checks, not one: the photo's ids must prefix-match the
+ * new prompt (KDA side), and the restore position must not exceed the live
+ * common prefix of the CURRENT record (the MLA Lc/Rc rows are per-position
+ * and only valid while the record still describes them — after a reset the
+ * record is empty and no restore can happen, which is correct because
+ * model_state_reset also freed those rows).
+ *
+ * With COLI_K3_CKPT unset or 0 (the default), none of this code runs and the
+ * engine is byte-identical to before the feature existed. */
+typedef struct {
+    int pos;            /* state covers ids[0..pos-1] */
+    int *fed;           /* own copy of those ids */
+    float *blob;        /* packed kstate + cwq/cwk/cwv of every KDA layer */
+    uint64_t used;      /* LRU stamp */
+} K3Ckpt;
+static K3Ckpt g_k3_ckpt[K3_CKPT_MAX];
+static uint64_t g_k3_ckpt_clock=0;
+
+static size_t k3_ckpt_blob_floats(const Model *m){
+    const Cfg *c=&m->c;
+    size_t per=(size_t)c->kda_heads*c->kda_hd*c->kda_hd
+              +3u*(size_t)c->kda_proj*c->conv_k, n=0;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda) n+=per;
+    return n;
+}
+
+static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
+    Cfg *c=&m->c; size_t o=0;
+    size_t ks=(size_t)c->kda_heads*c->kda_hd*c->kda_hd;
+    size_t cw=(size_t)c->kda_proj*c->conv_k;
+    for(int i=0;i<c->n_layers;i++) if(m->L[i].kda){
+        float *live[4]={m->kstate[i],m->cwq[i],m->cwk[i],m->cwv[i]};
+        size_t len[4]={ks,cw,cw,cw};
+        for(int j=0;j<4;j++){
+            if(to_blob) memcpy(blob+o,live[j],len[j]*sizeof(float));
+            else        memcpy(live[j],blob+o,len[j]*sizeof(float));
+            o+=len[j];
+        }
+    }
+}
+
+static void k3_ckpt_save(Model *m){
+    if(g_k3_ckpt_slots<1) return;
+    int pos=m->kvp.len;
+    if(pos<1||m->kvp.tainted||!m->kvp.fed) return;
+    for(int s=0;s<g_k3_ckpt_slots;s++){       /* identical photo: refresh LRU */
+        K3Ckpt *k=&g_k3_ckpt[s];
+        if(k->blob&&k->pos==pos&&
+           !memcmp(k->fed,m->kvp.fed,(size_t)pos*sizeof(int))){
+            k->used=++g_k3_ckpt_clock; return; }
+    }
+    int victim=0;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        if(!g_k3_ckpt[s].blob){ victim=s; break; }
+        if(g_k3_ckpt[s].used<g_k3_ckpt[victim].used) victim=s;
+    }
+    K3Ckpt *k=&g_k3_ckpt[victim];
+    if(!k->blob){
+        k->blob=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
+        if(!k->blob) return;                  /* optimisation, never a failure */
+    }
+    int *fed=realloc(k->fed,(size_t)pos*sizeof(int));
+    if(!fed) return;                          /* slot keeps its old photo */
+    k->fed=fed;
+    memcpy(k->fed,m->kvp.fed,(size_t)pos*sizeof(int));
+    k3_ckpt_copy(k->blob,m,1);
+    k->pos=pos; k->used=++g_k3_ckpt_clock;
+    if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[K3-CKPT] saved pos=%d slot=%d\n",pos,victim);
+}
+
+/* Deepest valid photo for this prompt; restores it and returns the covered
+ * positions (the caller prefills only ids[pos..np)), or 0 when none fits. */
+static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
+    if(g_k3_ckpt_slots<1||m->kvp.tainted||!m->kvp.fed) return 0;
+    int live=0, lim=m->kvp.len<np?m->kvp.len:np;
+    while(live<lim&&m->kvp.fed[live]==ids[live]) live++;
+    if(live>=np) live=np-1;   /* at least one new token must be prefilled */
+    int best=-1;
+    for(int s=0;s<g_k3_ckpt_slots;s++){
+        K3Ckpt *k=&g_k3_ckpt[s];
+        if(!k->blob||k->pos<1||k->pos>live) continue;
+        if(memcmp(k->fed,ids,(size_t)k->pos*sizeof(int))) continue;
+        if(best<0||k->pos>g_k3_ckpt[best].pos) best=s;
+    }
+    if(best<0) return 0;
+    K3Ckpt *k=&g_k3_ckpt[best];
+    k3_ckpt_copy(k->blob,m,0);
+    m->kvp.len=k->pos;        /* the record truncates with the state it describes */
+    k->used=++g_k3_ckpt_clock;
+    if(getenv("K3_PREFIX_LOG"))
+        fprintf(stderr,"[K3-CKPT] restored pos=%d of %d prompt tokens "
+                       "(recompute %d)\n",k->pos,np,np-k->pos);
+    return k->pos;
+}
+
 /* Decide reuse before changing the state it describes. A miss discards the
  * old recurrent/KV state first and allocates a fresh target; a hit grows the
  * existing target while preserving its prefix. The old order allocated first,
@@ -2396,6 +2527,9 @@ static void model_state_reset(Model *m){
  * MLA prefill immediately indexed them (#855). */
 static int prepare_request_state(Model *m, const int *ids, int np, int max_t){
     int reuse=kv_prefix_reuse(&m->kvp,ids,np);
+    /* Divergent prompt: before surrendering to a full reset, try the
+     * checkpoint pool (a no-op unless COLI_K3_CKPT enabled it). */
+    if(!reuse) reuse=k3_ckpt_restore_best(m,ids,np);
     if(!reuse) model_state_reset(m);
     kv_alloc(m,max_t);
     return reuse;
@@ -2547,6 +2681,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         if(!poll.fatal) coli_serve_write_error(stdout,q->id,"CANCELLED");
         return poll.fatal?-1:0;
     }
+    /* Turn boundary: the state now covers exactly the prompt. A photo here is
+     * what an agentic edit of the NEXT request restores from. */
+    k3_ckpt_save(m);
     int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
@@ -2601,6 +2738,9 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     }
     if(poll.fatal){ free(lo); free(ids); return -1; }
     free(lo); free(ids);
+    /* End of the reply: the next turn's transcript extends THIS state, and an
+     * edited retry of this turn restores the prompt-boundary photo above. */
+    k3_ckpt_save(m);
     double dt=now_s()-t0, decode=now_s()-tg;
     uint64_t hits=m->hits-hit0, misses=m->miss-miss0, total=hits+misses;
     ColiServeDone done={gen,decode>0?gen/decode:0.0,
