@@ -606,6 +606,20 @@ endif
 
 all: colibri$(EXE)
 
+# Tiny Kimi K3 fixture + vendor oracle.  The generator is numpy-only and
+# deterministic; ref.json is committed and comes from Moonshot's own modeling
+# code (tools/make_kimi_k3_ref.py, maintainer-run, SHA-256-pinned), so CI
+# needs neither torch nor network.  kimi_k3 builds on every platform, so
+# unlike the V4 targets this needs no support gate.
+.PHONY: kimi-k3-tiny-generate kimi-k3-tiny-check
+kimi-k3-tiny-generate:
+	$(PYTHON) tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
+
+kimi-k3-tiny-check: kimi-k3-tiny-generate kimi_k3$(EXE)
+	$(PYTHON) tests/test_kimi_k3_tiny.py \
+		--binary ./kimi_k3$(EXE) \
+		--fixture ./kimi_k3_tiny
+
 .PHONY: deepseek-v4 deepseek-v4-oracle deepseek-v4-tiny-generate \
 	deepseek-v4-tiny-check deepseek-v4-clean
 ifeq ($(COLI_V4_SUPPORTED),1)
