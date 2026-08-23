@@ -457,6 +457,7 @@ ifneq (,$(LINUX))
 TEST_BINS += tests/test_uring$(EXE)
 endif
 ifeq ($(COLI_V4_SUPPORTED),1)
+TEST_BINS += tests/test_v4_hybrid_policy$(EXE)
 TEST_BINS += tests/test_deepseek_v4$(EXE) tests/test_v4_ownership$(EXE) \
 	tests/test_v4_serve_framing$(EXE)
 endif
@@ -1335,6 +1336,9 @@ tests/test_corpus_draft$(EXE): tests/test_corpus_draft.c colibri.c st.h uring.h 
 
 tests/test_cap_precedence$(EXE): tests/test_cap_precedence.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+tests/test_v4_hybrid_policy$(EXE): tests/test_v4_hybrid_policy.c deepseek_v4_hybrid.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
 tests/test_ram_clamp$(EXE): tests/test_ram_clamp.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
