@@ -15441,6 +15441,32 @@ static int fp8_matvec_validate(const ColiTensorView *weight) {
 
 /* Compute CPU su attivazione GIA' qdq (estratto invariato da matvec_ref).
  * EN: CPU compute on an already-qdq'd activation, extracted verbatim. */
+#ifdef __AVX2__
+/* Branchless SIMD decode of 8 E4M3FN codes -> 8 f32, byte-identical to
+ * coli_e4m3fn_decode for all 256 inputs (exhaustively verified). Replaces a
+ * slow per-element _mm256_i32gather_ps from a 256-float LUT. E4M3FN values are
+ * exact, so the f32 bit pattern is built directly: normals via integer field
+ * assembly, subnormals as (float)mantissa*2^-9 (exact), NaN (code&0x7F==0x7F)
+ * as canonical qNaN overwriting the sign. */
+static inline __m256 v4_fp8_decode8(__m256i codes) {
+    __m256i man = _mm256_and_si256(codes, _mm256_set1_epi32(7));
+    __m256i exp = _mm256_and_si256(_mm256_srli_epi32(codes, 3), _mm256_set1_epi32(0xF));
+    __m256i sgn = _mm256_slli_epi32(_mm256_srli_epi32(codes, 7), 31);
+    __m256i nbits = _mm256_or_si256(
+        _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
+        _mm256_slli_epi32(man, 20));
+    __m256 nval = _mm256_castsi256_ps(nbits);
+    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(ldexpf(1.0f, -9)));
+    __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
+    __m256i sbits = _mm256_or_si256(
+        _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
+    __m256i is_nan = _mm256_cmpeq_epi32(
+        _mm256_and_si256(codes, _mm256_set1_epi32(0x7F)), _mm256_set1_epi32(0x7F));
+    return _mm256_castsi256_ps(
+        _mm256_blendv_epi8(sbits, _mm256_set1_epi32(0x7FC00000), is_nan));
+}
+#endif
+
 static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
                               const float *activation) {
     size_t rows = (size_t)weight->rows;
@@ -15452,9 +15478,6 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
         if (rows % 8) {
             return -1;
         }
-        float fp8[256];
-        for (int code = 0; code < 256; code++)
-            fp8[code] = coli_e4m3fn_decode((uint8_t)code);
         const uint8_t *data = weight->data;
         const float *scales = weight->scales;
         #pragma omp parallel for schedule(static)
@@ -15469,7 +15492,7 @@ static int fp8_matvec_compute(float *output, const ColiTensorView *weight,
                     __m128i bytes = _mm_loadl_epi64((const __m128i *)(data +
                         ((size_t)tile * columns + column) * 8));
                     __m256i codes = _mm256_cvtepu8_epi32(bytes);
-                    __m256 values = _mm256_i32gather_ps(fp8, codes, 4);
+                    __m256 values = v4_fp8_decode8(codes);
                     __m256 x = _mm256_set1_ps(activation[column]);
                     sum = _mm256_add_ps(sum, _mm256_mul_ps(
                         _mm256_mul_ps(x, values), scale));
