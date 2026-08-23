@@ -7,6 +7,7 @@ mocking sys.platform and the two win32 probes.
 """
 import ctypes
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -153,6 +154,34 @@ class PersistentDatapointTest(unittest.TestCase):
         self.assertEqual(campaign["warm"][0]["prompt_tokens"], 17)
         self.assertEqual(campaign["rotating_prompt_count"], 4)
         self.assertEqual(campaign["rotating_prompt_source"], "built-in")
+
+    def test_teardown_failure_does_not_discard_collected_results(self):
+        # At --memory-gb 126 the engine can outlast the close() grace period
+        # while it frees a large resident cache; the raised TimeoutExpired used
+        # to swallow the return and lose a complete run (#1154). A teardown that
+        # fails must still yield the measurements already gathered.
+        base = self._runtime()
+
+        class RaisingCloseEngine(base.Engine):
+            def close(self):
+                self.closed = True
+                raise subprocess.TimeoutExpired(cmd="engine", timeout=5)
+
+        runtime = self._runtime(engine_type=RaisingCloseEngine)
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "deepseek_v4"
+            executable.touch()
+            with mock.patch.dict(os.environ, {}, clear=True):
+                campaign = datapoint.run_persistent_engine(
+                    str(executable), "/model", "hello", 8, 0, 1, 16,
+                    memory_gb=126, runtime=runtime, physical_cores=8)
+
+        self.assertEqual(len(self.instances), 1)
+        self.assertTrue(self.instances[0].closed)
+        self.assertEqual(len(campaign["cold"]), 1)
+        self.assertEqual(len(campaign["warm"]), 1)
+        self.assertEqual([row["tok_s"] for row in campaign["rotating"]],
+                         [3.0, 4.0, 5.0, 6.0])
 
     def test_engine_is_closed_when_a_request_fails(self):
         instances = self.instances

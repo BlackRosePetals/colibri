@@ -2381,8 +2381,17 @@ class Engine:
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                # A large resident cache (e.g. 111 GB at --memory-gb 126) can
+                # take longer than the grace period to unmap and free on
+                # SIGTERM. SIGKILL cannot be caught, so the process is already
+                # on its way out; a second timeout only means the reap has not
+                # landed yet. Teardown is best-effort: never raise from here, or
+                # a completed measurement is lost to a shutdown that succeeded.
                 self.process.kill()
-                self.process.wait(timeout=5)
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
         if self.dispatcher is not threading.current_thread():
             self.dispatcher.join(timeout=5)
 
