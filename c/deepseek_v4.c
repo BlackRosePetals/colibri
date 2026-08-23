@@ -7019,6 +7019,7 @@ typedef struct {
 } V4ExpertRecord;
 
 typedef struct {
+    int owner_layer;
     int expert;
     int loading_expert;
     unsigned references;
@@ -7042,9 +7043,15 @@ typedef struct {
                           * mutates slot identity must maintain this index */
     int *allocated_per_layer; /* shared by the embedded base and hot StoreOps:
                                * every slab allocation must advance this cursor */
+    int *resident_per_layer; /* logical owners, including in-flight loads */
     int *lru_head; /* every recency update in either StoreOps must touch the
                     * intrusive list while state->mutex is held */
     int *lru_tail;
+    /* Batched prefill is layer-major.  While pool_layer >= 0, misses for that
+     * layer may borrow any physical cache partition; decode leaves this at -1
+     * and keeps the ordinary per-layer allocation policy. */
+    int pool_layer;
+    int pool_reserve_per_layer;
     uint64_t clock;
     unsigned active_leases;
     ColiExpertStoreStats stats;
@@ -7143,6 +7150,11 @@ static V4ExpertSlot *layer_slots(V4ExpertStoreState *state, int layer) {
     return state->slots + (size_t)layer * state->slots_per_layer;
 }
 
+static int slot_partition(const V4ExpertStoreState *state,
+                          const V4ExpertSlot *slot) {
+    return (int)(slot - state->slots) / state->slots_per_layer;
+}
+
 #ifdef COLI_V4_TEST_HOOKS
 uint64_t coli_v4_test_expert_victim_probes;
 #define V4_COUNT_VICTIM_PROBE() (coli_v4_test_expert_victim_probes++)
@@ -7152,34 +7164,36 @@ uint64_t coli_v4_test_expert_victim_probes;
 
 /* All LRU helpers are called with state->mutex held.  Slabs are allocated in
  * slot order and never freed before store destruction, so the next empty slot
- * is O(1).  Allocated slots form one exact LRU list per layer: moving a slot to
- * the tail is equivalent to assigning the old monotonically increasing used
- * timestamp, without searching the whole cache for its minimum on a miss. */
-static void touch_lru_slot(V4ExpertStoreState *state, int layer,
-                           V4ExpertSlot *slot) {
+ * is O(1).  Allocated slots form one exact LRU list per physical partition:
+ * moving a slot to the tail is equivalent to assigning the old monotonically
+ * increasing used timestamp, without searching the whole cache for its
+ * minimum on a miss.  A pooled prefill may change a slot's logical owner, but
+ * its physical partition (and therefore list membership) never changes. */
+static void touch_lru_slot(V4ExpertStoreState *state, V4ExpertSlot *slot) {
     int index = (int)(slot - state->slots);
-    int layer_begin = layer * state->slots_per_layer;
-    int layer_end = layer_begin + state->slots_per_layer;
-    assert(index >= layer_begin && index < layer_end);
+    int partition = slot_partition(state, slot);
+    int partition_begin = partition * state->slots_per_layer;
+    int partition_end = partition_begin + state->slots_per_layer;
+    assert(index >= partition_begin && index < partition_end);
     if (slot->in_lru) {
         if (slot->lru_previous >= 0)
             state->slots[slot->lru_previous].lru_next = slot->lru_next;
         else
-            state->lru_head[layer] = slot->lru_next;
+            state->lru_head[partition] = slot->lru_next;
         if (slot->lru_next >= 0)
             state->slots[slot->lru_next].lru_previous = slot->lru_previous;
         else
-            state->lru_tail[layer] = slot->lru_previous;
+            state->lru_tail[partition] = slot->lru_previous;
     } else {
         slot->in_lru = 1;
     }
-    slot->lru_previous = state->lru_tail[layer];
+    slot->lru_previous = state->lru_tail[partition];
     slot->lru_next = -1;
-    if (state->lru_tail[layer] >= 0)
-        state->slots[state->lru_tail[layer]].lru_next = index;
+    if (state->lru_tail[partition] >= 0)
+        state->slots[state->lru_tail[partition]].lru_next = index;
     else
-        state->lru_head[layer] = index;
-    state->lru_tail[layer] = index;
+        state->lru_head[partition] = index;
+    state->lru_tail[partition] = index;
 }
 
 static V4ExpertSlot *next_empty_slot(V4ExpertStoreState *state, int layer) {
@@ -7193,7 +7207,20 @@ static void mark_slot_allocated(V4ExpertStoreState *state, int layer,
     assert(slot == layer_slots(state, layer) +
                    state->allocated_per_layer[layer]);
     state->allocated_per_layer[layer]++;
-    touch_lru_slot(state, layer, slot);
+    touch_lru_slot(state, slot);
+}
+
+/* Prefer the current layer's physical partition, then borrow unused slabs
+ * from the remaining partitions.  The scan is bounded by model depth, not by
+ * cache capacity, and advances only when a whole partition is full. */
+static V4ExpertSlot *next_pooled_empty_slot(V4ExpertStoreState *state,
+                                            int layer) {
+    for (int offset = 0; offset < state->layers; offset++) {
+        int partition = (layer + offset) % state->layers;
+        V4ExpertSlot *slot = next_empty_slot(state, partition);
+        if (slot) return slot;
+    }
+    return NULL;
 }
 
 /* Only referenced (in-use/in-flight) slots can precede the victim.  Therefore
@@ -7223,12 +7250,11 @@ static V4ExpertSlot *indexed_expert_slot(V4ExpertStoreState *state,
                                          ColiExpertKey key) {
     int slot_index = state->slot_by_expert[expert_cell(
         state, key.layer, key.expert)];
-    size_t layer_begin = (size_t)key.layer * state->slots_per_layer;
-    size_t layer_end = layer_begin + state->slots_per_layer;
-    if (slot_index < 0 || (size_t)slot_index < layer_begin ||
-        (size_t)slot_index >= layer_end) return NULL;
+    size_t slot_count = (size_t)state->layers * state->slots_per_layer;
+    if (slot_index < 0 || (size_t)slot_index >= slot_count) return NULL;
     V4ExpertSlot *slot = &state->slots[slot_index];
-    if (slot->expert != key.expert && slot->loading_expert != key.expert)
+    if (slot->owner_layer != key.layer ||
+        (slot->expert != key.expert && slot->loading_expert != key.expert))
         return NULL;
     return slot;
 }
@@ -7237,19 +7263,30 @@ static void unindex_expert_slot(V4ExpertStoreState *state,
                                 V4ExpertSlot *slot) {
     int slot_index = (int)(slot - state->slots);
     int experts[2] = {slot->expert, slot->loading_expert};
+    int removed = 0;
     for (int i = 0; i < 2; i++) {
         int expert = experts[i];
-        if (expert < 0 || expert >= state->experts_per_layer) continue;
-        int layer = slot_index / state->slots_per_layer;
-        int *entry = &state->slot_by_expert[expert_cell(state, layer, expert)];
-        if (*entry == slot_index) *entry = -1;
+        if (slot->owner_layer < 0 || slot->owner_layer >= state->layers ||
+            expert < 0 || expert >= state->experts_per_layer) continue;
+        int *entry = &state->slot_by_expert[expert_cell(
+            state, slot->owner_layer, expert)];
+        if (*entry == slot_index) {
+            *entry = -1;
+            removed = 1;
+        }
     }
+    if (removed && state->resident_per_layer[slot->owner_layer] > 0)
+        state->resident_per_layer[slot->owner_layer]--;
 }
 
 static void index_expert_slot(V4ExpertStoreState *state, int layer,
                               int expert, V4ExpertSlot *slot) {
-    state->slot_by_expert[expert_cell(state, layer, expert)] =
-        (int)(slot - state->slots);
+    int slot_index = (int)(slot - state->slots);
+    int *entry = &state->slot_by_expert[expert_cell(state, layer, expert)];
+    assert(*entry < 0 || *entry == slot_index);
+    if (*entry != slot_index) state->resident_per_layer[layer]++;
+    slot->owner_layer = layer;
+    *entry = slot_index;
 }
 
 static void fill_tensor_view(ColiTensorView *view,
@@ -7346,7 +7383,7 @@ static int lookup(ColiExpertStore *store, ColiExpertKey key,
     slot->references++;
     state->active_leases++;
     slot->used = ++state->clock;
-    touch_lru_slot(state, key.layer, slot);
+    touch_lru_slot(state, slot);
     if (state->ehit) {
         size_t expert_index =
             (size_t)key.layer * state->experts_per_layer + key.expert;
@@ -7459,6 +7496,7 @@ static void destroy(ColiExpertStore *store) {
         free(state->slots);
         free(state->slot_by_expert);
         free(state->allocated_per_layer);
+        free(state->resident_per_layer);
         free(state->lru_head);
         free(state->lru_tail);
         free(state->ehit);
@@ -7495,6 +7533,7 @@ int coli_deepseek_v4_expert_store_open(
     }
     state->layers = options->layers;
     state->experts_per_layer = options->experts_per_layer;
+    state->pool_layer = -1;
     if (coli_st_index_open(&state->index, options->model_dir, error, error_size) != 0)
         goto fail;
     /* DUAL-SSD: register COLI_MODEL_MIRROR copies and derive the read split
@@ -7526,6 +7565,7 @@ int coli_deepseek_v4_expert_store_open(
         ((uint64_t)state->layers * state->record_bytes));
     int minimum_slots = state->experts_per_layer < 6
         ? state->experts_per_layer : 6;
+    state->pool_reserve_per_layer = minimum_slots;
     if (state->slots_per_layer < minimum_slots) {
         set_error(error, error_size,
                   "cache budget cannot hold %d active experts per layer "
@@ -7540,10 +7580,12 @@ int coli_deepseek_v4_expert_store_open(
                           sizeof(*state->slots));
     state->allocated_per_layer = calloc(
         (size_t)state->layers, sizeof(*state->allocated_per_layer));
+    state->resident_per_layer = calloc(
+        (size_t)state->layers, sizeof(*state->resident_per_layer));
     state->lru_head = malloc((size_t)state->layers * sizeof(*state->lru_head));
     state->lru_tail = malloc((size_t)state->layers * sizeof(*state->lru_tail));
-    if (!state->slots || !state->allocated_per_layer || !state->lru_head ||
-        !state->lru_tail) {
+    if (!state->slots || !state->allocated_per_layer ||
+        !state->resident_per_layer || !state->lru_head || !state->lru_tail) {
         set_error(error, error_size, "out of memory creating expert cache slots");
         goto fail;
     }
@@ -7552,6 +7594,7 @@ int coli_deepseek_v4_expert_store_open(
         state->lru_tail[layer] = -1;
     }
     for (int i = 0; i < state->layers * state->slots_per_layer; i++) {
+        state->slots[i].owner_layer = -1;
         state->slots[i].expert = -1;
         state->slots[i].loading_expert = -1;
         state->slots[i].lru_previous = -1;
@@ -7581,6 +7624,7 @@ fail:
     free(state->records);
     free(state->slot_by_expert);
     free(state->allocated_per_layer);
+    free(state->resident_per_layer);
     free(state->lru_head);
     free(state->lru_tail);
     free(state->ehit);
@@ -7705,7 +7749,7 @@ static V4HotPolicy *hot_find(ColiExpertStore *store) {
 #endif
 
 static int hot_is_pinned(const V4HotPolicy *policy, int layer, int expert) {
-    if (!policy || policy->pin_count < 1) return 0;
+    if (!policy || policy->pin_count < 1 || layer < 0 || expert < 0) return 0;
     int active = policy->pin_count;
 #if COLI_V4_PIN_RAMP_REQUESTS > 0
     if (!policy->history_seeded && active > 4) {
@@ -8000,7 +8044,7 @@ static void hot_repin_locked(V4HotPolicy *policy, V4ExpertStoreState *state,
             state, (ColiExpertKey){layer, expert});
         if (slot && slot->slab && slot->expert == expert) {
             slot->used = ++state->clock;
-            touch_lru_slot(state, layer, slot);
+            touch_lru_slot(state, slot);
         }
     }
     uint64_t decay_interval = policy->repin_interval * 64;
@@ -8024,11 +8068,63 @@ static V4ExpertSlot *hot_oldest_victim(V4ExpertStoreState *state,
         V4_COUNT_VICTIM_PROBE();
         if (!slot->references) {
             if (!fallback) fallback = slot;
-            if (!hot_is_pinned(policy, layer, slot->expert)) return slot;
+            if (!hot_is_pinned(policy, slot->owner_layer, slot->expert))
+                return slot;
         }
         index = slot->lru_next;
     }
     return fallback;
+}
+
+/* Pool-mode victim selection merges the heads of the physical-partition LRU
+ * lists.  It skips only active leases, the bounded pin set and the fixed
+ * six-expert decode reserve, so adding passive RAM slots does not make a miss
+ * more expensive.  Pinned experts survive unless every available slot is
+ * pinned, matching the ordinary cache policy. */
+static V4ExpertSlot *hot_oldest_pool_victim(
+    V4ExpertStoreState *state, const V4HotPolicy *policy) {
+    V4ExpertSlot *best = NULL;
+    V4ExpertSlot *reserved = NULL;
+    V4ExpertSlot *pinned = NULL;
+    V4ExpertSlot *last_resort = NULL;
+    for (int partition = 0; partition < state->layers; partition++) {
+        int index = state->lru_head[partition];
+        while (index >= 0) {
+            V4ExpertSlot *slot = &state->slots[index];
+            V4_COUNT_VICTIM_PROBE();
+            if (!slot->references) {
+                int is_pinned = hot_is_pinned(
+                    policy, slot->owner_layer, slot->expert);
+                int may_lend = slot->owner_layer < 0 ||
+                    slot->owner_layer == state->pool_layer ||
+                    state->resident_per_layer[slot->owner_layer] >
+                        state->pool_reserve_per_layer;
+                if (!last_resort || slot->used < last_resort->used)
+                    last_resort = slot;
+                if (!is_pinned &&
+                    (!reserved || slot->used < reserved->used))
+                    reserved = slot;
+                if (may_lend) {
+                    if (is_pinned) {
+                        if (!pinned || slot->used < pinned->used)
+                            pinned = slot;
+                    } else {
+                        if (!best || slot->used < best->used) best = slot;
+                        break;
+                    }
+                }
+            }
+            index = slot->lru_next;
+        }
+    }
+    /* Preserve both the decode reserve and pins whenever possible.  If active
+     * leases or an extremely small cache make that impossible, correctness
+     * wins: relax the reserve before evicting a pin, then use the exact oldest
+     * unreferenced slot as the final fallback. */
+    if (best) return best;
+    if (reserved) return reserved;
+    if (pinned) return pinned;
+    return last_resort;
 }
 
 static int lookup_hot(ColiExpertStore *store, ColiExpertKey key,
@@ -8067,7 +8163,7 @@ retry_lookup:
         slot->references++;
         state->active_leases++;
         slot->used = ++state->clock; state->stats.hits++;
-        touch_lru_slot(state, key.layer, slot);
+        touch_lru_slot(state, slot);
         if (hot_is_pinned(policy, key.layer, key.expert) && !store->gpu)
             hot_pack_slot_locked(policy, state, record, slot);
         memset(view, 0, sizeof(*view)); view->key = key;
@@ -8093,8 +8189,12 @@ retry_lookup:
         }
         goto retry_lookup;
     }
-    slot = next_empty_slot(state, key.layer);
-    if (!slot) slot = hot_oldest_victim(state, policy, key.layer);
+    int pooled = state->pool_layer == key.layer;
+    slot = pooled ? next_pooled_empty_slot(state, key.layer)
+                  : next_empty_slot(state, key.layer);
+    if (!slot)
+        slot = pooled ? hot_oldest_pool_victim(state, policy)
+                      : hot_oldest_victim(state, policy, key.layer);
     if (!slot) {
         pthread_mutex_unlock(&state->mutex);
         memset(view, 0, sizeof(*view));
@@ -8109,7 +8209,7 @@ retry_lookup:
             return -1;
         }
         slot->aligned_slab = 1;
-        mark_slot_allocated(state, key.layer, slot);
+        mark_slot_allocated(state, slot_partition(state, slot), slot);
         state->stats.resident_bytes += state->record_bytes;
     }
     policy->packed[hot_slot_index(state, slot)] = 0;
@@ -8119,7 +8219,7 @@ retry_lookup:
     slot->references = 1;
     state->active_leases++;
     slot->used = ++state->clock;
-    touch_lru_slot(state, key.layer, slot);
+    touch_lru_slot(state, slot);
     pthread_mutex_unlock(&state->mutex);
     int rep = coli_st_expert_route(key.layer, key.expert);
     struct timespec disk_t0;
@@ -8146,7 +8246,7 @@ retry_lookup:
         (disk_t1.tv_nsec - disk_t0.tv_nsec) * 1e-9;
     if (read_result) {
         unindex_expert_slot(state, slot);
-        slot->references = 0; slot->expert = -1;
+        slot->references = 0; slot->owner_layer = -1; slot->expert = -1;
         slot->loading_expert = -1;
         if (state->active_leases) state->active_leases--;
         free(v4_pack_buf);
@@ -8157,7 +8257,7 @@ retry_lookup:
     }
     slot->expert = key.expert; slot->loading_expert = -1;
     slot->used = ++state->clock;
-    touch_lru_slot(state, key.layer, slot);
+    touch_lru_slot(state, slot);
     state->stats.misses++; state->stats.bytes_read += record->record_bytes;
     hot_pack_slot_commit(policy, state, record, slot, v4_pack_buf);
     v4_pack_buf = NULL;
@@ -8183,6 +8283,24 @@ int coli_v4_test_expert_slot_index(ColiExpertStore *store, ColiExpertKey key) {
     return result;
 }
 #endif
+
+/* Let the layer currently sweeping a batched CPU prefill borrow the complete
+ * cache capacity.  Slots retain an explicit logical owner and stay indexed, so
+ * changing layers does not blindly flush warm entries: an entry is displaced
+ * only when the active layer actually needs its slab.  Pinned entries remain
+ * protected by hot_oldest_pool_victim().
+ *
+ * The capability is intentionally private to the production hot store.  A
+ * registered alternative ExpertStore backend receives a safe no-op rather
+ * than having its opaque state reinterpreted here. */
+void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer) {
+    if (!store || !store->state || store->gpu || !hot_find(store)) return;
+    V4ExpertStoreState *state = store->state;
+    if (layer < 0 || layer >= state->layers) layer = -1;
+    pthread_mutex_lock(&state->mutex);
+    state->pool_layer = layer;
+    pthread_mutex_unlock(&state->mutex);
+}
 
 static void destroy_hot(ColiExpertStore *store) {
     pthread_mutex_lock(&hot_policies_mutex);
@@ -8391,12 +8509,10 @@ void coli_v4_expert_store_emit_emap(ColiExpertStore *store) {
     if (!hex) return;
     pthread_mutex_lock(&state->mutex);
     for (size_t i = 0; i < cells; i++) {
-        int tier = 0;
         int layer = (int)(i / (size_t)cols), expert = (int)(i % (size_t)cols);
-        V4ExpertSlot *slots = state->slots +
-            (size_t)layer * state->slots_per_layer;
-        for (int z = 0; z < state->slots_per_layer; z++)
-            if (slots[z].slab && slots[z].expert == expert) { tier = 1; break; }
+        V4ExpertSlot *slot = indexed_expert_slot(
+            state, (ColiExpertKey){layer, expert});
+        int tier = slot && slot->slab && slot->expert == expert;
         int heat = state->eheat ? state->eheat[i] : 0;
         if (heat > 63) heat = 63;
         int b = (tier << 6) | heat;
@@ -11298,12 +11414,21 @@ static const float *v4_mainh_get(int64_t position) {
 
 #include "deepseek_v4_dspark.inc"
 
+static int v4_prefill_pool_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *setting = getenv("COLI_V4_PREFILL_POOL");
+        enabled = !setting || atoi(setting) != 0;
+    }
+    return enabled;
+}
+
 static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_ptr,
                         ColiDeepSeekV4WindowAttentionState **attention,
                         const ColiSafetensorsIndex *index,
                         const ColiDeepSeekV4Config *config,
                         ColiExpertStore *experts, const int *tokens,
-                        int start, int batch,
+                        int start, int batch, int use_prefill_pool,
                         ColiV4SessionAbortFn should_abort, void *abort_ctx,
                         char *error, size_t error_size) {
     if (!state_ptr || !next_ptr || !*state_ptr || !*next_ptr || !attention ||
@@ -11314,10 +11439,25 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
     }
     float *state = *state_ptr, *next = *next_ptr;
     size_t hd = (size_t)config->hc_mult * config->hidden_size;
+    /* Keep a kill switch for checkpoint A/B and unusual storage backends.  It
+     * does not change the caller's semantic distinction: speculative decode
+     * always passes use_prefill_pool=0. */
+    int pool_experts = use_prefill_pool && v4_prefill_pool_enabled();
     for (int layer_id = 0; layer_id < config->num_hidden_layers; layer_id++) {
         ColiDeepSeekV4LayerWeights layer;
         if (coli_v4_layer_load(engine, &layer, config, index, layer_id,
-                               error, error_size)) return -1;
+                               error, error_size)) {
+            if (pool_experts)
+                coli_v4_expert_store_prefill_pool(experts, -1);
+            return -1;
+        }
+        /* A true prefill is layer-major: every prompt position crosses this
+         * layer before the next one begins.  Let it borrow otherwise idle
+         * partitions so its expert union remains resident across chunks.
+         * Speculative decode also calls target_batch, but passes 0 and keeps
+         * ordinary per-layer allocation, as does target_token. */
+        if (pool_experts)
+            coli_v4_expert_store_prefill_pool(experts, layer_id);
         int result = 0;
         /* Chunk width caps every batch-scaled buffer in the block AND bounds
          * the expert union. The batch kernels' contract is 128 (the CPU
@@ -11357,12 +11497,17 @@ static int target_batch(ColiV4Engine *engine, float **state_ptr, float **next_pt
                          layer_id, offset, chunk);
         }
         coli_v4_layer_free(engine, &layer);
-        if (result) return -1;
+        if (result) {
+            if (pool_experts)
+                coli_v4_expert_store_prefill_pool(experts, -1);
+            return -1;
+        }
         float *swap = state; state = next; next = swap;
         for (int item = 0; item < batch; item++)
             v4_mainh_tap(config, layer_id, state + (size_t)item * hd,
                          (int64_t)start + item);
     }
+    if (pool_experts) coli_v4_expert_store_prefill_pool(experts, -1);
     *state_ptr = state;
     *next_ptr = next;
     return 0;
@@ -12357,7 +12502,7 @@ int coli_v4_session_generate(ColiV4Session *session,
             }
         if (target_batch(engine, &state, &next, attention, index, config,
                          experts, session->prompt_ids + done_upto, done_upto,
-                         seg, NULL, NULL, error, error_size)) {
+                         seg, 1, NULL, NULL, error, error_size)) {
             /* A real failure leaves the segment half-applied across layers;
              * only then is the record discarded. Cancels never land here —
              * segments are atomic and the poll runs between them. */
@@ -12502,7 +12647,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         }
                     if (target_batch(engine, &state, &next, attention, index,
                                      config, experts, inputs, old_last + 1,
-                                     batch, NULL, NULL, error, error_size)) {
+                                     batch, 0, NULL, NULL, error, error_size)) {
                         (void)spec_attention_restore(
                             attention, snapshots, config->num_hidden_layers);
                         spec_attention_free(snapshots,
@@ -12606,7 +12751,7 @@ int coli_v4_session_generate(ColiV4Session *session,
                         if (retained > 0 && target_batch(
                                 engine, &state, &next, attention, index,
                                 config, experts, inputs, old_last + 1,
-                                retained, NULL, NULL, error, error_size)) {
+                                retained, 0, NULL, NULL, error, error_size)) {
                             spec_attention_free(
                                 snapshots, config->num_hidden_layers);
                             kv_prefix_taint(&session->fed);
@@ -12719,7 +12864,8 @@ static int v4_oracle_teacher_forcing(
             return -1;
         }
     if (target_batch(NULL, &state, &next, attention, index, config, experts,
-                     full_ids, 0, full_count, NULL, NULL, error, error_size)) {
+                     full_ids, 0, full_count, 1, NULL, NULL,
+                     error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
     }
@@ -12765,7 +12911,7 @@ static int v4_oracle_greedy_from_prompt(
             return -1;
         }
     if (target_batch(NULL, &state, &next, attention, index, config, experts,
-                     prompt_ids, 0, prompt_count, NULL, NULL,
+                     prompt_ids, 0, prompt_count, 1, NULL, NULL,
                      error, error_size)) {
         free(state); free(next); free(hidden);
         return -1;
@@ -13592,7 +13738,7 @@ int main(int argc, char **argv) {
             if (load_embedding(tf_state + (size_t)item * hd_tf, index, &config,
                                full_ids[item])) goto cleanup;
         if (target_batch(engine, &tf_state, &tf_next, attention, index, &config,
-                         experts, full_ids, 0, full_count, NULL, NULL,
+                         experts, full_ids, 0, full_count, 1, NULL, NULL,
                          error, sizeof(error))) {
             fprintf(stderr, "%s\n", error); goto cleanup;
         }
