@@ -353,7 +353,16 @@ def run_persistent_engine(engine, snap, prompt, max_new, warmup_runs, warm_runs,
         tiers = dict(persistent.tiers) if getattr(persistent, "tiers", None) else None
         hwinfo = dict(persistent.hwinfo) if getattr(persistent, "hwinfo", None) else None
     finally:
-        persistent.close()
+        # All measurements above are already collected; a teardown that fails
+        # must not discard them. At --memory-gb 126 the engine can outlast the
+        # close() grace period while it frees a 111 GB resident cache, and a
+        # raised exception here would swallow the return and lose a complete run
+        # (observed on the EPYC 7282 datapoint, #1154).
+        try:
+            persistent.close()
+        except Exception as exc:  # noqa: BLE001 - teardown is best-effort
+            print(f"[datapoint] warning: engine teardown did not complete "
+                  f"cleanly, results are still valid: {exc}", file=sys.stderr)
 
     return {
         "mode": "persistent",
