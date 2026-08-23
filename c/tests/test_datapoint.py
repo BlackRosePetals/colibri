@@ -274,5 +274,43 @@ class PersistentDatapointTest(unittest.TestCase):
         self.assertTrue(all(family.has_gateway_adapter for family in FAMILIES))
 
 
+class EvictCacheSpaceTest(unittest.TestCase):
+    """The portable fallback must not fill the temp volume.
+
+    It is the only eviction route on Windows, and since #1042 it sizes the write
+    from the machine's real RAM rather than a hardcoded 8 GB. A 128 GB box whose
+    temp dir is on a drive with 124 GB free would write until that volume hit
+    zero and only then raise OSError.
+    """
+
+    def _run(self, ram_gb, free_gb, tmp="/tmp"):
+        usage = SimpleNamespace(free=int(free_gb * GB))
+        with mock.patch.object(sys, "platform", "win32"), \
+             mock.patch.object(datapoint.tempfile, "gettempdir", return_value=tmp), \
+             mock.patch.object(datapoint.shutil, "disk_usage", return_value=usage), \
+             mock.patch.object(datapoint.tempfile, "NamedTemporaryFile") as ntf:
+            return datapoint.evict_cache(ram_gb), ntf
+
+    def test_refuses_when_the_temp_volume_is_too_small(self):
+        result, ntf = self._run(ram_gb=128, free_gb=124)
+        self.assertFalse(result)
+        ntf.assert_not_called()          # nothing written, not even partially
+
+    def test_writes_when_there_is_room(self):
+        result, ntf = self._run(ram_gb=8, free_gb=500)
+        self.assertTrue(ntf.called)
+        self.assertTrue(result)
+
+    def test_unreadable_temp_volume_does_not_block_the_write(self):
+        """A failed disk_usage must not become a refusal. The pre-existing
+        OSError handler around the write is still the backstop."""
+        with mock.patch.object(sys, "platform", "win32"), \
+             mock.patch.object(datapoint.shutil, "disk_usage",
+                               side_effect=OSError("no stat")), \
+             mock.patch.object(datapoint.tempfile, "NamedTemporaryFile") as ntf:
+            self.assertTrue(datapoint.evict_cache(1))
+            self.assertTrue(ntf.called)
+
+
 if __name__ == "__main__":
     unittest.main()

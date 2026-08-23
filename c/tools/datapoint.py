@@ -32,6 +32,7 @@ import argparse
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -171,6 +172,24 @@ def evict_cache(ram_gb, snap_dir=None):
 
     # Fallback: Write temp file larger than RAM
     size_mb = int(ram_gb) * 1024 + 1024
+    # Confirm the temp volume can hold it before writing a byte. This is the only
+    # eviction route on Windows (macOS has purge, Linux has fadvise), and since
+    # #1042 it writes the machine's real RAM rather than a hardcoded 8 GB, so the
+    # write is now as large as the box. tempfile.gettempdir() is usually the
+    # system drive while the model lives elsewhere, so on a 128 GB machine with
+    # 124 GB free on C: this fills the system volume to zero and only then raises.
+    tmp_dir = tempfile.gettempdir()
+    need = size_mb * (1 << 20)
+    try:
+        free = shutil.disk_usage(tmp_dir).free
+    except OSError:
+        free = None
+    if free is not None and free < need:
+        print(f"[datapoint] cache eviction skipped: need {need / (1 << 30):.0f} GB "
+              f"free in {tmp_dir} but only {free / (1 << 30):.0f} GB available. "
+              f"Point TMPDIR (TEMP on Windows) at a larger volume, or pass "
+              f"--no-evict and label the run warm.", file=sys.stderr)
+        return False
     print(f"[datapoint] evicting page cache by writing {size_mb / 1024:.0f} GB "
           f"to a temp file (no direct eviction on this platform; --no-evict skips)",
           file=sys.stderr)
