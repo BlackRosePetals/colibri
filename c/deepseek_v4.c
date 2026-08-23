@@ -5296,6 +5296,63 @@ static int v4_apply_expert_batch(
         batch_outputs, count, dimension, swiglu_limit);
 }
 
+static int v4_shared_batch_enabled(void) {
+    const char *setting = getenv("COLI_V4_SHARED_BATCH");
+    return !setting || atoi(setting) != 0;
+}
+
+/* Shared-expert prefill has the same weights for every position.  Running a
+ * matvec per item reloads those dense FP8 matrices up to 128 times; the native
+ * batch kernel keeps each matrix tile hot while preserving each item's scalar
+ * column-accumulation order. */
+static int v4_shared_expert_forward_batch_ref(
+    float *outputs, const ColiTensorView *gate_weight,
+    const ColiTensorView *down_weight, const ColiTensorView *up_weight,
+    const float *inputs, int batch, float swiglu_limit) {
+    if (!outputs || !gate_weight || !down_weight || !up_weight || !inputs ||
+        batch < 1 || batch > V4_EXPERT_BATCH_MAX || swiglu_limit < 0.0f ||
+        gate_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        down_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        up_weight->format != COLI_TENSOR_FP8_E4M3_BLOCK ||
+        gate_weight->rows != up_weight->rows ||
+        gate_weight->columns != up_weight->columns ||
+        down_weight->columns != gate_weight->rows ||
+        down_weight->rows != gate_weight->columns)
+        return -1;
+    size_t intermediate = (size_t)gate_weight->rows;
+    if ((size_t)batch > SIZE_MAX / intermediate) return -1;
+    size_t cells = (size_t)batch * intermediate;
+    if (cells > SIZE_MAX / (3 * sizeof(float))) return -1;
+    float *workspace = malloc(3 * cells * sizeof(*workspace));
+    if (!workspace) return -1;
+    float *gate = workspace;
+    float *up = gate + cells;
+    float *activated = up + cells;
+    int result = coli_fp8_matmul_batch_ref(
+        gate, gate_weight, inputs, batch);
+    if (!result)
+        result = coli_fp8_matmul_batch_ref(
+            up, up_weight, inputs, batch);
+    for (int item = 0; !result && item < batch; item++) {
+        float *item_gate = gate + (size_t)item * intermediate;
+        float *item_up = up + (size_t)item * intermediate;
+        float *item_activated = activated + (size_t)item * intermediate;
+        coli_bf16_round_array(item_gate, intermediate);
+        coli_bf16_round_array(item_up, intermediate);
+        result = coli_v4_swiglu(item_activated, item_gate, item_up,
+                                (int)intermediate, swiglu_limit);
+        if (!result) coli_bf16_round_array(item_activated, intermediate);
+    }
+    if (!result)
+        result = coli_fp8_matmul_batch_ref(
+            outputs, down_weight, activated, batch);
+    if (!result)
+        coli_bf16_round_array(
+            outputs, (size_t)batch * (size_t)down_weight->rows);
+    free(workspace);
+    return result ? -1 : 0;
+}
+
 static int v4_moe_batch_union(
     float *outputs, const ColiDeepSeekV4LayerWeights *weights,
     const ColiDeepSeekV4Config *config, ColiExpertStore *store,
@@ -5377,10 +5434,14 @@ static int v4_moe_batch_union(
          fp8_view(&w2, weights, "ffn.shared_experts.w2") ||
          fp8_view(&w3, weights, "ffn.shared_experts.w3")))
         result = -1;
-    for (int item = 0; !result && item < batch; item++)
-        result = coli_v4_shared_expert_forward_ref(
-            shared + (size_t)item * d, &w1, &w2, &w3,
-            inputs + (size_t)item * d, config->swiglu_limit);
+    if (!result && batch > 1 && v4_shared_batch_enabled())
+        result = v4_shared_expert_forward_batch_ref(
+            shared, &w1, &w2, &w3, inputs, batch, config->swiglu_limit);
+    else
+        for (int item = 0; !result && item < batch; item++)
+            result = coli_v4_shared_expert_forward_ref(
+                shared + (size_t)item * d, &w1, &w2, &w3,
+                inputs + (size_t)item * d, config->swiglu_limit);
     if (!result)
         memset(outputs, 0, (size_t)batch * d * sizeof(*outputs));
 
