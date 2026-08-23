@@ -1,4 +1,4 @@
-/* Benchmark: Measure baseline vs persistent scratch buffer allocation for DeepSeek V4 indexer. */
+/* Benchmark: Measure baseline vs persistent scratch buffer allocation and execution for DeepSeek V4 indexer. */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,43 +10,45 @@ typedef struct { float score; int index; } IndexScore;
 
 #define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
 
-// --- Baseline Implementation: Dynamic Malloc/Free per call ---
+// --- Baseline Implementation: Dynamic Malloc/Free per call + Execution ---
 double indexer_select_batch_baseline(int batch, int need, int heads, int dimension, int max_count, int cols) {
     size_t qn = (size_t)heads * dimension;
 
-    // 9 dynamic allocations
-    volatile float *queries = (volatile float *)malloc((size_t)batch * qn * sizeof(float));
-    volatile float *sq = (volatile float *)malloc((size_t)need * qn * sizeof(float));
-    volatile float *head_weights = (volatile float *)malloc((size_t)need * heads * sizeof(float));
-    volatile int *scounts = (volatile int *)malloc((size_t)need * sizeof(int));
-    volatile int *stoken = (volatile int *)malloc((size_t)need * sizeof(int));
-    volatile float *scores = (volatile float *)malloc((size_t)need * max_count * sizeof(float));
-    volatile IndexScore *ranked = (volatile IndexScore *)malloc((size_t)max_count * sizeof(IndexScore));
-    volatile uint8_t *scales = (volatile uint8_t *)malloc((size_t)dimension / 32);
-    volatile float *qdq = (volatile float *)malloc((size_t)dimension * sizeof(float));
+    // 12 dynamic heap allocations
+    float *queries = (float *)malloc((size_t)batch * qn * sizeof(float));
+    float *sq = (float *)malloc((size_t)need * qn * sizeof(float));
+    float *head_weights = (float *)malloc((size_t)need * heads * sizeof(float));
+    int *scounts = (int *)malloc((size_t)need * sizeof(int));
+    int *stoken = (int *)malloc((size_t)need * sizeof(int));
+    float *scores = (float *)malloc((size_t)need * max_count * sizeof(float));
+    IndexScore *ranked = (IndexScore *)malloc((size_t)max_count * sizeof(IndexScore));
+    uint8_t *scales = (uint8_t *)malloc((size_t)dimension / 32);
+    float *qdq = (float *)malloc((size_t)dimension * sizeof(float));
+    float *xq = (float *)malloc((size_t)need * cols * sizeof(float));
+    float *yq = (float *)malloc((size_t)need * qn * sizeof(float));
+    uint8_t *xs = (uint8_t *)malloc((size_t)need * (cols / 128));
 
-    // Optional GPU path allocations
-    volatile float *xq = (volatile float *)malloc((size_t)need * cols * sizeof(float));
-    volatile float *yq = (volatile float *)malloc((size_t)need * qn * sizeof(float));
-    volatile uint8_t *xs = (volatile uint8_t *)malloc((size_t)need * (cols / 128));
+    if (!queries || !sq || !scores || !xq) {
+        free(xs); free(yq); free(xq); free(qdq); free(scales); free(ranked);
+        free(scores); free(stoken); free(scounts); free(head_weights); free(sq); free(queries);
+        return 0.0;
+    }
 
-    // Write to memory to prevent compiler DCE
-    if (queries) queries[0] = 1.0f;
-    if (sq) sq[0] = 2.0f;
-    if (scores) scores[0] = 3.0f;
-    if (xq) xq[0] = 4.0f;
+    // Realistic vector execution simulation across aligned arrays
+    for (int i = 0; i < dimension; i++) qdq[i] = (float)i * 0.01f;
+    for (int i = 0; i < batch; i++) queries[i * qn] = qdq[i % dimension];
+    for (int i = 0; i < need; i++) sq[i * qn] = queries[0] * 0.5f;
 
-    double sum = (queries ? queries[0] : 0) + (sq ? sq[0] : 0) + (scores ? scores[0] : 0) + (xq ? xq[0] : 0);
+    double sum = (double)(queries[0] + sq[0] + qdq[0]);
 
     // 12 dynamic frees
-    free((void *)xs); free((void *)yq); free((void *)xq);
-    free((void *)qdq); free((void *)scales); free((void *)ranked); free((void *)scores); free((void *)stoken);
-    free((void *)scounts); free((void *)head_weights); free((void *)sq); free((void *)queries);
+    free(xs); free(yq); free(xq); free(qdq); free(scales); free(ranked);
+    free(scores); free(stoken); free(scounts); free(head_weights); free(sq); free(queries);
 
     return sum;
 }
 
-// --- Persistent Arena Scratch Buffer Implementation ---
+// --- Persistent Arena Scratch Buffer Implementation + Execution ---
 typedef struct {
     void *buf;
     size_t cap;
@@ -89,27 +91,27 @@ double indexer_select_batch_optimized(int batch, int need, int heads, int dimens
     char *scratch_ptr = (char *)g_scratch.buf;
     scratch_ptr = (char *)(((uintptr_t)scratch_ptr + 31) & ~(uintptr_t)31);
 
-    volatile float *queries = (volatile float *)scratch_ptr; scratch_ptr += sz_queries;
-    volatile float *sq = (volatile float *)scratch_ptr; scratch_ptr += sz_sq;
-    volatile float *head_weights = (volatile float *)scratch_ptr; scratch_ptr += sz_head_weights;
-    volatile int *scounts = (volatile int *)scratch_ptr; scratch_ptr += sz_scounts;
-    volatile int *stoken = (volatile int *)scratch_ptr; scratch_ptr += sz_stoken;
-    volatile float *scores = (volatile float *)scratch_ptr; scratch_ptr += sz_scores;
-    volatile IndexScore *ranked = (volatile IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
-    volatile uint8_t *scales = (volatile uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
-    volatile float *qdq = (volatile float *)scratch_ptr; scratch_ptr += sz_qdq;
-    volatile float *xq = (volatile float *)scratch_ptr; scratch_ptr += sz_xq;
-    volatile float *yq = (volatile float *)scratch_ptr; scratch_ptr += sz_yq;
-    volatile uint8_t *xs = (volatile uint8_t *)scratch_ptr;
+    float *queries = (float *)scratch_ptr; scratch_ptr += sz_queries;
+    float *sq = (float *)scratch_ptr; scratch_ptr += sz_sq;
+    float *head_weights = (float *)scratch_ptr; scratch_ptr += sz_head_weights;
+    int *scounts = (int *)scratch_ptr; scratch_ptr += sz_scounts;
+    int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
+    float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
+    IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
+    uint8_t *scales = (uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
+    float *qdq = (float *)scratch_ptr; scratch_ptr += sz_qdq;
+    float *xq = (float *)scratch_ptr; scratch_ptr += sz_xq;
+    float *yq = (float *)scratch_ptr; scratch_ptr += sz_yq;
+    uint8_t *xs = (uint8_t *)scratch_ptr;
 
-    // Write & read memory to prevent compiler DCE
-    queries[0] = 1.0f;
-    sq[0] = 2.0f;
-    scores[0] = 3.0f;
-    xq[0] = 4.0f;
+    (void)xs; (void)yq; (void)xq; (void)scales; (void)ranked; (void)stoken; (void)scounts; (void)head_weights; (void)scores;
 
-    (void)xs; (void)yq; (void)qdq; (void)scales; (void)ranked; (void)stoken; (void)scounts; (void)head_weights;
-    return (double)(queries[0] + sq[0] + scores[0] + xq[0]);
+    // Realistic vector execution simulation across 32-byte SIMD aligned arrays
+    for (int i = 0; i < dimension; i++) qdq[i] = (float)i * 0.01f;
+    for (int i = 0; i < batch; i++) queries[i * qn] = qdq[i % dimension];
+    for (int i = 0; i < need; i++) sq[i * qn] = queries[0] * 0.5f;
+
+    return (double)(queries[0] + sq[0] + qdq[0]);
 }
 
 int main(void) {
@@ -123,7 +125,7 @@ int main(void) {
     const int TRIALS = 10;
     const int REPEATS = 50000; // 50,000 calls per trial
 
-    printf("[OK] Indexer allocation micro-benchmark initialized.\n\n");
+    printf("[OK] Indexer allocation & runtime micro-benchmark initialized.\n\n");
     printf("--- Running 10-Trial Benchmark (%d indexer calls / trial) ---\n", REPEATS);
 
     double total_base_s = 0.0;
@@ -150,20 +152,24 @@ int main(void) {
         total_base_s += time_base;
         total_opt_s += time_opt;
 
-        double speedup = ((time_base - time_opt) / time_base) * 100.0;
-        printf("Trial %2d: Baseline = %.4f s | Optimized = %.4f s | Speedup = %.2fx (%.1f%% faster)\n",
-               t + 1, time_base, time_opt, time_base / time_opt, speedup);
+        double base_us_per_call = (time_base / REPEATS) * 1e6;
+        double opt_us_per_call = (time_opt / REPEATS) * 1e6;
+        double speedup_pct = ((time_base - time_opt) / time_base) * 100.0;
+
+        printf("Trial %2d: Baseline = %.4f s (%.2f us/call) | Optimized = %.4f s (%.2f us/call) | Latency Reduction = %.1f%%\n",
+               t + 1, time_base, base_us_per_call, time_opt, opt_us_per_call, speedup_pct);
     }
 
-    double avg_base = total_base_s / TRIALS;
-    double avg_opt = total_opt_s / TRIALS;
-    double avg_speedup = ((avg_base - avg_opt) / avg_base) * 100.0;
+    double avg_base_s = total_base_s / TRIALS;
+    double avg_opt_s = total_opt_s / TRIALS;
+    double avg_base_us = (avg_base_s / REPEATS) * 1e6;
+    double avg_opt_us = (avg_opt_s / REPEATS) * 1e6;
+    double avg_speedup_pct = ((avg_base_s - avg_opt_s) / avg_base_s) * 100.0;
 
     printf("\n=== 10-TRIAL AVERAGE SUMMARY ===\n");
-    printf("Average Baseline Time: %.4f s\n", avg_base);
-    printf("Average Optimized Time: %.4f s\n", avg_opt);
-    printf("Average Speedup:       %.2fx FASTER (%.1f%% latency reduction)\n",
-           avg_base / avg_opt, avg_speedup);
+    printf("Average Baseline Latency:  %.4f s (%.2f us [%.4f ms] per batch call)\n", avg_base_s, avg_base_us, avg_base_us / 1000.0);
+    printf("Average Optimized Latency: %.4f s (%.2f us [%.4f ms] per batch call)\n", avg_opt_s, avg_opt_us, avg_opt_us / 1000.0);
+    printf("Overall Overhead Reduction: %.1f%%\n", avg_speedup_pct);
 
     if (g_scratch.buf) free(g_scratch.buf);
     (void)dummy;
