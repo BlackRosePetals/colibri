@@ -128,6 +128,12 @@ def main():
                                    work / "off.stderr")
         on, err_on = run_session(args.binary, model, {"COLI_K3_CKPT": "4"},
                                  work / "on.stderr")
+        disk_dir = work / "photos"
+        disk_dir.mkdir()
+        disk, err_disk = run_session(
+            args.binary, model,
+            {"COLI_K3_CKPT": "4", "COLI_K3_CKPT_DIR": str(disk_dir)},
+            work / "disk.stderr")
 
         # opt-in invariant: the default run must not know the feature exists
         if "[K3-CKPT]" in err_off:
@@ -178,6 +184,28 @@ def main():
                   f"{recompute} recomputed instead of {total}")
         if "[K3-CKPT] saved" not in err_on:
             raise AssertionError("no checkpoint was ever saved:\n" + err_on)
+
+        # disk mode: same photos parked in files. Identity and restore depth
+        # must match the RAM mode exactly, and the blobs must be ON DISK.
+        for index, (ram_result, disk_result) in enumerate(zip(on, disk), 1):
+            if ram_result != disk_result:
+                raise AssertionError(
+                    f"request {index}: disk mode diverged from RAM mode: "
+                    f"{disk_result!r} vs {ram_result!r}")
+        disk_restores = re.findall(
+            r"\[K3-CKPT\] restored pos=(\d+) of (\d+) prompt "
+            r"tokens \(recompute (\d+)\)", err_disk)
+        if [tuple(map(int, r)) for r in disk_restores] != restores:
+            raise AssertionError(
+                f"disk-mode restores {disk_restores} differ from RAM-mode "
+                f"{restores}:\n{err_disk}")
+        photos = sorted(f.name for f in disk_dir.glob("k3_ckpt_*.bin"))
+        if not photos:
+            raise AssertionError(
+                "disk mode restored correctly but wrote no photo files: "
+                "the blobs are not actually on disk")
+        print(f"ok disk mode: identical outputs and restores, "
+              f"{len(photos)} photo file(s) on disk")
         print("kimi-k3-ckpt: all checks passed")
         return 0
     finally:
