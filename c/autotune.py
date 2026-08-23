@@ -1,9 +1,10 @@
 """Measured, quality-preserving execution tuning for colibri.
 
 The tuner changes execution scheduling only.  It never sweeps quantization,
-expert selection, sampling, or model weights.  A calibration continuation is
-generated once and then teacher-forced for every candidate so every run sees
-the same token and routing inputs.
+expert selection, sampling, or model weights.  GLM uses its fixed-token replay
+protocol.  The sibling engines keep one serve process alive per candidate and
+rotate deterministic prompts, so their expert caches behave like a real chat
+instead of being reset between every sample.
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ LATENCY_RE = re.compile(r"latency p50\s+([0-9.]+)\s*ms.*?p99\s+([0-9.]+)\s*ms")
 # as TOPK, TOPP, DRAFT, quantization and CACHE_ROUTE are intentionally excluded.
 TUNABLE_KEYS = frozenset({
     "OMP_NUM_THREADS", "COLI_NUMA", "PIPE", "DIRECT",
-    "COLI_CUDA_PIPE", "COLI_CUDA_ASYNC",
+    "COLI_CUDA_PIPE", "COLI_CUDA_ASYNC", "V4_LOADER_LANES",
 })
 
 
@@ -153,9 +154,10 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
     steps = []
     cores = max(1, int(plan.get("cpu", {}).get("physical_cores", os.cpu_count() or 1)))
     current_threads = int(base_env.get("OMP_NUM_THREADS", cores))
-    for threads in dict.fromkeys((cores, max(1, cores // 2))):
-        if threads != current_threads:
-            steps.append((f"omp-{threads}", {"OMP_NUM_THREADS": str(threads)}))
+    if not base_env.get("COLI_NO_OMP_TUNE"):
+        for threads in dict.fromkeys((cores, max(1, cores // 2))):
+            if threads != current_threads:
+                steps.append((f"omp-{threads}", {"OMP_NUM_THREADS": str(threads)}))
     sockets = int(plan.get("cpu", {}).get("sockets", 1))
     if sockets > 1 and base_env.get("COLI_NUMA") != "1":
         steps.append(("numa-on", {"COLI_NUMA": "1"}))
@@ -173,6 +175,19 @@ def candidate_steps(plan: dict, base_env: dict, arch: str = "glm") -> list[tuple
         pipe = int(base_env.get("PIPE", "0"))
         if pipe != 1:
             steps.append(("io-pipe-on", {"PIPE": "1"}))
+    if (arch == "deepseek_v4"
+            and plan.get("tiers", {}).get("disk", {}).get("cold_expert_bytes", 0) > 0):
+        # The pool default (9) was measured on one CPU/NVMe pair.  GPU-tier
+        # systems often prefer 3 because a deeper reader pool contends with
+        # bank refill, while other SSDs keep scaling past 9.  Sweep a bounded
+        # set around both measured optima; lanes block in pread and therefore
+        # do not need one CPU apiece.
+        current_lanes = int(base_env.get("V4_LOADER_LANES", "9"))
+        lane_values = (3, 6, 9, 12)
+        for lanes in lane_values:
+            if lanes != current_lanes:
+                steps.append((f"v4-loader-{lanes}",
+                              {"V4_LOADER_LANES": str(lanes)}))
     return steps
 
 
@@ -196,6 +211,24 @@ def parse_replay(output: str) -> dict:
         "hit_pct": float(hit.group(1)) if hit else None,
         "p50_ms": float(latency.group(1)) if latency else None,
         "p99_ms": float(latency.group(2)) if latency else None,
+    }
+
+
+def _summarize_measurement(name: str, overlay: dict, samples: list[dict]) -> dict:
+    """Reduce one candidate's fixed request budget to comparable medians."""
+    return {
+        "name": name,
+        "env": dict(overlay),
+        "tok_s": statistics.median(sample["tok_s"] for sample in samples),
+        "hit_pct": statistics.median(
+            sample["hit_pct"] for sample in samples
+            if sample["hit_pct"] is not None
+        ) if any(sample["hit_pct"] is not None for sample in samples) else None,
+        "p99_ms": statistics.median(
+            sample["p99_ms"] for sample in samples
+            if sample["p99_ms"] is not None
+        ) if any(sample["p99_ms"] is not None for sample in samples) else None,
+        "samples": samples,
     }
 
 
@@ -234,7 +267,8 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
              prompt: str, arch: str = "glm",
              tokens: int = 16, repeats: int = 2, timeout: int = 900,
              min_gain: float = 0.03, profile_dir: str | None = None,
-             progress=None, family=None, engine_cls=None) -> tuple[dict, Path]:
+             progress=None, family=None, engine_cls=None,
+             prompts=None) -> tuple[dict, Path]:
     """Coordinate-descent tuning with a reverse-order confirmation gate."""
     progress = progress or (lambda _message: None)
     if cap is None:
@@ -266,6 +300,10 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
     else:
         replay = None
         context = contextlib.nullcontext()
+    serving_prompts = tuple(prompts or (prompt,))
+    if not serving_prompts or any(not isinstance(item, str) or not item
+                                  for item in serving_prompts):
+        raise ValueError("tuning prompts must be non-empty strings")
     with context as directory:
         if arch == "glm":
             ref = Path(directory) / "replay.json"
@@ -284,51 +322,59 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
         else:
             if engine_cls is None:
                 from openai_server import Engine as engine_cls
-            expected = []      # bytes of the session's first run: the contract
+            # One expected byte stream per prompt. Different prompts naturally
+            # produce different text; the same prompt changing across
+            # candidates is the quality violation.
+            expected = {}
 
-            def run_once(name, overlay):
+            def measure(name, overlay):
                 env = dict(base_env)
                 env.update(overlay)
                 env["COLI_TEMP"] = "0"
                 served = engine_cls(engine, model, cap, tokens, env, 1, family)
-                pieces = []
+                samples = []
                 try:
-                    result = served.generate(prompt, tokens, 0.0, 1.0,
-                                             pieces.append)
+                    # Keep this engine alive for the whole candidate. `repeats`
+                    # is still the request budget, but requests now rotate
+                    # instead of repeatedly teaching the cache one prompt.
+                    for repeat in range(repeats):
+                        active_prompt = serving_prompts[repeat % len(serving_prompts)]
+                        progress(f"{name} ({repeat + 1}/{repeats}, prompt "
+                                 f"{repeat % len(serving_prompts) + 1}/"
+                                 f"{len(serving_prompts)})")
+                        pieces = []
+                        result = served.generate(active_prompt, tokens, 0.0, 1.0,
+                                                 pieces.append)
+                        text = "".join(pieces)
+                        contract = expected.get(active_prompt)
+                        if contract is None:
+                            expected[active_prompt] = text
+                        elif text != contract:
+                            raise OutputDrift(
+                                f"{name} changed the generated tokens for prompt "
+                                f"{repeat % len(serving_prompts) + 1}; a scheduling "
+                                f"knob must never do that")
+                        tok_s = float(result.get("tokens_per_second") or 0.0)
+                        if tok_s <= 0:
+                            raise RuntimeError(
+                                f"{name}: engine reported no decode speed")
+                        samples.append({
+                            "tok_s": tok_s,
+                            "hit_pct": result.get("cache_hit_percent"),
+                            "p50_ms": None,
+                            "p99_ms": None,
+                        })
                 finally:
                     served.close()
-                text = "".join(pieces)
-                if not expected:
-                    expected.append(text)
-                elif text != expected[0]:
-                    raise OutputDrift(
-                        f"{name} changed the generated tokens; a scheduling "
-                        f"knob must never do that")
-                tok_s = float(result.get("tokens_per_second") or 0.0)
-                if tok_s <= 0:
-                    raise RuntimeError(
-                        f"{name}: engine reported no decode speed")
-                return {"tok_s": tok_s,
-                        "hit_pct": result.get("cache_hit_percent"),
-                        "p50_ms": None, "p99_ms": None}
+                return _summarize_measurement(name, overlay, samples)
 
-        def measure(name, overlay):
-            samples = []
-            for repeat in range(repeats):
-                progress(f"{name} ({repeat + 1}/{repeats})")
-                samples.append(run_once(name, overlay))
-            return {
-                "name": name,
-                "env": dict(overlay),
-                "tok_s": statistics.median(sample["tok_s"] for sample in samples),
-                "hit_pct": statistics.median(
-                    sample["hit_pct"] for sample in samples if sample["hit_pct"] is not None
-                ) if any(sample["hit_pct"] is not None for sample in samples) else None,
-                "p99_ms": statistics.median(
-                    sample["p99_ms"] for sample in samples if sample["p99_ms"] is not None
-                ) if any(sample["p99_ms"] is not None for sample in samples) else None,
-                "samples": samples,
-            }
+        if arch == "glm":
+            def measure(name, overlay):
+                samples = []
+                for repeat in range(repeats):
+                    progress(f"{name} ({repeat + 1}/{repeats})")
+                    samples.append(run_once(name, overlay))
+                return _summarize_measurement(name, overlay, samples)
 
         baseline = measure("baseline", {})
         winner = baseline
