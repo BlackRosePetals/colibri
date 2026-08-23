@@ -853,6 +853,10 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view);
 /* DSV4_HYBRID=1 gate plus its cross-unit counters/EMAs: defined in the block
  * unit, read by the serve unit's per-turn stderr line. */
 int coli_v4_hybrid_enabled(void);
+/* async attach (enqueue only; drain closes the pipeline before compute) */
+int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
+                                    ColiExpertView *view);
+int coli_v4_gpu_expert_drain(ColiExpertStore *store);
 extern double g_v4_hyb_fill_bw, g_v4_hyb_host_bw;
 extern unsigned long long g_v4_hyb_gpu_n, g_v4_hyb_cpu_n;
 extern unsigned long long g_v4_hyb_upload_n, g_v4_hyb_skip_n;

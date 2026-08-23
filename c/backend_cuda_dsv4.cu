@@ -10,6 +10,9 @@
 #include <cstring>
 #include <climits>
 #include <vector>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -1918,8 +1921,35 @@ static bool host_pinned(const void*p,size_t len){
     g_pin_bytes+=size;g_pin_regions.push_back({base,size});
     return true;
 #else
-    (void)a;return false;
+    /* Linux/WSL: no VirtualQuery, but none is needed — cudaHostRegister pins
+     * whole pages, so register the requested range rounded out to page
+     * boundaries. The slot slabs are stable for the process lifetime (one
+     * posix_memalign per slot, freed only at store destroy), exactly like the
+     * Windows branch assumes. Overlapping ranges collapse into the
+     * already-registered success case; any failure (WSL builds without
+     * pinning support included) lands in g_pin_failed and every later upload
+     * from that slab takes the pageable path, same as before this branch
+     * existed. */
+    long page=sysconf(_SC_PAGESIZE);if(page<=0)page=4096;
+    uintptr_t base=a&~((uintptr_t)page-1);
+    size_t size=((a+len+page-1)&~((uintptr_t)page-1))-base;
+    static const size_t cap=(size_t)20<<30;
+    if(g_pin_bytes+size>cap){g_pin_failed.push_back({base,size});return false;}
+    cudaError_t err=cudaHostRegister((void*)base,size,cudaHostRegisterPortable);
+    if(err==cudaErrorHostMemoryAlreadyRegistered){cudaGetLastError();g_pin_regions.push_back({base,size});return true;}
+    if(err!=cudaSuccess){cudaGetLastError();g_pin_failed.push_back({base,size});return false;}
+    g_pin_bytes+=size;g_pin_regions.push_back({base,size});
+    return true;
 #endif
+}
+
+/* Drain the device's expert stream: the hybrid decode split enqueues its
+ * fill-set uploads asynchronously, computes the CPU subset while the DMA is
+ * in flight, and closes the pipeline here before the GPU group runs. */
+extern "C" int dsv4_cuda_stream_drain(int device){
+    Dev*c=ctx(device);if(!c)return 0;
+    if(!ok(cudaSetDevice(device),"select drain device"))return 0;
+    return ok(cudaStreamSynchronize(c->stream),"hybrid drain")?1:0;
 }
 
 extern "C" int dsv4_cuda_expert_bank_upload(Dsv4CudaExpertSet*set,int e,

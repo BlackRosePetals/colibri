@@ -5044,6 +5044,9 @@ static int moe_token_pipeline(float *output,
     }
 #ifdef COLI_V4_GPU_TIER
     int hybrid_gpu_count = 0;
+    int hybrid_pending_drain = 0;   /* async DMA enqueued, not yet drained */
+    int hybrid_uploads = 0;
+    struct timespec hybrid_fill_t0 = {0, 0};
     if (!result && coli_v4_hybrid_enabled() && store->gpu && !gpu_compute) {
         /* q* pass: the peeks above established which of the token's experts
          * are already resident. Upload only fill = q*(m) of the m misses;
@@ -5062,19 +5065,29 @@ static int moe_token_pipeline(float *output,
                 miss_n, g_v4_hyb_fill_bw, g_v4_hyb_host_bw);
             if (g_v4_hyb_host_bw <= 0.0 && fill >= miss_n && miss_n > 1)
                 fill = miss_n - 1;
+            /* Fill uploads are ENQUEUED, not drained: the CPU subset below
+             * computes while the DMA is in flight — the very overlap the q*
+             * balance assumes. The fill branch is timed as a whole at the
+             * drain point; per-upload wall clocks here would only measure
+             * enqueue latency. */
+            /* Async needs a drainable stream. An older Windows DLL exports
+             * the refill but not the drain: probe once (a drain on an empty
+             * stream is a no-op) and stay fully synchronous there, so
+             * nothing is ever enqueued that could not be waited on. */
+            static int hybrid_async_ok = -1;
+            if (hybrid_async_ok < 0)
+                hybrid_async_ok = coli_v4_gpu_expert_drain(store) == 0;
+            clock_gettime(CLOCK_MONOTONIC, &hybrid_fill_t0);
             for (int i = 0; i < fill; i++) {
                 int v = missing[i];
-                struct timespec f0, f1;
-                clock_gettime(CLOCK_MONOTONIC, &f0);
-                if (coli_v4_gpu_expert_attach(store, &views[v]) == 0 &&
+                int attached = hybrid_async_ok
+                    ? coli_v4_gpu_expert_attach_async(store, &views[v])
+                    : coli_v4_gpu_expert_attach(store, &views[v]);
+                if (attached == 0 &&
                     views[v].gate.gpu && views[v].up.gpu &&
                     views[v].down.gpu) {
-                    clock_gettime(CLOCK_MONOTONIC, &f1);
-                    double dt = (f1.tv_sec - f0.tv_sec) +
-                                (f1.tv_nsec - f0.tv_nsec) * 1e-9;
-                    if (dt > 0.0)
-                        g_v4_hyb_fill_bw = coli_v4_hybrid_ema(
-                            g_v4_hyb_fill_bw, 1.0 / dt);
+                    hybrid_uploads++;
+                    hybrid_pending_drain = hybrid_async_ok;
                     g_v4_hyb_upload_n++;
                 }
             }
@@ -5145,6 +5158,49 @@ static int moe_token_pipeline(float *output,
         float *gpu_weights = malloc((size_t)gpu_n * sizeof(*gpu_weights));
         float *gpu_sum = malloc((size_t)d * sizeof(*gpu_sum));
         int gpu_ok = gates && ups && downs && gpu_weights && gpu_sum;
+        /* CPU subset FIRST: it computes while the fill DMA enqueued by the
+         * q* pass is still in flight. The host bandwidth EMA is measured
+         * right here, under bus contention — which is exactly the number the
+         * balance needs. */
+        struct timespec h0, h1;
+        clock_gettime(CLOCK_MONOTONIC, &h0);
+        for (int current = 0; !result && current < selected; current++) {
+            int on_gpu = views[current].gate.gpu && views[current].up.gpu &&
+                         views[current].down.gpu;
+            if (on_gpu && gpu_ok) continue;   /* covered by the group below */
+            result = coli_v4_expert_forward_ref(
+                expert_output, &views[current], input,
+                expert_weights[current], config->swiglu_limit);
+            if (!result)
+                for (int i = 0; i < d; i++) output[i] += expert_output[i];
+        }
+        if (!result && cpu_n > 0) {
+            clock_gettime(CLOCK_MONOTONIC, &h1);
+            double dt = (h1.tv_sec - h0.tv_sec) +
+                        (h1.tv_nsec - h0.tv_nsec) * 1e-9;
+            if (dt > 0.0)
+                g_v4_hyb_host_bw = coli_v4_hybrid_ema(
+                    g_v4_hyb_host_bw, (double)cpu_n / dt);
+        }
+        /* Close the fill pipeline. The whole window (enqueue -> drained) is
+         * the fill branch's wall time; a sample is taken only when the drain
+         * actually waited, otherwise the transfers finished under the CPU
+         * work and the window would say nothing about the bus. */
+        if (hybrid_pending_drain) {
+            struct timespec d0, d1;
+            clock_gettime(CLOCK_MONOTONIC, &d0);
+            coli_v4_gpu_expert_drain(store);
+            clock_gettime(CLOCK_MONOTONIC, &d1);
+            hybrid_pending_drain = 0;
+            double waited = (d1.tv_sec - d0.tv_sec) +
+                            (d1.tv_nsec - d0.tv_nsec) * 1e-9;
+            double window = (d1.tv_sec - hybrid_fill_t0.tv_sec) +
+                            (d1.tv_nsec - hybrid_fill_t0.tv_nsec) * 1e-9;
+            if (hybrid_uploads > 0 && window > 0.0 &&
+                waited > window * 0.05)
+                g_v4_hyb_fill_bw = coli_v4_hybrid_ema(
+                    g_v4_hyb_fill_bw, (double)hybrid_uploads / window);
+        }
         if (gpu_ok) {
             int k = 0;
             for (int i = 0; i < selected; i++)
@@ -5163,26 +5219,21 @@ static int moe_token_pipeline(float *output,
             if (!dsv4_cuda_expert_group(gates, ups, downs, gpu_weights,
                 gpu_n, config->swiglu_limit, gpu_sum, input)) gpu_ok = 0;
         }
-        struct timespec h0, h1;
-        clock_gettime(CLOCK_MONOTONIC, &h0);
-        for (int current = 0; !result && current < selected; current++) {
-            int on_gpu = views[current].gate.gpu && views[current].up.gpu &&
-                         views[current].down.gpu;
-            if (on_gpu && gpu_ok) continue;   /* covered by the group above */
-            result = coli_v4_expert_forward_ref(
-                expert_output, &views[current], input,
-                expert_weights[current], config->swiglu_limit);
-            if (!result)
-                for (int i = 0; i < d; i++) output[i] += expert_output[i];
-        }
-        if (!result && gpu_ok && cpu_n > 0) {
-            clock_gettime(CLOCK_MONOTONIC, &h1);
-            double dt = (h1.tv_sec - h0.tv_sec) +
-                        (h1.tv_nsec - h0.tv_nsec) * 1e-9;
-            if (dt > 0.0)
-                g_v4_hyb_host_bw = coli_v4_hybrid_ema(
-                    g_v4_hyb_host_bw, (double)cpu_n / dt);
-        }
+        /* Backend failure on the group: the CPU loop above deliberately
+         * skipped these experts, so compute them here — degrade, don't drop
+         * (nor fail the token). */
+        if (!gpu_ok)
+            for (int current = 0; !result && current < selected; current++) {
+                if (!(views[current].gate.gpu && views[current].up.gpu &&
+                      views[current].down.gpu))
+                    continue;   /* already computed by the CPU loop above */
+                result = coli_v4_expert_forward_ref(
+                    expert_output, &views[current], input,
+                    expert_weights[current], config->swiglu_limit);
+                if (!result)
+                    for (int i = 0; i < d; i++)
+                        output[i] += expert_output[i];
+            }
         if (!result) {
             if (gpu_ok) {
                 for (int i = 0; i < d; i++)
@@ -5211,6 +5262,13 @@ static int moe_token_pipeline(float *output,
             for (int i = 0; i < d; i++)
                 output[i] = coli_bf16_round(output[i] + shared_output[i]);
     }
+#ifdef COLI_V4_GPU_TIER
+    /* If an error or the fused path skipped the hybrid branch while async
+     * fill DMA was still enqueued, drain before releasing the host slabs the
+     * copies read from. (The fused kernels sync internally, so this is only
+     * ever a wait on already-finished work — never a correctness gamble.) */
+    if (hybrid_pending_drain) coli_v4_gpu_expert_drain(store);
+#endif
     for (int current = 0; current < selected; current++)
         coli_expert_release(store, &views[current]);
     free(views);
@@ -9482,8 +9540,8 @@ static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create_capacity(
 static V4GpuExpertMirrorCache *v4_gpu_expert_mirrors_create(int device,
                                                             int suggested);
 static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache);
-static int v4_gpu_expert_attach_cached(V4GpuExpertMirrorCache *cache,
-                                       ColiExpertView *view);
+static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
+                                          ColiExpertView *view, int sync);
 
 int coli_v4_gpu_engine_open(ColiV4Engine *engine) {
     if (!engine) return -1;
@@ -10015,8 +10073,8 @@ static void v4_gpu_expert_mirrors_free(V4GpuExpertMirrorCache *cache) {
     free(cache);
 }
 
-static int v4_gpu_expert_attach_cached(V4GpuExpertMirrorCache *cache,
-                                       ColiExpertView *view) {
+static int v4_gpu_expert_attach_cached_ex(V4GpuExpertMirrorCache *cache,
+                                          ColiExpertView *view, int sync) {
     if (!cache || !view) return -1;
     if (view->gate.block_rows != 1 || view->up.block_rows != 1 ||
         view->down.block_rows != 1)
@@ -10093,7 +10151,7 @@ static int v4_gpu_expert_attach_cached(V4GpuExpertMirrorCache *cache,
                 dsv4_cuda_tensor_refill_fp4(
                     cache->entries[found].down, (const uint8_t *)view->down.data,
                     (const uint8_t *)view->down.scales, (int)view->down.rows,
-                    (int)view->down.columns, 1)) {
+                    (int)view->down.columns, sync)) {
                 cache->entries[found].layer = view->key.layer;
                 cache->entries[found].expert = view->key.expert;
                 cache->entries[found].clock = ++cache->clock;
@@ -10161,8 +10219,27 @@ static int v4_gpu_expert_attach_cached(V4GpuExpertMirrorCache *cache,
 
 int coli_v4_gpu_expert_attach(ColiExpertStore *store, ColiExpertView *view) {
     if (!store || !view) return -1;
-    return v4_gpu_expert_attach_cached(
-        (V4GpuExpertMirrorCache *)store->gpu, view);
+    return v4_gpu_expert_attach_cached_ex(
+        (V4GpuExpertMirrorCache *)store->gpu, view, 1);
+}
+
+/* Async twin: the upload is ENQUEUED on the device stream and may still be
+ * in flight when this returns. Safe because later work on the same stream
+ * (the expert group, the fused MoE) is ordered after it, and because the
+ * caller holds the expert leases until after compute; anyone releasing the
+ * host slabs earlier must drain first (coli_v4_gpu_expert_drain). */
+int coli_v4_gpu_expert_attach_async(ColiExpertStore *store,
+                                    ColiExpertView *view) {
+    if (!store || !view) return -1;
+    return v4_gpu_expert_attach_cached_ex(
+        (V4GpuExpertMirrorCache *)store->gpu, view, 0);
+}
+
+extern int dsv4_cuda_stream_drain(int device);
+int coli_v4_gpu_expert_drain(ColiExpertStore *store) {
+    if (!store || !store->gpu) return 0;
+    V4GpuExpertMirrorCache *cache = (V4GpuExpertMirrorCache *)store->gpu;
+    return dsv4_cuda_stream_drain(cache->device) ? 0 : -1;
 }
 
 /* Lookup-only twin of attach: report whether {layer, expert} is already
@@ -10193,7 +10270,7 @@ int coli_v4_gpu_expert_peek(ColiExpertStore *store, ColiExpertView *view) {
 
 int coli_v4_gpu_dspark_expert_attach(void *cache, ColiExpertView *view) {
     if (!view) return -1;
-    return v4_gpu_expert_attach_cached((V4GpuExpertMirrorCache *)cache, view);
+    return v4_gpu_expert_attach_cached_ex((V4GpuExpertMirrorCache *)cache, view, 1);
 }
 
 /* Lazy dspark mirror cache. Kept separate from the target model's expert
