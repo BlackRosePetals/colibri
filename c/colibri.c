@@ -9422,6 +9422,7 @@ static void pin_arena_bind(Model *m, PinRec *r, int *slot_of, int from, int to){
 #endif
 static double expert_avail(Model *m, double ram_gb, int ebits, int max_ctx);  /* def. sotto */
 static double g_mem_avail_boot;   /* def. sotto (#653: corretta qui su GPU integrate) */
+static double coli_clamp_ram_gb(double ram_gb, double mem_avail_gb, int overcommit);  /* def. sotto (#759) */
 /* Admission test unchanged; it just runs from route_trace.h's reader now, so PIN=<file>
  * accepts every history layout an engine can write instead of only sparse text (#700). */
 typedef struct { Model *m; PinRec *r; int *n, cap; unsigned char *seen; } PinCollect;
@@ -9465,6 +9466,12 @@ static void pin_load(Model *m, const char *statspath, double gb, int trusted){
     double pin_budget_b;
     if(gb<0){
         double ram_env=getenv("RAM_GB")?atof(getenv("RAM_GB")):0.0;
+        /* #759: same clamp as cap_for_ram; here the snapshot is still the
+         * uncorrected boot value (#653 runs later in this function), so on
+         * unified-memory hosts this only rejects budgets larger than physical
+         * RAM at boot -- never smaller than what the tier will leave behind. */
+        ram_env=coli_clamp_ram_gb(ram_env,g_mem_avail_boot,
+            getenv("COLI_RAM_OVERCOMMIT")?atoi(getenv("COLI_RAM_OVERCOMMIT")):0);
         int est_ctx=getenv("CTX")?atoi(getenv("CTX")):4096;   /* stesso default del call site */
         double avail=expert_avail(m,ram_env,m->ebits,est_ctx);
         pin_budget_b=avail>0?avail:0.0;
@@ -9757,6 +9764,21 @@ static double expert_cache_bytes_per_slot(Model *m, int ebits){
     return expert_cache_row_bytes(m,ebits);
 }
 
+
+
+/* #759: an explicit RAM_GB used to be honored literally even when it named more
+ * physical memory than the machine actually has. On unified-memory hosts the
+ * #653 correction shrinks the boot snapshot by the VRAM expert tier, so the gap
+ * between the requested budget and reality is easy to hit; CAP_RAISE then scaled
+ * the LRU against that phantom budget and the kernel OOM-killed mid-prefill.
+ * Pure function (no I/O, no globals) so tests can drive it directly, same
+ * contract style as coli_resolve_cap(). */
+static double coli_clamp_ram_gb(double ram_gb, double mem_avail_gb, int overcommit){
+    if(!overcommit && ram_gb>0 && mem_avail_gb>0 && ram_gb>mem_avail_gb)
+        return mem_avail_gb;
+    return ram_gb;
+}
+
 /* clampa la cache expert a un budget RAM (GB): cap t.c. residente + cache + slack <= budget.
  * ram_gb<=0 -> budget AUTO = 88% della RAM disponibile adesso (lascia respiro a OS+wrapper:
  * sforare = OOM-kill del kernel a meta' generazione, molto peggio di una cache piu' piccola). */
@@ -9773,6 +9795,19 @@ static void cap_for_ram(Model *m, double ram_gb, int ebits, int max_ctx){
     if(auto_b){ ram_gb = g_mem_avail_boot*0.88;   /* misurata PRIMA del load: il residente gia'
                                                    * allocato viene sottratto sotto, non due volte */
         if(ram_gb<4){ fprintf(stderr,"[RAM] MemAvailable is unreadable or too low; assuming 8 GB\n"); ram_gb=8; } }
+    else{
+        /* #759: an explicit budget larger than what is really available (the
+         * #653-corrected snapshot on unified memory) would only ever be caught
+         * by the OOM killer, after CAP_RAISE had scaled the LRU up against it. */
+        int oc = getenv("COLI_RAM_OVERCOMMIT")?atoi(getenv("COLI_RAM_OVERCOMMIT")):0;
+        double clamped = coli_clamp_ram_gb(ram_gb,g_mem_avail_boot,oc);
+        if(clamped<ram_gb){
+            fprintf(stderr,"[RAM_GB=%.1f] clamped to %.1f GB: that is the MemAvailable this run "
+                "can actually use (#653 snapshot; COLI_RAM_OVERCOMMIT=1 keeps the literal budget)\n",
+                ram_gb,clamped);
+            ram_gb=clamped;
+        }
+    }
     g_ram_budget_gb = ram_gb;                    /* #403: la RSS-guard usa il budget RISOLTO */
     /* slack ONESTO, non forfettario (l'OOM del 2026-07-04 veniva da qui):
      *  ws[64] slab del working-set (si materializzano TUTTI nel prefill batch-union),
