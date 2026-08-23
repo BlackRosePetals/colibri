@@ -10765,7 +10765,11 @@ int main(int argc, char **argv){
             g_tq_codec ? "rotated int4 + Lloyd codebook (4-bit)" : "PolarQuant recursive-polar");
       }
     }
-    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
+    /* ebits/dbits are the compute (dequant) width the idot kernels run at, not
+     * the stored weight format: a fmt=4 grouped-int4 container still computes at
+     * 8-bit here. Label it as compute so the banner is not misread as a storage
+     * claim (#1183). */
+    printf("== GLM C engine (glm_moe_dsa), cache=%d experts/layer | compute experts@%d-bit dense@%d-bit | idot: " IDOT_KERNEL " ==\n", cap, ebits, dbits);
     g_mem_avail_boot = mem_available_gb();
 #if !defined(_WIN32)
     if(getenv("CLUSTER_WORKERS") && *getenv("CLUSTER_WORKERS")){
