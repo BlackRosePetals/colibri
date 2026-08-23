@@ -148,6 +148,44 @@ class AutotuneUnitTest(unittest.TestCase):
 
 
 class AutotuneIntegrationTest(unittest.TestCase):
+    def test_unset_cap_resolves_from_the_plan_not_str_none(self):
+        # --cap has default=None; str(None) used to reach every engine as
+        # argv[1]="None" -> atoi -> 0: qwen36 aborted, GLM silently swept the
+        # platform default instead of the plan's cap (#1190).
+        with tempfile.TemporaryDirectory() as directory:
+            engine = Path(directory) / "cap-recorder.py"
+            caps = Path(directory) / "caps"
+            engine.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os,sys\n"
+                f"open({str(caps)!r},'a').write(sys.argv[1]+'\\n')\n"
+                "if os.environ.get('PROMPT'):\n"
+                " print('[PROMPT_TOKENS] 3: 10 11 12')\n"
+                " print('[TOKENS] 4 generated: 20 21 22 23')\n"
+                "else:\n"
+                " print('REPLAY decode: 4 tokens | 10.00 tok/s | expert hit 95.0%')\n"
+                " print('[PROF] decode forwards: 4 | latency p50 80.0 ms "
+                "| p90 90.0 ms | p99 100.0 ms | max 100.0 ms')\n",
+                encoding="utf-8",
+            )
+            engine.chmod(engine.stat().st_mode | stat.S_IXUSR)
+            p = plan(cores=1)
+            p["tiers"]["ram"] = {"cache_slots_per_layer": 84}
+            run_tune(
+                str(engine), None, dict(os.environ), p, directory, "prompt",
+                tokens=4, repeats=1, timeout=5, min_gain=0.03,
+                profile_dir=directory,
+            )
+            seen = set(caps.read_text().split())
+            self.assertEqual(seen, {"84"},
+                             f"engine saw caps {seen}, expected the plan's 84")
+
+    def test_unset_cap_with_capless_plan_refuses_loudly(self):
+        with self.assertRaises(ValueError):
+            run_tune("/nonexistent-engine", None, dict(os.environ),
+                     plan(cores=1), "/tmp", "prompt", tokens=4, repeats=1,
+                     timeout=5, min_gain=0.03)
+
     def test_fixed_replay_selects_and_persists_winner(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "fake-engine.py"

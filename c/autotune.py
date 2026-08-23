@@ -229,6 +229,18 @@ def run_tune(engine: str, cap: int, base_env: dict, plan: dict, model: str,
              progress=None) -> tuple[dict, Path]:
     """Coordinate-descent tuning with a reverse-order confirmation gate."""
     progress = progress or (lambda _message: None)
+    if cap is None:
+        # --cap has default=None ("auto"). str(None) used to reach the engine
+        # as argv[1]="None", which atoi() turns into 0: qwen36 refuses it and
+        # tuning dies with "calibration failed (1)", while GLM silently swept
+        # its platform default instead of the cap the plan just resolved
+        # (#1190). The plan is authoritative here, exactly like `coli chat`;
+        # a plan without a resolved cap is a loud error, never "None".
+        cap = plan.get("tiers", {}).get("ram", {}).get("cache_slots_per_layer")
+        if cap is None:
+            raise ValueError(
+                "--cap not given and the resource plan carries no resolved "
+                "cache_slots_per_layer")
     replay, _ = create_replay(engine, cap, base_env, prompt, tokens, timeout)
     with tempfile.TemporaryDirectory(prefix="coli-tune-") as directory:
         ref = Path(directory) / "replay.json"
