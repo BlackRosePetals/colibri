@@ -1025,7 +1025,8 @@ def cmd_tune(a):
     print("  only quality-preserving scheduling knobs are eligible\n")
     try:
         profile,path=run_tune(
-            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,tokens=a.tokens,
+            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,family=family,
+            tokens=a.tokens,
             repeats=a.repeats,timeout=a.timeout,min_gain=a.min_gain,
             profile_dir=a.profile_dir,
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
