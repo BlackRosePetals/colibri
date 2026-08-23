@@ -384,12 +384,17 @@ static int write_all(int fd, const void *data, size_t length) {
     return 0;
 }
 
-static int write_fixture_experts(const char *path, int expert_count) {
+static int write_fixture_layers(const char *path, int layer_count,
+                                int expert_count) {
     static const char *matrix_names[3] = {"w1", "w2", "w3"};
-    if (expert_count < 1 || (size_t)expert_count > SIZE_MAX / 1024) return -1;
-    size_t header_capacity = 256 + (size_t)expert_count * 1024;
+    if (layer_count < 1 || expert_count < 1 ||
+        (size_t)layer_count > SIZE_MAX / (size_t)expert_count)
+        return -1;
+    size_t cells = (size_t)layer_count * expert_count;
+    if (cells > (SIZE_MAX - 256) / 1024) return -1;
+    size_t header_capacity = 256 + cells * 1024;
     char *header = malloc(header_capacity);
-    size_t payload_size = 4 + (size_t)expert_count * 51;
+    size_t payload_size = 4 + cells * 51;
     unsigned char *payload = malloc(payload_size);
     if (!header || !payload) {
         free(payload);
@@ -400,34 +405,37 @@ static int write_fixture_experts(const char *path, int expert_count) {
         header, header_capacity,
         "{\"resident\":{\"dtype\":\"F32\",\"shape\":[1],"
         "\"data_offsets\":[3,7]}");
-    for (int expert = 0; expert < expert_count; expert++) {
-        size_t scale = expert ? 4 + (size_t)expert * 51 : 0;
-        size_t weight = scale + 3 + (expert ? 0 : 4);
-        for (int matrix = 0; matrix < 3; matrix++) {
-            int count = snprintf(
-                header + used, header_capacity - used,
-                ",\"layers.0.ffn.experts.%d.%s.scale\":{"
-                "\"dtype\":\"F8_E8M0\",\"shape\":[1,1],"
-                "\"data_offsets\":[%zu,%zu]}",
-                expert, matrix_names[matrix], scale + matrix,
-                scale + matrix + 1);
-            if (count < 0 || (size_t)count >= header_capacity - used) {
-                free(payload); free(header); return -1;
+    for (int layer = 0; layer < layer_count; layer++) {
+        for (int expert = 0; expert < expert_count; expert++) {
+            size_t cell = (size_t)layer * expert_count + expert;
+            size_t scale = cell ? 4 + cell * 51 : 0;
+            size_t weight = scale + 3 + (cell ? 0 : 4);
+            for (int matrix = 0; matrix < 3; matrix++) {
+                int count = snprintf(
+                    header + used, header_capacity - used,
+                    ",\"layers.%d.ffn.experts.%d.%s.scale\":{"
+                    "\"dtype\":\"F8_E8M0\",\"shape\":[1,1],"
+                    "\"data_offsets\":[%zu,%zu]}",
+                    layer, expert, matrix_names[matrix], scale + matrix,
+                    scale + matrix + 1);
+                if (count < 0 || (size_t)count >= header_capacity - used) {
+                    free(payload); free(header); return -1;
+                }
+                used += (size_t)count;
             }
-            used += (size_t)count;
-        }
-        for (int matrix = 0; matrix < 3; matrix++) {
-            int count = snprintf(
-                header + used, header_capacity - used,
-                ",\"layers.0.ffn.experts.%d.%s.weight\":{"
-                "\"dtype\":\"I8\",\"shape\":[1,16],"
-                "\"data_offsets\":[%zu,%zu]}",
-                expert, matrix_names[matrix], weight + matrix * 16,
-                weight + (matrix + 1) * 16);
-            if (count < 0 || (size_t)count >= header_capacity - used) {
-                free(payload); free(header); return -1;
+            for (int matrix = 0; matrix < 3; matrix++) {
+                int count = snprintf(
+                    header + used, header_capacity - used,
+                    ",\"layers.%d.ffn.experts.%d.%s.weight\":{"
+                    "\"dtype\":\"I8\",\"shape\":[1,16],"
+                    "\"data_offsets\":[%zu,%zu]}",
+                    layer, expert, matrix_names[matrix], weight + matrix * 16,
+                    weight + (matrix + 1) * 16);
+                if (count < 0 || (size_t)count >= header_capacity - used) {
+                    free(payload); free(header); return -1;
+                }
+                used += (size_t)count;
             }
-            used += (size_t)count;
         }
     }
     if (used + 1 >= header_capacity) {
@@ -451,6 +459,10 @@ static int write_fixture_experts(const char *path, int expert_count) {
     return result ? -1 : 0;
 }
 
+static int write_fixture_experts(const char *path, int expert_count) {
+    return write_fixture_layers(path, 1, expert_count);
+}
+
 static int write_fixture(const char *path) {
     return write_fixture_experts(path, 7);
 }
@@ -458,6 +470,24 @@ static int write_fixture(const char *path) {
 static int expect_fixture_expert(const ColiExpertView *view, int expert) {
     int scale = expert ? 4 + expert * 51 : 0;
     int weight = scale + 3 + (expert ? 0 : 4);
+    return view->gate.format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
+           view->gate.rows == 1 && view->gate.columns == 32 &&
+           view->gate.data_bytes == 16 && view->gate.scale_bytes == 1 &&
+           ((const unsigned char *)view->gate.scales)[0] ==
+               (unsigned char)scale &&
+           ((const unsigned char *)view->gate.data)[0] ==
+               (unsigned char)weight &&
+           ((const unsigned char *)view->down.data)[0] ==
+               (unsigned char)(weight + 16) &&
+           ((const unsigned char *)view->up.data)[0] ==
+               (unsigned char)(weight + 32);
+}
+
+static int expect_fixture_expert_at(const ColiExpertView *view, int layer,
+                                    int expert, int experts_per_layer) {
+    int cell = layer * experts_per_layer + expert;
+    int scale = cell ? 4 + cell * 51 : 0;
+    int weight = scale + 3 + (cell ? 0 : 4);
     return view->gate.format == COLI_TENSOR_FP4_NATIVE_BLOCK &&
            view->gate.rows == 1 && view->gate.columns == 32 &&
            view->gate.data_bytes == 16 && view->gate.scale_bytes == 1 &&
@@ -753,6 +783,184 @@ static int test_expert_store(void) {
     unlink(path);
     rmdir(directory);
     puts("DeepSeek-V4 ExpertStore tests: ok");
+    return 0;
+}
+
+static int lookup_fixture_at(ColiExpertStore *store, int layer, int expert,
+                             int experts_per_layer) {
+    ColiExpertView view;
+    if (coli_expert_lookup(store, (ColiExpertKey){layer, expert}, &view) ||
+        !expect_fixture_expert_at(&view, layer, expert, experts_per_layer)) {
+        fprintf(stderr, "pooled fixture mismatch: layer=%d expert=%d\n",
+                layer, expert);
+        return -1;
+    }
+    coli_expert_release(store, &view);
+    return 0;
+}
+
+/* Six slots per physical layer cannot retain an eight-expert union.  Pooling
+ * two layers provides twelve slots: the first sweep reads each layer-0 expert
+ * once, the second sweep must read zero bytes.  The test also proves that a
+ * borrowed slot remains indexed after pool close and that switching pool owner
+ * does not blindly flush an already-warm expert from another layer. */
+static int test_expert_store_prefill_pool(void) {
+    enum { LAYERS = 2, EXPERTS = 8, SLOTS_PER_LAYER = 6 };
+    char directory[] = "colibri-v4-pool-XXXXXX";
+    char path[256], error[256];
+    setenv("COLI_V4_AUTOPIN", "0", 1);
+    setenv("COLI_V4_SAVE_USAGE", "0", 1);
+    setenv("COLI_V4_ROWS16", "0", 1);
+    if (!mkdtemp(directory)) { perror("mkdtemp pool"); return 1; }
+    snprintf(path, sizeof(path), "%s/model.safetensors", directory);
+    if (write_fixture_layers(path, LAYERS, EXPERTS)) {
+        perror("write pool fixture");
+        rmdir(directory);
+        return 1;
+    }
+    ColiDeepSeekV4ExpertStoreOptions options = {
+        directory, LAYERS, EXPERTS,
+        (uint64_t)LAYERS * SLOTS_PER_LAYER * 51, -1, UINT64_MAX
+    };
+    /* Deterministic A/B.  With the ordinary six-slot partition, iterating an
+     * eight-expert union in the same order twice is a cyclic 0%%-hit workload:
+     * 16 reads.  The pooled twelve-slot capacity must turn the second sweep
+     * into eight hits: 8 reads, exactly half the bytes. */
+    ColiExpertStore *baseline = NULL;
+    if (coli_deepseek_v4_expert_store_open(
+            &options, &baseline, error, sizeof(error))) {
+        fprintf(stderr, "baseline pool store open failed: %s\n", error);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    int failed = 0;
+    for (int sweep = 0; sweep < 2 && !failed; sweep++)
+        for (int expert = 0; expert < EXPERTS; expert++)
+            if (lookup_fixture_at(baseline, 0, expert, EXPERTS)) {
+                failed = 1;
+                break;
+            }
+    ColiExpertStoreStats baseline_stats;
+    baseline->ops->stats(baseline, &baseline_stats);
+    baseline->ops->destroy(baseline);
+    if (baseline_stats.requests != 16 || baseline_stats.hits != 0 ||
+        baseline_stats.misses != 16 || baseline_stats.bytes_read != 16 * 51) {
+        fprintf(stderr,
+                "prefill baseline mismatch: requests=%llu hits=%llu "
+                "misses=%llu bytes=%llu\n",
+                (unsigned long long)baseline_stats.requests,
+                (unsigned long long)baseline_stats.hits,
+                (unsigned long long)baseline_stats.misses,
+                (unsigned long long)baseline_stats.bytes_read);
+        failed = 1;
+    }
+
+    ColiExpertStore *store = NULL;
+    if (coli_deepseek_v4_expert_store_open(
+            &options, &store, error, sizeof(error))) {
+        fprintf(stderr, "pool store open failed: %s\n", error);
+        unlink(path); rmdir(directory);
+        return 1;
+    }
+    /* A warm entry owned by the other layer must survive while unused slabs
+     * are still available to the pooled layer. */
+    failed |= lookup_fixture_at(store, 1, 7, EXPERTS);
+    coli_v4_expert_store_prefill_pool(store, 0);
+    for (int sweep = 0; sweep < 2 && !failed; sweep++)
+        for (int expert = 0; expert < EXPERTS; expert++)
+            if (lookup_fixture_at(store, 0, expert, EXPERTS)) {
+                failed = 1;
+                break;
+            }
+    ColiExpertStoreStats pooled_sweeps;
+    store->ops->stats(store, &pooled_sweeps);
+    /* Subtract the one layer-1 warmup read above. */
+    uint64_t pooled_requests = pooled_sweeps.requests - 1;
+    uint64_t pooled_hits = pooled_sweeps.hits;
+    uint64_t pooled_misses = pooled_sweeps.misses - 1;
+    uint64_t pooled_bytes = pooled_sweeps.bytes_read - 51;
+    if (pooled_requests != 16 || pooled_hits != 8 || pooled_misses != 8 ||
+        pooled_bytes != 8 * 51 ||
+        baseline_stats.bytes_read != pooled_bytes * 2) {
+        fprintf(stderr,
+                "prefill pooled A/B mismatch: requests=%llu hits=%llu "
+                "misses=%llu bytes=%llu baseline_bytes=%llu\n",
+                (unsigned long long)pooled_requests,
+                (unsigned long long)pooled_hits,
+                (unsigned long long)pooled_misses,
+                (unsigned long long)pooled_bytes,
+                (unsigned long long)baseline_stats.bytes_read);
+        failed = 1;
+    }
+    int borrowed = coli_v4_test_expert_slot_index(
+        store, (ColiExpertKey){0, EXPERTS - 1});
+    if (borrowed < SLOTS_PER_LAYER) {
+        fprintf(stderr, "prefill did not borrow a slot: index=%d\n", borrowed);
+        failed = 1;
+    }
+
+    coli_v4_expert_store_prefill_pool(store, 1);
+    failed |= lookup_fixture_at(store, 1, 7, EXPERTS);
+    coli_v4_expert_store_prefill_pool(store, -1);
+    failed |= lookup_fixture_at(store, 0, 7, EXPERTS);
+    failed |= lookup_fixture_at(store, 1, 7, EXPERTS);
+
+    ColiExpertStoreStats stats;
+    store->ops->stats(store, &stats);
+    if (stats.requests != 20 || stats.hits != 11 || stats.misses != 9 ||
+        stats.bytes_read != 9 * 51 || stats.resident_bytes != 9 * 51 ||
+        stats.capacity_bytes != LAYERS * SLOTS_PER_LAYER * 51) {
+        fprintf(stderr,
+                "prefill pool stats mismatch: requests=%llu hits=%llu "
+                "misses=%llu bytes=%llu resident=%llu capacity=%llu\n",
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses,
+                (unsigned long long)stats.bytes_read,
+                (unsigned long long)stats.resident_bytes,
+                (unsigned long long)stats.capacity_bytes);
+        failed = 1;
+    }
+
+    /* Fill the remaining slabs from layer 1, then force four global victims.
+     * Layer 0 started with eight pooled residents: its six-expert decode
+     * reserve must survive while layer 1 replaces its own older entries. */
+    coli_v4_expert_store_prefill_pool(store, 1);
+    for (int expert = 0; expert < 7; expert++)
+        failed |= lookup_fixture_at(store, 1, expert, EXPERTS);
+    coli_v4_expert_store_prefill_pool(store, -1);
+    int layer0_resident = 0;
+    for (int expert = 0; expert < EXPERTS; expert++)
+        if (coli_v4_test_expert_slot_index(
+                store, (ColiExpertKey){0, expert}) >= 0)
+            layer0_resident++;
+    if (layer0_resident != SLOTS_PER_LAYER) {
+        fprintf(stderr, "prefill pool lost decode reserve: layer0=%d\n",
+                layer0_resident);
+        failed = 1;
+    }
+    store->ops->stats(store, &stats);
+    if (stats.requests != 27 || stats.hits != 11 || stats.misses != 16 ||
+        stats.bytes_read != 16 * 51 ||
+        stats.resident_bytes != LAYERS * SLOTS_PER_LAYER * 51 ||
+        stats.capacity_bytes != LAYERS * SLOTS_PER_LAYER * 51) {
+        fprintf(stderr,
+                "prefill reserve stats mismatch: requests=%llu hits=%llu "
+                "misses=%llu bytes=%llu resident=%llu capacity=%llu\n",
+                (unsigned long long)stats.requests,
+                (unsigned long long)stats.hits,
+                (unsigned long long)stats.misses,
+                (unsigned long long)stats.bytes_read,
+                (unsigned long long)stats.resident_bytes,
+                (unsigned long long)stats.capacity_bytes);
+        failed = 1;
+    }
+    store->ops->destroy(store);
+    unlink(path);
+    rmdir(directory);
+    if (failed) return 1;
+    puts("DeepSeek-V4 ExpertStore prefill pool: ok "
+         "(A/B bytes 816->408, second sweep=0 reads, warm entries + decode reserve retained)");
     return 0;
 }
 
@@ -1300,6 +1508,10 @@ int main(int argc, char **argv) {
     }
     if (test_expert_store() != 0) {
         fprintf(stderr, "FAIL: test_expert_store\n");
+        return 1;
+    }
+    if (test_expert_store_prefill_pool() != 0) {
+        fprintf(stderr, "FAIL: test_expert_store_prefill_pool\n");
         return 1;
     }
     if (test_expert_store_miss_scaling() != 0) {

@@ -611,6 +611,11 @@ int coli_deepseek_v4_expert_store_open(
     char *error,
     size_t error_size);
 
+/* Batched CPU prefill only: `layer` borrows the complete expert-cache pool;
+ * a negative value restores ordinary per-layer miss allocation for decode.
+ * Alternative registered ExpertStore backends safely ignore the request. */
+void coli_v4_expert_store_prefill_pool(ColiExpertStore *store, int layer);
+
 #ifdef __cplusplus
 }
 #endif
