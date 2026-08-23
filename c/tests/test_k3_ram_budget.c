@@ -76,6 +76,11 @@ int main(void){
     CHECK(k3_ckpt_reserve_gb(&cm,0)==0.0);
     CHECK(one_ckpt>0.42&&one_ckpt<0.47);
     CHECK(four_ckpt>1.7&&four_ckpt<1.9);
+    /* disk-parked photos (COLI_K3_CKPT_DIR): one bounce buffer in RAM no
+     * matter how many slots -- the low-RAM machine must not be charged N. */
+    g_k3_ckpt_dir="/anywhere";
+    CHECK(k3_ckpt_reserve_gb(&cm,4)==one_ckpt);
+    g_k3_ckpt_dir=NULL;
     int with_ckpt=k3_cap_for_ram(242.0,RESIDENT,RESERVE+four_ckpt,
                                  SLOT_GB,NMOE,old,N_EXPERTS,&left);
     printf("        --ram 242 + 4 checkpoints -> cap %d/layer, peak %.1f GB\n",

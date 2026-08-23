@@ -71,6 +71,13 @@
  *                        token 0. Unset/0 (default) = feature off, engine
  *                        byte-identical to before. ~434 MB per photo on the
  *                        full model, which is why it is opt-in.
+ *   COLI_K3_CKPT_DIR=dir park the photos in files under dir instead of RAM
+ *                        (low-RAM machines: ~0.4s of sequential I/O per
+ *                        restore against minutes of avoided re-prefill).
+ *                        Alone it implies COLI_K3_CKPT=2; an explicit
+ *                        COLI_K3_CKPT (0 included) always wins. Photos never
+ *                        outlive the process: after a restart the MLA rows
+ *                        are gone, so no restore could be valid.
  *   COLI_TEMP=F          0 = greedy (default), else softmax temperature
  */
 #define _GNU_SOURCE
@@ -483,6 +490,10 @@ static double k3_ckpt_reserve_gb(const Model *m, int slots);
 static int g_k3_ckpt_slots=0;            /* COLI_K3_CKPT: recurrent-state checkpoint
                                           * slots. STRICTLY OPT-IN, 0 = off (default,
                                           * engine behaves exactly as before). */
+static const char *g_k3_ckpt_dir=NULL;   /* COLI_K3_CKPT_DIR: park the photos in
+                                          * files instead of RAM (low-RAM machines:
+                                          * ~0.4s of sequential I/O per restore
+                                          * against minutes of avoided re-prefill). */
 
 static int k3_mmap_backend_allowed(int mmap_enabled, int vk_enabled, int cuda_enabled){
     return !mmap_enabled || (!vk_enabled && !cuda_enabled);
@@ -792,7 +803,12 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
       const char *e=getenv("COLI_K3_CKPT");
       g_k3_ckpt_slots=e?atoi(e):0;
       if(g_k3_ckpt_slots<0) g_k3_ckpt_slots=0;
-      if(g_k3_ckpt_slots>K3_CKPT_MAX) g_k3_ckpt_slots=K3_CKPT_MAX; }
+      if(g_k3_ckpt_slots>K3_CKPT_MAX) g_k3_ckpt_slots=K3_CKPT_MAX;
+      g_k3_ckpt_dir=getenv("COLI_K3_CKPT_DIR");
+      if(g_k3_ckpt_dir&&!*g_k3_ckpt_dir) g_k3_ckpt_dir=NULL;
+      /* a directory alone is a clear enough request: default to 2 slots
+       * there, while an explicit COLI_K3_CKPT (0 included) always wins */
+      if(g_k3_ckpt_dir&&!e) g_k3_ckpt_slots=2; }
     g_k3_pipe  = getenv("K3_PIPE")?atoi(getenv("K3_PIPE")):1;
     g_k3_topp  = getenv("K3_TOPP")?(float)atof(getenv("K3_TOPP")):0.f;
     if(g_k3_topp>0.f)
@@ -1055,8 +1071,9 @@ static void model_init(Model *m, const char *snap, int n_layers_env){
     fprintf(stderr,"[K3] init done in %.1fs | %d layers | expert cache %d/layer (%.1f MB/slot) | RSS %.1f GB\n",
             now_s()-t0,c->n_layers,cap,m->e_slot/1e6,rss_gb());
     if(g_k3_ckpt_slots>0)
-        fprintf(stderr,"[K3-CKPT] enabled: %d recurrent-state slots (%.1f MB each)\n",
-                g_k3_ckpt_slots,k3_ckpt_blob_floats(m)*sizeof(float)/1048576.0);
+        fprintf(stderr,"[K3-CKPT] enabled: %d recurrent-state slots (%.1f MB each, %s)\n",
+                g_k3_ckpt_slots,k3_ckpt_blob_floats(m)*sizeof(float)/1048576.0,
+                g_k3_ckpt_dir?g_k3_ckpt_dir:"RAM");
     /* Phase 9: layer validation init */
     { const char *vl=getenv("K3_VALIDATE_LAYER");
       const char *vt=getenv("K3_VALIDATE_TOKEN");
@@ -2458,7 +2475,11 @@ static size_t k3_ckpt_blob_floats(const Model *m){
 
 static double k3_ckpt_reserve_gb(const Model *m, int slots){
     if(slots<1) return 0.0;
-    return (double)slots*(double)k3_ckpt_blob_floats(m)*sizeof(float)/1e9;
+    /* Disk-parked photos keep ONE bounce buffer in RAM regardless of slot
+     * count -- that is the whole point of COLI_K3_CKPT_DIR on a low-RAM
+     * machine. RAM slots each hold a full blob. */
+    int resident_blobs = g_k3_ckpt_dir ? 1 : slots;
+    return (double)resident_blobs*(double)k3_ckpt_blob_floats(m)*sizeof(float)/1e9;
 }
 
 static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
@@ -2476,23 +2497,82 @@ static void k3_ckpt_copy(float *blob, Model *m, int to_blob){
     }
 }
 
+/* Disk-parked photos: same photos, same validity rules, but the blob lives
+ * in a file so the RAM cost is one bounce buffer instead of N slots. Slot
+ * metadata (pos, fed ids, LRU stamp) stays in memory: photos never survive
+ * the process, because after a restart the per-position MLA rows are gone
+ * and no restore could ever be valid. Stale files from a previous run are
+ * simply overwritten. Writes are atomic (tmp + rename); any I/O failure
+ * drops the photo, never the request. */
+static float *g_k3_ckpt_iobuf=NULL;
+#define K3_CKPT_FILE_MAGIC ((((uint64_t)0x504B4333)<<32)|1u) /* "3CKP" v1 */
+
+static void k3_ckpt_file(char *out, size_t n, int slot){
+    snprintf(out,n,"%s/k3_ckpt_%d.bin",g_k3_ckpt_dir,slot);
+}
+
+static int k3_ckpt_iobuf_ready(const Model *m){
+    if(!g_k3_ckpt_iobuf)
+        g_k3_ckpt_iobuf=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
+    return g_k3_ckpt_iobuf!=NULL;
+}
+
+static int k3_ckpt_disk_write(Model *m, int slot, int pos){
+    char path[512], tmp[524];
+    k3_ckpt_file(path,sizeof path,slot);
+    snprintf(tmp,sizeof tmp,"%s.tmp",path);
+    size_t floats=k3_ckpt_blob_floats(m);
+    if(!k3_ckpt_iobuf_ready(m)) return 0;
+    k3_ckpt_copy(g_k3_ckpt_iobuf,m,1);
+    FILE *f=fopen(tmp,"wb"); if(!f) return 0;
+    uint64_t header[3]={K3_CKPT_FILE_MAGIC,(uint64_t)pos,(uint64_t)floats};
+    int ok=fwrite(header,sizeof header,1,f)==1 &&
+           fwrite(g_k3_ckpt_iobuf,sizeof(float),floats,f)==floats;
+    ok=!fclose(f)&&ok;
+    if(ok){ remove(path); ok=!rename(tmp,path); }
+    if(!ok) remove(tmp);
+    return ok;
+}
+
+static int k3_ckpt_disk_read(Model *m, int slot, int pos){
+    char path[512];
+    k3_ckpt_file(path,sizeof path,slot);
+    size_t floats=k3_ckpt_blob_floats(m);
+    if(!k3_ckpt_iobuf_ready(m)) return 0;
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    uint64_t header[3]={0,0,0};
+    int ok=fread(header,sizeof header,1,f)==1 &&
+           header[0]==K3_CKPT_FILE_MAGIC &&
+           header[1]==(uint64_t)pos && header[2]==(uint64_t)floats &&
+           fread(g_k3_ckpt_iobuf,sizeof(float),floats,f)==floats;
+    fclose(f);
+    if(ok) k3_ckpt_copy(g_k3_ckpt_iobuf,m,0);
+    return ok;
+}
+
+/* A slot holds a photo: in RAM mode the blob pointer says so, in disk mode
+ * the committed position does (the file is only trusted through it). */
+static int k3_ckpt_slot_full(const K3Ckpt *k){
+    return g_k3_ckpt_dir ? k->pos>0 : k->blob!=NULL;
+}
+
 static void k3_ckpt_save(Model *m){
     if(g_k3_ckpt_slots<1) return;
     int pos=m->kvp.len;
     if(pos<1||m->kvp.tainted||!m->kvp.fed) return;
     for(int s=0;s<g_k3_ckpt_slots;s++){       /* identical photo: refresh LRU */
         K3Ckpt *k=&g_k3_ckpt[s];
-        if(k->blob&&k->pos==pos&&
+        if(k3_ckpt_slot_full(k)&&k->pos==pos&&
            !memcmp(k->fed,m->kvp.fed,(size_t)pos*sizeof(int))){
             k->used=++g_k3_ckpt_clock; return; }
     }
     int victim=0;
     for(int s=0;s<g_k3_ckpt_slots;s++){
-        if(!g_k3_ckpt[s].blob){ victim=s; break; }
+        if(!k3_ckpt_slot_full(&g_k3_ckpt[s])){ victim=s; break; }
         if(g_k3_ckpt[s].used<g_k3_ckpt[victim].used) victim=s;
     }
     K3Ckpt *k=&g_k3_ckpt[victim];
-    if(!k->blob){
+    if(!g_k3_ckpt_dir&&!k->blob){
         k->blob=malloc(k3_ckpt_blob_floats(m)*sizeof(float));
         if(!k->blob) return;                  /* optimisation, never a failure */
     }
@@ -2500,7 +2580,9 @@ static void k3_ckpt_save(Model *m){
     if(!fed) return;                          /* slot keeps its old photo */
     k->fed=fed;
     memcpy(k->fed,m->kvp.fed,(size_t)pos*sizeof(int));
-    k3_ckpt_copy(k->blob,m,1);
+    if(g_k3_ckpt_dir){
+        if(!k3_ckpt_disk_write(m,victim,pos)){ k->pos=0; return; }
+    } else k3_ckpt_copy(k->blob,m,1);
     k->pos=pos; k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))
         fprintf(stderr,"[K3-CKPT] saved pos=%d slot=%d\n",pos,victim);
@@ -2516,13 +2598,15 @@ static int k3_ckpt_restore_best(Model *m, const int *ids, int np){
     int best=-1;
     for(int s=0;s<g_k3_ckpt_slots;s++){
         K3Ckpt *k=&g_k3_ckpt[s];
-        if(!k->blob||k->pos<1||k->pos>live) continue;
+        if(!k3_ckpt_slot_full(k)||k->pos<1||k->pos>live) continue;
         if(memcmp(k->fed,ids,(size_t)k->pos*sizeof(int))) continue;
         if(best<0||k->pos>g_k3_ckpt[best].pos) best=s;
     }
     if(best<0) return 0;
     K3Ckpt *k=&g_k3_ckpt[best];
-    k3_ckpt_copy(k->blob,m,0);
+    if(g_k3_ckpt_dir){
+        if(!k3_ckpt_disk_read(m,best,k->pos)){ k->pos=0; return 0; }
+    } else k3_ckpt_copy(k->blob,m,0);
     m->kvp.len=k->pos;        /* the record truncates with the state it describes */
     k->used=++g_k3_ckpt_clock;
     if(getenv("K3_PREFIX_LOG"))
