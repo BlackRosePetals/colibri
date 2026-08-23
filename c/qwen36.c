@@ -2280,6 +2280,10 @@ static void serve_one(Model *m, ServeReq *q){
         unsigned char chunk[256]; int cn=0; utf8_drain(sbuf,&sbn,tmp,tn,chunk,&cn);
         if(cn>0) serve_data(q->id,(char*)chunk,cn);
         gen++;
+        /* The next logits are not needed after the final requested token.
+         * serve_one() resets the recurrent/KV state for every request, so
+         * stepping here would only run a full discarded decode pass. */
+        if(s == q->max_tok - 1) break;
         lo = step(m, &tk, 1, np+s);
     }
     if(sbn>0) serve_data(q->id,(char*)sbuf,sbn);   /* flush trailing partial UTF-8 */
