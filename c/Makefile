@@ -1316,7 +1316,7 @@ tests/bench_dsa_select$(EXE): tests/bench_dsa_select.c colibri.c st.h uring.h js
 # bench_indexer_allocations: microbenchmark (DeepSeek V4 indexer malloc vs persistent arena scratch), NOT a test gate.
 # Build on demand: make tests/bench_indexer_allocations
 tests/bench_indexer_allocations$(EXE): tests/bench_indexer_allocations.c
-	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+	$(CC) -O3 $< -o $@
 
 # bench_idot: microbenchmark (single-acc vs independent-acc AVX-VNNI idot), NOT a test gate.
 # Build on demand on an AVX-VNNI CPU: make tests/bench_idot ARCH=native
