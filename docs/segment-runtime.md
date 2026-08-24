@@ -67,3 +67,38 @@ allocation. The format is private to an adapter and compatible only when the
 model identity, `state_schema`, numeric class and segment range match. A network
 service should put those fields in its own snapshot envelope before accepting a
 restore.
+
+## All-family conformance gate
+
+`tests/test_segment_conformance` keeps the ABI universal before model adapters
+are connected. It registers six deterministic, stateful fixtures matching all
+families in `family_registry.py`:
+
+| Family | Remote state represented by the fixture |
+| --- | --- |
+| GLM-5.2 | MLA latent cache, RoPE, DSA indexer and device cache |
+| Inkling | global/sliding KV and convolutional state |
+| Kimi K3 | MLA, KDA recurrent state, convolution windows and AttnRes |
+| OLMoE | conventional key/value cache |
+| Qwen3.6 | attention KV, DeltaNet recurrent state and convolution ring |
+| DeepSeek V4 | mHC, window/compressed attention, compressor and indexer |
+
+Every fixture must pass the same checks for half-open range identity, exact
+activation geometry, session isolation, contiguous execution, streamed
+snapshot/restore, exact continuation and transactional rejection of corrupt or
+range-incompatible snapshots. The test is dependency-free and runs on every
+platform in the ordinary C and sanitizer suites.
+
+The fixture schemas are prefixed with `fixture/`. They exercise the contract;
+they are not model math and are never registered by a shipping executable. A
+model is ready for distributed Segment execution only after its real adapter
+passes these lifecycle checks against the repository's generated tiny oracle
+and the existing token/numerical oracle for that engine. The public Lumabri
+release gate is all-or-nothing across all six families: a passing synthetic
+fixture alone must never be advertised as model support.
+
+`tests/segment_conformance_manifest.json` binds this matrix to the authoritative
+family registry. Adding a future Colibri family without adding its Segment
+state and oracle entry fails the Python suite. Five current families have a
+generated tiny checkpoint; OLMoE's existing oracle uses its real checkpoint and
+is labelled accordingly rather than being presented as a tiny-model result.
