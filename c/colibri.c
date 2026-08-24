@@ -1330,6 +1330,9 @@ static int g_disk_split=0; /* DISK_SPLIT=1: contatori che spezzano i DISK LOAD (
 /* KV-cache quantization tier flags — defined here (before kv_persist.h) so the .coli_kv
  * disk format can see them; the full rationale comments live at their original site below. */
 static int g_kv8=0;                             /* KV8=1: fp8 e4m3 latent KV + per-row scale */
+static int g_kv8_gs=0;                          /* KV8_GS=<n>: one scale per n latent elements
+                                                 * instead of per row (FlashMLA uses 128 on the
+                                                 * 512-dim latent). 0 = per-row (unchanged). */
 static int g_tq=0, g_tq_bits=4, g_tq_codec=1;   /* KV_TQ: codec 1=rotated int4 (default), 0=PolarQuant */
 #include "kv_persist.h"
 #include "telemetry.h"
@@ -4203,7 +4206,9 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             float *Ls=comp+(int64_t)s*cw, *Rs=Ls+c->kv_lora;
             rmsnorm(Ls, Ls, l->kv_a_ln, c->kv_lora, c->eps);      /* latente normato */
             rope_interleave(Rs, pos, c);                          /* k_rot roped */
-            ks->Lsc[layer][pos]=coli_kv8_quant_row(Ls, coli_kv_row8(ks->Lc8[layer],pos,c->kv_lora), c->kv_lora);
+            coli_kv8_quant_row_gs(Ls, coli_kv_row8(ks->Lc8[layer],pos,c->kv_lora),
+                                  ks->Lsc[layer]+(int64_t)pos*coli_kv8_nscale(c->kv_lora,g_kv8_gs),
+                                  c->kv_lora, g_kv8_gs);
             ks->Rsc[layer][pos]=coli_kv8_quant_row(Rs, coli_kv_row8(ks->Rc8[layer],pos,c->qk_rope), c->qk_rope);
         } else {
             float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
@@ -4515,13 +4520,27 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     for(int d=0;d<c->qk_rope;d++) a+=qr[d]*Rf[d];
                 } else if(g_kv8){
                     /* LUT-dequant inline nel dot; la scala per-riga esce dalla
-                     * somma: score = Lsc·Σ q·lut[b] + Rsc·Σ qr·lut[b] */
+                     * somma: score = Lsc·Σ q·lut[b] + Rsc·Σ qr·lut[b].
+                     * KV8_GS: per-group scales — partial dot per group, each
+                     * scaled before the sum (same math, tighter grid). */
                     const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
                     const uint8_t *kr=coli_kv_row8(ks->Rc8[layer],t,c->qk_rope);
-                    float al=0, ar=0;
-                    for(int i=0;i<kvl;i++) al+=qabs[i]*coli_fp8_lut[Lt[i]];
+                    int nsl=coli_kv8_nscale(kvl,g_kv8_gs);
+                    const float *Ls_t=ks->Lsc[layer]+(int64_t)t*nsl;
+                    float ar=0; a=0;
+                    if(g_kv8_gs){
+                        for(int g=0,k2=0;g<kvl;g+=g_kv8_gs,k2++){
+                            int m=kvl-g<g_kv8_gs?kvl-g:g_kv8_gs; float al=0;
+                            for(int i=0;i<m;i++) al+=qabs[g+i]*coli_fp8_lut[Lt[g+i]];
+                            a+=al*Ls_t[k2];
+                        }
+                    } else {
+                        float al=0;
+                        for(int i=0;i<kvl;i++) al+=qabs[i]*coli_fp8_lut[Lt[i]];
+                        a=al*Ls_t[0];
+                    }
                     for(int d=0;d<c->qk_rope;d++) ar+=qr[d]*coli_fp8_lut[kr[d]];
-                    a=al*ks->Lsc[layer][t]+ar*ks->Rsc[layer][t];
+                    a+=ar*ks->Rsc[layer][t];
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 const float *kr=coli_kv_row(ks->Rc[layer],t,c->qk_rope);
@@ -4565,8 +4584,18 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
                     for(int i=0;i<kvl;i++) clat[i]+=a*Lf[i];
                 } else if(g_kv8){
                     const uint8_t *Lt=coli_kv_row8(ks->Lc8[layer],t,kvl);
-                    float a=sc[jj]*ks->Lsc[layer][t];       /* la scala si fonde nel peso */
-                    for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
+                    int nsl=coli_kv8_nscale(kvl,g_kv8_gs);
+                    const float *Ls_t=ks->Lsc[layer]+(int64_t)t*nsl;
+                    if(g_kv8_gs){
+                        for(int g=0,k2=0;g<kvl;g+=g_kv8_gs,k2++){
+                            int m=kvl-g<g_kv8_gs?kvl-g:g_kv8_gs;
+                            float a=sc[jj]*Ls_t[k2];
+                            for(int i=0;i<m;i++) clat[g+i]+=a*coli_fp8_lut[Lt[g+i]];
+                        }
+                    } else {
+                        float a=sc[jj]*Ls_t[0];             /* la scala si fonde nel peso */
+                        for(int i=0;i<kvl;i++) clat[i]+=a*coli_fp8_lut[Lt[i]];
+                    }
                 } else {
                 const float *Lt=coli_kv_row(ks->Lc[layer],t,kvl);
                 /* MLA-absorb value mix: clat += sc[jj] * Lt (AXPY over kvl).
@@ -4750,9 +4779,11 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
             /* staging f32 del latente dequantizzato: kv_b vuole righe float. Il buffer
              * [Tk-stL,kvl] e' rumore rispetto a kvb_all [Tk,H*(nope+vh)] gia' allocato. */
             float *Lf=falloc((int64_t)(Tk-stL)*c->kv_lora);
-            for(int t=stL;t<Tk;t++)
-                coli_kv8_dequant_row(coli_kv_row8(m->Lc8[layer],t,c->kv_lora), m->Lsc[layer][t],
-                                     Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora);
+            { int nsl=coli_kv8_nscale(c->kv_lora,g_kv8_gs);
+              for(int t=stL;t<Tk;t++)
+                coli_kv8_dequant_row_gs(coli_kv_row8(m->Lc8[layer],t,c->kv_lora),
+                                        m->Lsc[layer]+(int64_t)t*nsl,
+                                        Lf+(int64_t)(t-stL)*c->kv_lora, c->kv_lora, g_kv8_gs); }
             matmul_qt(kvb_all+(int64_t)stL*kvb_dim, Lf, &l->kv_b, Tk-stL);
             free(Lf);
         } else
@@ -6872,7 +6903,8 @@ static void kv_alloc(Model *m, int max_t){
         for(int i=0;i<NR;i++){
             k->Lc8[i]=malloc((size_t)max_t*lb);
             k->Rc8[i]=malloc((size_t)max_t*rb);
-            k->Lsc[i]=falloc(max_t); k->Rsc[i]=falloc(max_t);
+            k->Lsc[i]=falloc((int64_t)max_t*(g_kv8?coli_kv8_nscale(c->kv_lora,g_kv8_gs):1));
+            k->Rsc[i]=falloc(max_t);
             if(!k->Lc8[i]||!k->Rc8[i]){fprintf(stderr,"OOM kv8\n");exit(1);}
         }
     } else
@@ -10775,7 +10807,13 @@ int main(int argc, char **argv){
         }
 #endif
         coli_fp8_lut_init();
-        fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + per-row scale (~3.9x less KV RAM)\n");
+        { const char *gsv=getenv("KV8_GS"); g_kv8_gs = gsv?atoi(gsv):0; if(g_kv8_gs<0) g_kv8_gs=0; }
+        fprintf(stderr,"[KV8] latent KV cache in fp8 e4m3 + %s scale (~3.9x less KV RAM)\n",
+                g_kv8_gs?"per-group":"per-row");
+        if(g_kv8_gs && (!getenv("KVSAVE")||atoi(getenv("KVSAVE")))){
+            fprintf(stderr,"[KV8] KV8_GS has no .coli_kv format yet: KV persistence disabled for this run\n");
+            setenv("KVSAVE","0",1);
+        }
     }
     /* KV_TQ=3|4: tier TurboQuant/PolarQuant (mutuamente esclusivo con KV8). CPU-only,
      * come KV8: si spegne dove i percorsi leggono righe f32. */
