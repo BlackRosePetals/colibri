@@ -10,9 +10,10 @@
  * engine-specific objects opaque while callers can open a layer range, create
  * isolated sessions, run activations through it and stream snapshots.
  *
- * Version 1 is additive and unused by the existing CLI/serve paths.  Adapters
- * register before the first lookup (normally from a link-time constructor),
- * after which the registry is read-only and safe for concurrent lookup.
+ * Version 1 is additive and unused by the existing CLI/serve paths.  A
+ * consumer registers adapters explicitly during process initialization and
+ * before the first lookup, after which the registry is read-only and safe for
+ * concurrent lookup.  No compiler-specific constructor mechanism is needed.
  */
 
 #include <stddef.h>
@@ -160,6 +161,8 @@ int coli_segment_engine_open(const char *engine_id,
                              const ColiSegmentEngineOptions *options,
                              ColiSegmentEngine **engine,
                              char *error, size_t error_size);
+/* The caller sets struct_size to its allocation size. Bytes beyond the ABI
+ * version known by this runtime are zeroed for forward-compatible callers. */
 int coli_segment_engine_capabilities(const ColiSegmentEngine *engine,
                                      ColiSegmentCapabilities *capabilities,
                                      char *error, size_t error_size);

@@ -20,7 +20,9 @@ model family in later changes.
 
 ## Lifecycle
 
-1. Register a static `ColiSegmentAdapter` during process initialization.
+1. Call each model adapter's explicit registration function during process
+   initialization. The consumer must not depend on linker constructors; this
+   keeps initialization order visible and portable to MSVC.
 2. Open an engine with `coli_segment_engine_open` and inspect its model-specific
    `ColiSegmentCapabilities`.
 3. Create one or more sessions. A session must not receive concurrent calls.
@@ -34,6 +36,10 @@ concurrent lookups begin; registration itself is not a hot-path operation.
 
 Capabilities are returned after model open because the layer count, boundary
 width and context limit may vary between checkpoints handled by one engine.
+The caller initializes `struct_size` to its allocation size. The runtime zeros
+that complete allocation before copying the fields it knows, so a future caller
+using a larger structure never observes uninitialized extension fields when it
+loads an older runtime.
 `state_schema` identifies the activation and snapshot layout.
 `numeric_class` identifies builds whose results and snapshots are compatible;
 an adapter must include every relevant precision, reduction and backend rule in

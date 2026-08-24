@@ -145,6 +145,8 @@ int coli_segment_engine_capabilities(const ColiSegmentEngine *engine,
         capabilities->struct_size < sizeof(*capabilities))
         return set_error(error, error_size,
                          "invalid segment capabilities buffer");
+    size_t caller_size = capabilities->struct_size;
+    memset(capabilities, 0, caller_size);
     memcpy(capabilities, &engine->capabilities, sizeof(*capabilities));
     return 0;
 }

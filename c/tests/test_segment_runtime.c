@@ -181,6 +181,20 @@ int main(void) {
                                             error, sizeof(error)) == 0);
     assert(capabilities.state_width == 4 && capabilities.num_layers == 6);
     assert(capabilities.flags & COLI_SEGMENT_CAP_RANGE_NATIVE);
+
+    struct {
+        ColiSegmentCapabilities capabilities;
+        uint64_t future_fields[2];
+    } future_capabilities;
+    memset(&future_capabilities, 0xa5, sizeof(future_capabilities));
+    future_capabilities.capabilities.struct_size = sizeof(future_capabilities);
+    assert(coli_segment_engine_capabilities(
+               engine, &future_capabilities.capabilities,
+               error, sizeof(error)) == 0);
+    assert(future_capabilities.capabilities.state_width == 4);
+    assert(future_capabilities.future_fields[0] == 0);
+    assert(future_capabilities.future_fields[1] == 0);
+
     capabilities.struct_size = 0;
     assert(coli_segment_engine_capabilities(engine, &capabilities,
                                             error, sizeof(error)) != 0);
