@@ -3877,7 +3877,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (!result && need <= 1024) {
         float *xq = (float *)scratch_ptr; scratch_ptr += sz_xq;
         float *yq = (float *)scratch_ptr; scratch_ptr += sz_yq;
-        uint8_t *xs = (uint8_t *)scratch_ptr;
+        uint8_t *xs = (uint8_t *)scratch_ptr; scratch_ptr += sz_xs;
         int qok = xq && yq && xs;
         if (qok) {
             int i = 0;
