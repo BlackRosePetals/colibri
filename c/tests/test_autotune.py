@@ -111,6 +111,23 @@ class AutotuneUnitTest(unittest.TestCase):
                 # sweep has nothing left to measure on those engines.
                 self.assertTrue(any(name.startswith("omp-") for name in steps), steps)
 
+    def test_v4_loader_lanes_are_bounded_and_only_swept_when_disk_is_cold(self):
+        cold_plan = plan(cores=16, gpu=False, cold=1 << 30)
+        steps = dict(candidate_steps(cold_plan, {}, "deepseek_v4"))
+        self.assertEqual(
+            [name for name in steps if name.startswith("v4-loader-")],
+            ["v4-loader-3", "v4-loader-6", "v4-loader-12"],
+        )
+        self.assertEqual(steps["v4-loader-3"], {"V4_LOADER_LANES": "3"})
+        resident = dict(candidate_steps(plan(cores=16, gpu=False, cold=0), {},
+                                        "deepseek_v4"))
+        self.assertFalse(any(name.startswith("v4-loader-") for name in resident))
+
+    def test_omp_kill_switch_removes_thread_candidates(self):
+        steps = candidate_steps(plan(cores=16, gpu=False),
+                                {"COLI_NO_OMP_TUNE": "1"}, "kimi")
+        self.assertFalse(any(name.startswith("omp-") for name, _ in steps))
+
     def test_profile_round_trip_and_explicit_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "engine"
@@ -155,17 +172,21 @@ class FakeServeEngine:
     drift_on = None            # knob name that changes the OUTPUT (illegal)
     drift_baseline = False     # second run of ANY env differs (nondeterminism)
     calls = 0
+    sessions = []
 
     def __init__(self, executable, model, cap, max_tokens, env, kv_slots,
                  family):
         FakeServeEngine.launches.append(
             {"cap": cap, "env": dict(env), "family": family})
         self.env = env
+        self.prompts = []
+        FakeServeEngine.sessions.append(self.prompts)
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text,
                  cache_slot=0):
         FakeServeEngine.calls += 1
-        text = "hello world"
+        self.prompts.append(prompt)
+        text = f"answer:{prompt}"
         if FakeServeEngine.drift_on and \
                 self.env.get(FakeServeEngine.drift_on) is not None:
             text = "HELLO DRIFT"
@@ -174,6 +195,9 @@ class FakeServeEngine:
         on_text(text)
         threads = self.env.get("OMP_NUM_THREADS")
         speed = {None: 10.0, "8": 13.0, "4": 11.0}.get(threads, 10.0)
+        speed *= {None: 1.0, "3": 1.30, "6": 1.10,
+                  "9": 1.0, "12": 0.90}.get(
+                      self.env.get("V4_LOADER_LANES"), 1.0)
         return {"completion_tokens": max_tokens, "tokens_per_second": speed,
                 "cache_hit_percent": 95.0, "prompt_tokens": 3}
 
@@ -182,7 +206,7 @@ class FakeServeEngine:
 
     @classmethod
     def reset(cls, drift_on=None, drift_baseline=False):
-        cls.launches, cls.calls = [], 0
+        cls.launches, cls.sessions, cls.calls = [], [], 0
         cls.drift_on, cls.drift_baseline = drift_on, drift_baseline
 
 
@@ -205,7 +229,7 @@ class ServeTuneTest(unittest.TestCase):
 
     def test_sibling_arch_tunes_through_the_serve_protocol(self):
         FakeServeEngine.reset()
-        profile, _ = self.run_serve_tune()
+        profile, _ = self.run_serve_tune(prompts=("prompt-a", "prompt-b"))
         self.assertTrue(profile["accepted"])
         # cores=8 with OMP unset means only omp-4 is offered (8 is already
         # the implicit default), so the sweep's one candidate must win
@@ -216,6 +240,12 @@ class ServeTuneTest(unittest.TestCase):
             self.assertEqual(launch["cap"], 16)
             self.assertEqual(launch["family"], "fake-family")
             self.assertEqual(launch["env"].get("COLI_TEMP"), "0")
+        # baseline, candidate, confirm-winner, confirm-baseline: one process
+        # each, not one process per repeat. Every process sees the same
+        # rotating prompt order and therefore retains its expert-cache state.
+        self.assertEqual(len(FakeServeEngine.launches), 4)
+        self.assertEqual(FakeServeEngine.sessions,
+                         [["prompt-a", "prompt-b"]] * 4)
 
     def test_candidate_that_changes_output_is_disqualified(self):
         FakeServeEngine.reset(drift_on="OMP_NUM_THREADS")
@@ -225,6 +255,18 @@ class ServeTuneTest(unittest.TestCase):
         self.assertEqual(profile["winner"]["env"], {})
         names = [candidate["name"] for candidate in profile["candidates"]]
         self.assertNotIn("omp-4", names)
+
+    def test_v4_loader_winner_is_measured_and_persisted(self):
+        FakeServeEngine.reset()
+        p = plan(cores=8, gpu=False, cold=1 << 30)
+        p["tiers"]["ram"] = {"cache_slots_per_layer": 16}
+        profile, _ = self.run_serve_tune(
+            plan=p, base_env={"OMP_NUM_THREADS": "8"},
+            repeats=2, prompts=("prompt-a", "prompt-b"),
+        )
+        self.assertTrue(profile["accepted"])
+        self.assertEqual(profile["winner"]["env"], {"V4_LOADER_LANES": "3"})
+        self.assertAlmostEqual(profile["gain"], 0.30)
 
     def test_nondeterministic_baseline_aborts_the_tune(self):
         FakeServeEngine.reset(drift_baseline=True)
