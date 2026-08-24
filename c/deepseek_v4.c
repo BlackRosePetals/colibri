@@ -3550,6 +3550,11 @@ struct ColiDeepSeekV4Indexer {
     int capacity;
     int count;
     float *compressed;
+    /* Persistent arena scratch buffer for coli_v4_indexer_select_batch.
+     * Assumes single-threaded execution per indexer instance (standard in SERVE chunk prefill). */
+    void *scratch_buf;
+    size_t scratch_cap;
+    char in_use;
 };
 
 typedef struct { float score; int index; } IndexScore;
@@ -3654,7 +3659,21 @@ void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state) {
     if (!state) return;
     coli_v4_compressor_destroy(state->compressor);
     free(state->compressed);
+    free(state->scratch_buf);
     free(state);
+}
+
+static void *indexer_scratch_alloc(ColiDeepSeekV4Indexer *state, size_t needed) {
+    if (!state) return NULL;
+    if (state->scratch_cap < needed) {
+        size_t new_cap = needed < 65536 ? 65536 : (needed + needed / 4);
+        void *new_buf = malloc(new_cap);
+        if (!new_buf) return NULL;
+        free(state->scratch_buf);
+        state->scratch_buf = new_buf;
+        state->scratch_cap = new_cap;
+    }
+    return state->scratch_buf;
 }
 
 static int apply_position_rope(float *queries,
@@ -3824,6 +3843,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (max_count > state->count)
         return set_error(error, error_size, "indexer batch counts exceed cache");
 
+    if (__atomic_test_and_set(&state->in_use, __ATOMIC_ACQUIRE))
+        return set_error(error, error_size, "concurrent indexer batch selection on single instance");
+
     static int prof = -1;
     if (prof < 0) prof = getenv("DSV4_ATTN_PROF") != NULL;
     struct timespec ts_prev, ts_now;
@@ -3831,24 +3853,54 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #define IDX_PROF_MARK(acc) do { if (prof) {         clock_gettime(CLOCK_MONOTONIC, &ts_now);         acc += (ts_now.tv_sec - ts_prev.tv_sec) +                (ts_now.tv_nsec - ts_prev.tv_nsec) * 1e-9;         ts_prev = ts_now; } } while (0)
     if (prof) clock_gettime(CLOCK_MONOTONIC, &ts_prev);
     ColiTensorView wq;
-    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b"))
+    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b")) {
+        __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
         return set_error(error, error_size, "missing indexer query weight");
+    }
     const uint16_t *raw_weights = value(
         state->weights, "attn.indexer.weights_proj.weight", NULL);
     size_t qn = (size_t)heads * dimension;
-    float *queries = malloc((size_t)batch * qn * sizeof(*queries));
-    float *sq = malloc((size_t)need * qn * sizeof(*sq));
-    float *head_weights = malloc((size_t)need * heads * sizeof(*head_weights));
-    int *scounts = malloc((size_t)need * sizeof(*scounts));
-    int *stoken = malloc((size_t)need * sizeof(*stoken));
-    float *scores = malloc((size_t)need * max_count * sizeof(*scores));
-    IndexScore *ranked = malloc((size_t)max_count * sizeof(*ranked));
-    uint8_t *scales = malloc((size_t)dimension / 32);
-    float *qdq = malloc((size_t)dimension * sizeof(*qdq));
+    size_t cols = (size_t)wq.columns;
+
+#define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
+    size_t sz_queries = ALIGN32((size_t)batch * qn * sizeof(float));
+    size_t sz_sq = ALIGN32((size_t)need * qn * sizeof(float));
+    size_t sz_head_weights = ALIGN32((size_t)need * heads * sizeof(float));
+    size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
+    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    size_t sz_scales = ALIGN32((size_t)dimension / 32);
+    size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
+#ifdef COLI_V4_GPU_TIER
+    size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
+    size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
+    size_t sz_xs = (need <= 1024) ? ALIGN32((size_t)need * (cols / 128)) : 0;
+#else
+    size_t sz_xq = 0, sz_yq = 0, sz_xs = 0;
+#endif
+
+    size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
+                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
+
+    char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
+    if (!scratch_ptr || !raw_weights) {
+        __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
+        return set_error(error, error_size, "out of memory scoring indexer batch");
+    }
+
+    scratch_ptr = (char *)(((uintptr_t)scratch_ptr + 31) & ~(uintptr_t)31);
+
+    float *queries = (float *)scratch_ptr; scratch_ptr += sz_queries;
+    float *sq = (float *)scratch_ptr; scratch_ptr += sz_sq;
+    float *head_weights = (float *)scratch_ptr; scratch_ptr += sz_head_weights;
+    int *scounts = (int *)scratch_ptr; scratch_ptr += sz_scounts;
+    int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
+    float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
+    IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
+    uint8_t *scales = (uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
+    float *qdq = (float *)scratch_ptr; scratch_ptr += sz_qdq;
     int result = 0;
-    if (!queries || !sq || !head_weights || !scounts || !stoken || !scores ||
-        !ranked || !scales || !qdq || !raw_weights)
-        result = set_error(error, error_size, "out of memory scoring indexer batch");
 
     /* Query projection. Preferred: host fp8 activation quantization (the
      * reference qdq, per token) + the GPU replica of the reference matmul —
@@ -3859,10 +3911,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int projected = 0;
 #ifdef COLI_V4_GPU_TIER
     if (!result && need <= 1024) {
-        size_t cols = (size_t)wq.columns;
-        float *xq = malloc((size_t)need * cols * sizeof(*xq));
-        float *yq = malloc((size_t)need * qn * sizeof(*yq));
-        uint8_t *xs = malloc((size_t)need * (cols / 128));
+        float *xq = (float *)scratch_ptr; scratch_ptr += sz_xq;
+        float *yq = (float *)scratch_ptr; scratch_ptr += sz_yq;
+        uint8_t *xs = (uint8_t *)scratch_ptr; scratch_ptr += sz_xs;
         int qok = xq && yq && xs;
         if (qok) {
             int i = 0;
@@ -3885,7 +3936,6 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
             }
             projected = 1;
         }
-        free(xs); free(yq); free(xq);
     }
 #endif
     {
@@ -4014,8 +4064,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 gpu_scored ? "" : " (cpu-score)");
 #undef IDX_PROF_MARK
-    free(qdq); free(scales); free(ranked); free(scores); free(stoken);
-    free(scounts); free(head_weights); free(sq); free(queries);
+    __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
     return result;
 }
 
