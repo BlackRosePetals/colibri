@@ -865,12 +865,19 @@ rans: $(RANSLIB)
 $(RANSLIB): tools/rans_ctypes.c rans.h
 	$(CC) $(CFLAGS) -fPIC -shared $< -o $@ $(LDFLAGS)
 
-cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu
+cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backend_cuda.cu tests/test_ragged_attention.cu tests/test_absorb_determinism.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.c tests/test_fp8_warp_cuda.cu tests/test_fp8_cuda.cu tests/test_weights_owned_cuda.cu tests/test_cuda_fmt_trap_cuda.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE) $(ANS_NVCC_LIBS)
 	./backend_cuda_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_ragged_attention.cu -o ragged_attention_test$(EXE)
 	./ragged_attention_test$(EXE)
+	# weight_at's device-side refusal (the __trap()) on real silicon. The
+	# host-side half is tests/test_cuda_fmt_guard.c, which runs in the CPU
+	# suite and cannot execute device code. Includes backend_cuda.cu itself:
+	# weight_at is file-static, and the trap is unreachable through the public
+	# API by design. Re-execs itself per probe (the trap poisons the context).
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
+	./cuda_fmt_trap_test$(EXE)
 	# fmt=8 warp kernels (COLI_CUDA_F8_WARP): decode sweep, census + tail
 	# shapes, S-invariance, NaN/denormal policy. Includes backend_cuda.cu
 	# itself (kernel-level oracle), so only the test file is compiled.
@@ -938,6 +945,7 @@ gpu-compile: backend_cuda.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_absorb_determinism.cu -o absorb_determinism_test$(EXE)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_fp8_warp_cuda.cu -o fp8_warp_test$(EXE) $(ANS_NVCC_LIBS)
 	"$(GPUCC)" $(GPUFLAGS) tests/test_weights_owned_cuda.cu -o weights_owned_test$(EXE) $(ANS_NVCC_LIBS)
+	"$(GPUCC)" $(GPUFLAGS) tests/test_cuda_fmt_trap_cuda.cu -o cuda_fmt_trap_test$(EXE) $(ANS_NVCC_LIBS)
 
 cuda-bench: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/bench_tensor_core.cu
 	@command -v "$(GPUCC)" >/dev/null 2>&1 || { echo "$(GPUCC_NAME) not found" >&2; exit 1; }
@@ -1217,6 +1225,12 @@ tests/test_int3_load$(EXE): tests/test_int3_load.c colibri.c st.h uring.h json.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_fp8_passthrough$(EXE): tests/test_fp8_passthrough.c quant.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+# Host-only: backend_cuda.h's format predicate is plain C, so its truth table is
+# a portable gate even where there is no CUDA toolchain. Same arrangement as
+# metal_fused_fmt_ok's CPU-testable truth table.
+tests/test_cuda_fmt_guard$(EXE): tests/test_cuda_fmt_guard.c backend_cuda.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_fp8_load$(EXE): tests/test_fp8_load.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
