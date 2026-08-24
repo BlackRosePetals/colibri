@@ -3518,6 +3518,7 @@ struct ColiDeepSeekV4Indexer {
      * Assumes single-threaded execution per indexer instance (standard in SERVE chunk prefill). */
     void *scratch_buf;
     size_t scratch_cap;
+    int in_use;
 };
 
 typedef struct { float score; int index; } IndexScore;
@@ -3630,8 +3631,9 @@ static void *indexer_scratch_alloc(ColiDeepSeekV4Indexer *state, size_t needed) 
     if (!state) return NULL;
     if (state->scratch_cap < needed) {
         size_t new_cap = needed < 65536 ? 65536 : needed * 2;
-        void *new_buf = realloc(state->scratch_buf, new_cap);
+        void *new_buf = malloc(new_cap);
         if (!new_buf) return NULL;
+        free(state->scratch_buf);
         state->scratch_buf = new_buf;
         state->scratch_cap = new_cap;
     }
@@ -3805,6 +3807,10 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (max_count > state->count)
         return set_error(error, error_size, "indexer batch counts exceed cache");
 
+    if (state->in_use)
+        return set_error(error, error_size, "concurrent indexer batch selection on single instance");
+    state->in_use = 1;
+
     static int prof = -1;
     if (prof < 0) prof = getenv("DSV4_ATTN_PROF") != NULL;
     struct timespec ts_prev, ts_now;
@@ -3812,8 +3818,10 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #define IDX_PROF_MARK(acc) do { if (prof) {         clock_gettime(CLOCK_MONOTONIC, &ts_now);         acc += (ts_now.tv_sec - ts_prev.tv_sec) +                (ts_now.tv_nsec - ts_prev.tv_nsec) * 1e-9;         ts_prev = ts_now; } } while (0)
     if (prof) clock_gettime(CLOCK_MONOTONIC, &ts_prev);
     ColiTensorView wq;
-    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b"))
+    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b")) {
+        state->in_use = 0;
         return set_error(error, error_size, "missing indexer query weight");
+    }
     const uint16_t *raw_weights = value(
         state->weights, "attn.indexer.weights_proj.weight", NULL);
     size_t qn = (size_t)heads * dimension;
@@ -3829,16 +3837,22 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
     size_t sz_scales = ALIGN32((size_t)dimension / 32);
     size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
+#ifdef COLI_V4_GPU_TIER
     size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
     size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
     size_t sz_xs = (need <= 1024) ? ALIGN32((size_t)need * (cols / 128)) : 0;
+#else
+    size_t sz_xq = 0, sz_yq = 0, sz_xs = 0;
+#endif
 
     size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
                            sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
-    if (!scratch_ptr || !raw_weights)
+    if (!scratch_ptr || !raw_weights) {
+        state->in_use = 0;
         return set_error(error, error_size, "out of memory scoring indexer batch");
+    }
 
     scratch_ptr = (char *)(((uintptr_t)scratch_ptr + 31) & ~(uintptr_t)31);
 
@@ -4015,6 +4029,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 gpu_scored ? "" : " (cpu-score)");
 #undef IDX_PROF_MARK
+    state->in_use = 0;
     return result;
 }
 
