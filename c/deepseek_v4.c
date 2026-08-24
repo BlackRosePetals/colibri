@@ -594,6 +594,9 @@ int coli_st_prefetch_at_rep(const ColiSafetensorsIndex *index, int shard,
 #define coli_v4_layer_free coli_v4_layer_resident_reference_free
 /* ---- begin include deepseek_v4_layer.c ---- */
 #include "deepseek_v4_internal.h"
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -798,10 +801,40 @@ static int v4_fp8_pack_rows8_inplace(unsigned char *data,
     for (int64_t tile = 0; tile < rows / 8; tile++) {
         unsigned char *target = data + (size_t)tile * tile_bytes;
         memcpy(scratch, target, tile_bytes);
-        for (int64_t column = 0; column < columns; column++)
-            for (int lane = 0; lane < 8; lane++)
-                target[(size_t)column * 8 + lane] =
-                    scratch[(size_t)lane * columns + column];
+        /* 8xN byte transpose. The scalar loop wrote contiguously but READ
+         * eight cache lines per emitted 8 bytes (stride = columns); on a
+         * resident load that second pass over every dense FP8 byte was pure
+         * scalar CPU. Three unpack stages turn 8 rows x 16 columns into the
+         * identical byte order with 16-byte loads and stores. columns is a
+         * multiple of 128 (checked above), so of 16 too. */
+        for (int64_t column = 0; column < columns; column += 16) {
+            const unsigned char *lanes = scratch + column;
+            __m128i r0 = _mm_loadu_si128((const __m128i *)(lanes + 0 * columns));
+            __m128i r1 = _mm_loadu_si128((const __m128i *)(lanes + 1 * columns));
+            __m128i r2 = _mm_loadu_si128((const __m128i *)(lanes + 2 * columns));
+            __m128i r3 = _mm_loadu_si128((const __m128i *)(lanes + 3 * columns));
+            __m128i r4 = _mm_loadu_si128((const __m128i *)(lanes + 4 * columns));
+            __m128i r5 = _mm_loadu_si128((const __m128i *)(lanes + 5 * columns));
+            __m128i r6 = _mm_loadu_si128((const __m128i *)(lanes + 6 * columns));
+            __m128i r7 = _mm_loadu_si128((const __m128i *)(lanes + 7 * columns));
+            __m128i s0 = _mm_unpacklo_epi8(r0, r1), s1 = _mm_unpackhi_epi8(r0, r1);
+            __m128i s2 = _mm_unpacklo_epi8(r2, r3), s3 = _mm_unpackhi_epi8(r2, r3);
+            __m128i s4 = _mm_unpacklo_epi8(r4, r5), s5 = _mm_unpackhi_epi8(r4, r5);
+            __m128i s6 = _mm_unpacklo_epi8(r6, r7), s7 = _mm_unpackhi_epi8(r6, r7);
+            __m128i u0 = _mm_unpacklo_epi16(s0, s2), u1 = _mm_unpackhi_epi16(s0, s2);
+            __m128i u2 = _mm_unpacklo_epi16(s4, s6), u3 = _mm_unpackhi_epi16(s4, s6);
+            __m128i u4 = _mm_unpacklo_epi16(s1, s3), u5 = _mm_unpackhi_epi16(s1, s3);
+            __m128i u6 = _mm_unpacklo_epi16(s5, s7), u7 = _mm_unpackhi_epi16(s5, s7);
+            unsigned char *out = target + (size_t)column * 8;
+            _mm_storeu_si128((__m128i *)(out +   0), _mm_unpacklo_epi32(u0, u2));
+            _mm_storeu_si128((__m128i *)(out +  16), _mm_unpackhi_epi32(u0, u2));
+            _mm_storeu_si128((__m128i *)(out +  32), _mm_unpacklo_epi32(u1, u3));
+            _mm_storeu_si128((__m128i *)(out +  48), _mm_unpackhi_epi32(u1, u3));
+            _mm_storeu_si128((__m128i *)(out +  64), _mm_unpacklo_epi32(u4, u6));
+            _mm_storeu_si128((__m128i *)(out +  80), _mm_unpackhi_epi32(u4, u6));
+            _mm_storeu_si128((__m128i *)(out +  96), _mm_unpacklo_epi32(u5, u7));
+            _mm_storeu_si128((__m128i *)(out + 112), _mm_unpackhi_epi32(u5, u7));
+        }
     }
     free(scratch);
     return 1;
@@ -1157,42 +1190,42 @@ int coli_v4_resident_tier_plan(
 #include <string.h>
 
 
-static int find_head(const char *model_dir, ColiSafetensorsIndex **index,
+static int find_head(const ColiSafetensorsIndex *index,
                      const ColiSafetensorsTensor **head,
                      char *error, size_t error_size) {
-    *index = NULL; *head = NULL;
-    if (coli_st_index_open(index, model_dir, error, error_size)) return -1;
-    *head = coli_st_find(*index, "head.weight");
+    *head = coli_st_find(index, "head.weight");
     if (!*head || (*head)->dtype != COLI_ST_BF16 || (*head)->rank != 2) {
         snprintf(error, error_size, "missing or invalid BF16 head.weight");
-        coli_st_index_close(*index); *index = NULL; return -1;
+        return -1;
     }
     return 0;
 }
 
-int coli_v4_head_cache_probe(const char *model_dir, uint64_t *bytes,
+/* The engine's retained index is passed in: this used to open (and scan)
+ * every shard header a third time just to read one tensor's byte count. */
+int coli_v4_head_cache_probe(const ColiSafetensorsIndex *index, uint64_t *bytes,
                              char *error, size_t error_size) {
-    ColiSafetensorsIndex *index;
     const ColiSafetensorsTensor *head;
-    if (!bytes || find_head(model_dir, &index, &head, error, error_size)) return -1;
+    if (!bytes || !index ||
+        find_head(index, &head, error, error_size)) return -1;
     *bytes = head->nbytes;
-    coli_st_index_close(index); return 0;
+    return 0;
 }
 
-int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
+int coli_v4_head_cache_load(ColiV4Engine *engine,
+                            const ColiSafetensorsIndex *index,
                             char *error, size_t error_size) {
-    if (!engine) {
+    if (!engine || !index) {
         snprintf(error, error_size, "head cache requires a V4 engine");
         return -1;
     }
-    ColiSafetensorsIndex *index;
     const ColiSafetensorsTensor *head;
-    if (find_head(model_dir, &index, &head, error, error_size)) return -1;
+    if (find_head(index, &head, error, error_size)) return -1;
     unsigned char *data = malloc((size_t)head->nbytes);
     int shard = coli_st_tensor_shard(index, head);
     if (!data || coli_st_read_at(index, shard, (uint64_t)head->off,
                                  (size_t)head->nbytes, data)) {
-        free(data); coli_st_index_close(index);
+        free(data);
         snprintf(error, error_size, "cannot load resident BF16 head.weight");
         return -1;
     }
@@ -1201,7 +1234,7 @@ int coli_v4_head_cache_load(ColiV4Engine *engine, const char *model_dir,
     engine->head_cache.bytes = head->nbytes;
     engine->head_cache.offset = (uint64_t)head->off;
     engine->head_cache.shard = shard;
-    coli_st_index_close(index); return 0;
+    return 0;
 }
 
 uint64_t coli_v4_head_cache_bytes(const ColiV4Engine *engine) {
@@ -1242,6 +1275,12 @@ int coli_st_read_at_engine(ColiV4Engine *engine,
 /* ######## deepseek_v4_expert_store_auto.c ######## */
 /* ---- begin inlined deepseek_v4_expert_store_auto_v5.c ---- */
 #include "deepseek_v4_internal.h"
+
+static double v4_open_now_s(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec + now.tv_nsec * 1e-9;
+}
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1287,42 +1326,53 @@ static uint64_t context_bytes(const ColiDeepSeekV4Config *config, int context) {
 static int build_runtime_plan(ColiV4Engine *engine,
                               const ColiDeepSeekV4ExpertStoreOptions *options,
                               ColiDeepSeekV4ResourcePlan *plan,
+                              uint64_t *dense_bytes_out,
                               char *error, size_t error_size) {
-    ColiDeepSeekV4Config config;
-    ColiSafetensorsIndex *index = NULL;
     if (!engine) {
         snprintf(error, error_size, "V4 runtime requires an engine");
         return -1;
     }
-    if (coli_v4_config_load(&config, options->model_dir, error, error_size) ||
-        coli_st_index_open(&index, options->model_dir, error, error_size))
+    /* The engine already parsed config.json and scanned every shard header
+     * into target_index at open. This planner (plus the dense inventory and
+     * the head probe downstream) used to redo BOTH from scratch — on a
+     * 141-shard checkpoint that was five extra full index builds per engine
+     * open, ~100k tensor names hashed each time, for numbers the retained
+     * index answers directly. One layer walk now yields the per-layer
+     * maximum AND the dense total together. */
+    const ColiDeepSeekV4Config *config = &engine->config;
+    const ColiSafetensorsIndex *index = engine->target_index;
+    if (!index || strcmp(options->model_dir,
+                         engine->runtime.target_model_dir) != 0) {
+        snprintf(error, error_size,
+                 "V4 runtime plan requires the engine's own model directory");
         return -1;
-    uint64_t maximum_layer = 0;
-    for (int layer = 0; layer < config.num_hidden_layers; layer++) {
+    }
+    uint64_t maximum_layer = 0, dense_total = 0;
+    for (int layer = 0; layer < config->num_hidden_layers; layer++) {
         ColiDeepSeekV4LayerPlan layer_plan;
         ColiDeepSeekV4LayerStats stats;
-        if (coli_v4_layer_plan(&layer_plan, &config, layer,
+        if (coli_v4_layer_plan(&layer_plan, config, layer,
                                error, error_size) ||
             coli_v4_layer_validate(&layer_plan, index, &stats,
-                                   error, error_size)) {
-            coli_st_index_close(index); return -1;
-        }
+                                   error, error_size))
+            return -1;
         if (stats.total_bytes > maximum_layer) maximum_layer = stats.total_bytes;
+        dense_total += stats.total_bytes;
     }
+    if (dense_bytes_out) *dense_bytes_out = dense_total;
     uint64_t record = expert_record_bytes(index);
-    coli_st_index_close(index);
     if (!record) {
         snprintf(error, error_size, "cannot determine V4 expert record size");
         return -1;
     }
     ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
     int context = runtime->context_tokens;
-    if (context > config.max_position_embeddings)
-        context = config.max_position_embeddings;
-    uint64_t hidden = (uint64_t)64 * config.hc_mult * config.hidden_size *
+    if (context > config->max_position_embeddings)
+        context = config->max_position_embeddings;
+    uint64_t hidden = (uint64_t)64 * config->hc_mult * config->hidden_size *
                       sizeof(float) * 2;
     uint64_t scratch = 512 * MIB;
-    uint64_t runtime_other = context_bytes(&config, context) + hidden + scratch;
+    uint64_t runtime_other = context_bytes(config, context) + hidden + scratch;
     if (UINT64_MAX - runtime_other < runtime->dspark_reserve_bytes) {
         snprintf(error, error_size, "V4 DSpark reserve overflow");
         return -1;
@@ -1335,31 +1385,12 @@ static int build_runtime_plan(ColiV4Engine *engine,
     }
     ColiDeepSeekV4ResourceInputs inputs = {
         available, runtime->memory_limit_bytes, maximum_layer,
-        runtime_other, record, config.num_hidden_layers,
-        config.num_experts_per_tok, config.n_routed_experts,
+        runtime_other, record, config->num_hidden_layers,
+        config->num_experts_per_tok, config->n_routed_experts,
     };
     return coli_v4_resource_plan_compute(plan, &inputs, error, error_size);
 }
 
-static int v5_dense_inventory(const char *model_dir,
-                              uint64_t *bytes,
-                              char *error, size_t error_size) {
-    ColiDeepSeekV4Config config; ColiSafetensorsIndex *index = NULL;
-    if (coli_v4_config_load(&config, model_dir, error, error_size) ||
-        coli_st_index_open(&index, model_dir, error, error_size)) return -1;
-    uint64_t total = 0;
-    for (int layer = 0; layer < config.num_hidden_layers; layer++) {
-        ColiDeepSeekV4LayerPlan layer_plan; ColiDeepSeekV4LayerStats stats;
-        if (coli_v4_layer_plan(&layer_plan, &config, layer,
-                               error, error_size) ||
-            coli_v4_layer_validate(&layer_plan, index, &stats,
-                                   error, error_size)) {
-            coli_st_index_close(index); return -1;
-        }
-        total += stats.total_bytes;
-    }
-    coli_st_index_close(index); *bytes = total; return 0;
-}
 
 int coli_v4_expert_store_open_planned(
     ColiV4Engine *engine,
@@ -1370,14 +1401,16 @@ int coli_v4_expert_store_open_planned(
     if (!options || !engine) return -1;
     ColiDeepSeekV4ResourcePlan plan;
     ColiDeepSeekV4RuntimeOptions *runtime = &engine->runtime;
-    if (build_runtime_plan(engine, options, &plan, error, error_size)) return -1;
+    double open_plan_t0 = v4_open_now_s();
+    uint64_t dense_bytes = 0;
+    if (build_runtime_plan(engine, options, &plan, &dense_bytes,
+                           error, error_size)) return -1;
     uint64_t per_slot = plan.expert_cache_bytes /
                         (uint64_t)plan.slots_per_layer;
-    uint64_t head_bytes = 0, dense_bytes = 0;
-    if (coli_v4_head_cache_probe(options->model_dir, &head_bytes,
-                                 error, error_size) ||
-        v5_dense_inventory(options->model_dir, &dense_bytes,
-                           error, error_size)) return -1;
+    uint64_t head_bytes = 0;
+    if (coli_v4_head_cache_probe(engine->target_index, &head_bytes,
+                                 error, error_size)) return -1;
+    double open_plan_s = v4_open_now_s() - open_plan_t0;
 
     uint64_t fixed = plan.system_reserve_bytes + plan.runtime_reserve_bytes;
     ColiDeepSeekV4ResidentTierPlan tiers;
@@ -1417,7 +1450,7 @@ int coli_v4_expert_store_open_planned(
     plan.projected_bytes = fixed + dense_bytes +
         plan.expert_cache_bytes + (resident_head ? head_bytes : 0);
     if (resident_head && coli_v4_head_cache_load(
-            engine, options->model_dir, error, error_size)) return -1;
+            engine, engine->target_index, error, error_size)) return -1;
     fprintf(stderr,
         "ram_tiers available=%.2fGiB dense=%s(%.2fGiB) "
         "target_slots=%d target_cache=%.2fGiB head=%s projected=%.2fGiB\n",
@@ -1428,6 +1461,9 @@ int coli_v4_expert_store_open_planned(
         plan.expert_cache_bytes / (double)GIB,
         resident_head ? "resident-bf16" : "streamed-bf16",
         plan.projected_bytes / (double)GIB);
+    fprintf(stderr, "v4_open index=%.2fs plan=%.2fs (index built once, "
+                    "reused by plan/inventory/head)\n",
+            g_v4_open_index_seconds, open_plan_s);
     ColiDeepSeekV4ExpertStoreOptions automatic = *options;
     automatic.cache_bytes = plan.expert_cache_bytes;
     automatic.pin_slots_per_layer = runtime->pin_slots_per_layer;
@@ -7803,7 +7839,7 @@ int coli_deepseek_v4_expert_store_open(
     coli_st_mirror_setup(state->index, options->model_dir,
                          options->experts_per_layer);
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
-    state->records = calloc(record_count, sizeof(*state->records));
+    state->records = malloc(record_count * sizeof(*state->records)); /* build_record zeroes each */
     if (!state->records) {
         set_error(error, error_size, "out of memory creating expert manifest");
         goto fail;
@@ -9129,6 +9165,7 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
 #ifdef COLI_V4_UNIT_RUNTIME
 /* ######## deepseek_v4_runtime.c / engine ######## */
 #include "deepseek_v4_internal.h"
+#include <time.h>
 #include "expert_store_registry.h"
 
 #include <assert.h>
@@ -9394,6 +9431,9 @@ void coli_v4_engine_destroy(ColiV4Engine *engine) {
     free(engine);
 }
 
+/* Cross-unit: written by engine open, printed by the auto store planner. */
+double g_v4_open_index_seconds;
+
 int coli_v4_engine_open(ColiV4Engine **output,
                         const ColiV4EngineOpenOptions *options,
                         char *error, size_t error_size) {
@@ -9427,10 +9467,17 @@ int coli_v4_engine_open(ColiV4Engine **output,
     if (coli_v4_config_load(&engine->config, engine->runtime.target_model_dir,
                             error, error_size))
         goto fail;
-    if (coli_st_index_open(&engine->target_index,
-                           engine->runtime.target_model_dir, error,
-                           error_size))
-        goto fail;
+    {
+        struct timespec ix0, ix1;
+        clock_gettime(CLOCK_MONOTONIC, &ix0);
+        if (coli_st_index_open(&engine->target_index,
+                               engine->runtime.target_model_dir, error,
+                               error_size))
+            goto fail;
+        clock_gettime(CLOCK_MONOTONIC, &ix1);
+        g_v4_open_index_seconds = (ix1.tv_sec - ix0.tv_sec) +
+                                  (ix1.tv_nsec - ix0.tv_nsec) * 1e-9;
+    }
     engine->owns_index = 1;
     const ColiSafetensorsTensor *dspark_w1 = NULL, *dspark_w2 = NULL;
     int requested_full_dspark = v4_dspark_full_wanted(options);
@@ -14765,7 +14812,7 @@ int coli_deepseek_v4_expert_store_open(
     if (coli_st_index_open(&state->index, options->model_dir, error, error_size) != 0)
         goto fail;
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
-    state->records = calloc(record_count, sizeof(*state->records));
+    state->records = malloc(record_count * sizeof(*state->records)); /* build_record zeroes each */
     if (!state->records) {
         set_error(error, error_size, "out of memory creating expert manifest");
         goto fail;
