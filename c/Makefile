@@ -1132,6 +1132,9 @@ tests/test_serve_codec$(EXE): tests/test_serve_codec.c serve_codec.h compat.h
 tests/test_segment_runtime$(EXE): tests/test_segment_runtime.c segment_runtime.c segment_runtime.h
 	$(CC) $(CFLAGS) tests/test_segment_runtime.c segment_runtime.c -o $@ $(LDFLAGS)
 
+tests/test_segment_conformance$(EXE): tests/test_segment_conformance.c tests/segment_conformance_fixtures.c tests/segment_conformance_fixtures.h segment_runtime.c segment_runtime.h
+	$(CC) $(CFLAGS) tests/test_segment_conformance.c tests/segment_conformance_fixtures.c segment_runtime.c -o $@ $(LDFLAGS)
+
 tests/test_inkling_serve_framing$(EXE): tests/test_inkling_serve_framing.c inkling.c st.h json.h tok.h tok_unicode.h tok_unicode_o200k.h compat.h omp_tune.h route_trace.h kv_prefix.h serve_codec.h $(INK_CUDA_OBJ) $(METAL_OBJ)
 	$(CC) $(CFLAGS) $< $(INK_CUDA_OBJ) $(METAL_OBJ) -o $@ $(LDFLAGS)
 
