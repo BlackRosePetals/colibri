@@ -1905,7 +1905,7 @@ def model_arch(model):
     return resolve_model(model).descriptor.id
 
 
-def cap_for_arch(arch, cap):
+def cap_for_arch(arch, cap, env=None):
     """Cap-sentinel shim (#379): CURRENT-STATE CALIBRATION, not durable core.
 
     An absent cap (None) means different things across today's engines --
@@ -1927,6 +1927,17 @@ def cap_for_arch(arch, cap):
     -> this shim must be removed and re-derived."""
     if cap is not None:
         return cap
+    # A measured profile records the exact argv cap used during calibration.
+    # The launcher passes it privately through the server process because cap
+    # is not an engine environment knob.  It remains below an explicit --cap
+    # in the precedence chain and is removed before the engine starts.
+    if env is not None:
+        try:
+            measured = int(env.get("COLI_PROFILE_CAP", ""))
+        except (TypeError, ValueError):
+            measured = 0
+        if measured >= 1:
+            return measured
     return family_by_id(arch).limits.implicit_cap
 
 
@@ -2065,8 +2076,10 @@ class Engine:
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
+        resolved_cap = cap_for_arch(arch, cap, child_env)
+        child_env.pop("COLI_PROFILE_CAP", None)
         self.process = subprocess.Popen(
-            [str(executable), str(cap_for_arch(arch, cap))], env=child_env,
+            [str(executable), str(resolved_cap)], env=child_env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0,
         )
         # Keep the job handle on the instance: KILL_ON_JOB_CLOSE fires when the

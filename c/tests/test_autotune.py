@@ -14,6 +14,7 @@ from autotune import (
     load_profile,
     machine_fingerprint,
     parse_replay,
+    resource_candidate_steps,
     run_tune,
     save_profile,
 )
@@ -128,6 +129,56 @@ class AutotuneUnitTest(unittest.TestCase):
                                 {"COLI_NO_OMP_TUNE": "1"}, "kimi")
         self.assertFalse(any(name.startswith("omp-") for name, _ in steps))
 
+    def test_resource_candidates_only_shrink_the_safe_expert_cache(self):
+        p = plan(cores=16, gpu=False, cold=40 * (1024 ** 3))
+        p["tiers"]["ram"] = {
+            "budget_bytes": 60 * (1024 ** 3),
+            "expert_cache_bytes": 40 * (1024 ** 3),
+            "cache_slots_per_layer": 100,
+        }
+        glm = resource_candidate_steps(p, {"RAM_GB": "60.000"}, "glm", 100)
+        self.assertEqual(glm, [
+            ("cache-75", {"RAM_GB": "50.000"}, 75),
+            ("cache-50", {"RAM_GB": "40.000"}, 50),
+        ])
+        v4 = resource_candidate_steps(
+            p, {"RAM_GB": "60.000"}, "deepseek_v4", 100)
+        self.assertEqual(v4, [
+            ("ram-cache-75", {"RAM_GB": "50.000"}, 100),
+            ("ram-cache-50", {"RAM_GB": "40.000"}, 100),
+        ])
+        for arch in ("inkling", "olmoe", "qwen36"):
+            with self.subTest(arch=arch):
+                self.assertEqual(
+                    resource_candidate_steps(p, {}, arch, 100),
+                    [("cache-75", {}, 75), ("cache-50", {}, 50)],
+                )
+        # K3's current default is 8 decimal GB; candidates cannot silently
+        # grow it merely because the planner has room for more.
+        self.assertEqual(
+            resource_candidate_steps(p, {}, "kimi", 100),
+            [("k3-cache-75", {"K3_EXPERT_GB": "6.000"}, 100),
+             ("k3-cache-50", {"K3_EXPERT_GB": "4.000"}, 100)],
+        )
+
+    def test_resource_sweep_skips_resident_models_and_explicit_choices(self):
+        p = plan(cores=8, gpu=False, cold=0)
+        p["tiers"]["ram"] = {
+            "budget_bytes": 60 * (1024 ** 3),
+            "expert_cache_bytes": 40 * (1024 ** 3),
+            "cache_slots_per_layer": 100,
+        }
+        self.assertEqual(resource_candidate_steps(p, {}, "glm", 100), [])
+        p["tiers"]["disk"]["cold_expert_bytes"] = 1
+        self.assertEqual(
+            resource_candidate_steps(p, {}, "glm", 100, {"cap"}), [])
+        self.assertEqual(
+            resource_candidate_steps(p, {}, "glm", 100, {"RAM_GB"}), [])
+        self.assertEqual(
+            resource_candidate_steps(p, {}, "deepseek_v4", 100, {"RAM_GB"}), [])
+        self.assertEqual(
+            resource_candidate_steps(p, {}, "kimi", 100, {"K3_EXPERT_GB"}), [])
+
     def test_profile_round_trip_and_explicit_environment_wins(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = Path(directory) / "engine"
@@ -163,6 +214,29 @@ class AutotuneUnitTest(unittest.TestCase):
             }, directory)
             self.assertIsNone(load_profile(p, directory, str(engine), directory))
 
+    def test_profile_resource_winner_is_rechecked_against_current_ram(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = Path(directory) / "engine"
+            engine.write_bytes(b"engine")
+            p = plan(gpu=False)
+            p["tiers"]["ram"] = {
+                "budget_bytes": 64 * (1024 ** 3),
+                "expert_cache_bytes": 40_000_000_000,
+                "cache_slots_per_layer": 64,
+            }
+            fingerprint = machine_fingerprint(p, directory, str(engine))
+            save_profile({
+                "schema_version": 1, "fingerprint": fingerprint,
+                "accepted": True, "gain": 0.10,
+                "winner": {"env": {"RAM_GB": "48.000"}, "cap": 48},
+            }, directory)
+            self.assertIsNotNone(load_profile(p, directory, str(engine), directory))
+            # Available memory is not fingerprinted, so this is the admission
+            # gate that prevents yesterday's 48-slot winner on today's 32-slot plan.
+            p["tiers"]["ram"]["budget_bytes"] = 32 * (1024 ** 3)
+            p["tiers"]["ram"]["cache_slots_per_layer"] = 32
+            self.assertIsNone(load_profile(p, directory, str(engine), directory))
+
 
 class FakeServeEngine:
     """Serve-protocol stand-in for the sibling engines: deterministic greedy
@@ -173,12 +247,16 @@ class FakeServeEngine:
     drift_baseline = False     # second run of ANY env differs (nondeterminism)
     calls = 0
     sessions = []
+    cap_speeds = {}
+    cap_hits = {}
+    cap_ttft = {}
 
     def __init__(self, executable, model, cap, max_tokens, env, kv_slots,
                  family):
         FakeServeEngine.launches.append(
             {"cap": cap, "env": dict(env), "family": family})
         self.env = env
+        self.cap = cap
         self.prompts = []
         FakeServeEngine.sessions.append(self.prompts)
 
@@ -198,16 +276,23 @@ class FakeServeEngine:
         speed *= {None: 1.0, "3": 1.30, "6": 1.10,
                   "9": 1.0, "12": 0.90}.get(
                       self.env.get("V4_LOADER_LANES"), 1.0)
+        speed *= FakeServeEngine.cap_speeds.get(self.cap, 1.0)
         return {"completion_tokens": max_tokens, "tokens_per_second": speed,
-                "cache_hit_percent": 95.0, "prompt_tokens": 3}
+                "cache_hit_percent": FakeServeEngine.cap_hits.get(self.cap, 95.0),
+                "time_to_first_token": FakeServeEngine.cap_ttft.get(self.cap, 1.0),
+                "prompt_tokens": 3}
 
     def close(self):
         pass
 
     @classmethod
-    def reset(cls, drift_on=None, drift_baseline=False):
+    def reset(cls, drift_on=None, drift_baseline=False, cap_speeds=None,
+              cap_hits=None, cap_ttft=None):
         cls.launches, cls.sessions, cls.calls = [], [], 0
         cls.drift_on, cls.drift_baseline = drift_on, drift_baseline
+        cls.cap_speeds = dict(cap_speeds or {})
+        cls.cap_hits = dict(cap_hits or {})
+        cls.cap_ttft = dict(cap_ttft or {})
 
 
 class ServeTuneTest(unittest.TestCase):
@@ -272,6 +357,45 @@ class ServeTuneTest(unittest.TestCase):
         FakeServeEngine.reset(drift_baseline=True)
         with self.assertRaises(RuntimeError):
             self.run_serve_tune()
+
+    def test_faster_smaller_cache_is_measured_confirmed_and_persisted(self):
+        FakeServeEngine.reset(cap_speeds={16: 1.0, 12: 1.30, 8: 1.10})
+        p = plan(cores=8, gpu=False, cold=1 << 30)
+        p["tiers"]["ram"] = {
+            "budget_bytes": 24 * (1024 ** 3),
+            "expert_cache_bytes": 16 * (1024 ** 3),
+            "cache_slots_per_layer": 16,
+        }
+        profile, _ = self.run_serve_tune(
+            arch="inkling", plan=p,
+            base_env={"COLI_NO_OMP_TUNE": "1"},
+            repeats=2, prompts=("prompt-a", "prompt-b"),
+        )
+        self.assertTrue(profile["accepted"])
+        self.assertEqual(profile["winner"]["cap"], 12)
+        self.assertEqual(profile["winner"]["name"], "cache-75")
+        self.assertTrue(profile["validation"]["ttft_gate"])
+        self.assertEqual([launch["cap"] for launch in FakeServeEngine.launches],
+                         [16, 12, 8, 12, 16])
+
+    def test_smaller_cache_cannot_trade_away_hit_rate_or_ttft(self):
+        p = plan(cores=8, gpu=False, cold=1 << 30)
+        p["tiers"]["ram"] = {
+            "budget_bytes": 24 * (1024 ** 3),
+            "expert_cache_bytes": 16 * (1024 ** 3),
+            "cache_slots_per_layer": 16,
+        }
+        for hits, ttft in (({12: 94.0}, {}), ({}, {12: 1.30})):
+            with self.subTest(hits=hits, ttft=ttft):
+                FakeServeEngine.reset(
+                    cap_speeds={16: 1.0, 12: 1.30, 8: 1.0},
+                    cap_hits=hits, cap_ttft=ttft)
+                profile, _ = self.run_serve_tune(
+                    arch="inkling", plan=p,
+                    base_env={"COLI_NO_OMP_TUNE": "1"},
+                )
+                self.assertFalse(profile["accepted"])
+                self.assertEqual(profile["winner"]["cap"], 16)
 
 
 class AutotuneIntegrationTest(unittest.TestCase):
