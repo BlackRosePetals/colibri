@@ -402,9 +402,6 @@ endif
 GPUCC      = $(NVCC)
 GPUFLAGS   = $(NVCCFLAGS)
 GPUCC_NAME = nvcc (set CUDA_HOME or NVCC)
-# tests/mxfp4_ref.c is compiled by $(CC) with OpenMP. Its object therefore
-# needs the host OpenMP runtime when the GPU compiler performs the final link.
-GPU_OMP_LINK = -Xcompiler=-fopenmp
 # PYTHON is a HOST tool (clean/test-c/test-python run it on the build machine),
 # so key it off the host, NOT $(IS_WIN) — which is derived from the *target*
 # triple ($(CC) -dumpmachine). Otherwise a cross build (make CC=x86_64-w64-
@@ -551,7 +548,6 @@ CUDA_OBJ   = backend_cuda.o
 GPUCC      = $(HIPCC)
 GPUFLAGS   = $(HIPCCFLAGS)
 GPUCC_NAME = hipcc (set ROCM_HOME or HIPCC)
-GPU_OMP_LINK = -fopenmp
 # rocWMMA needs matrix cores (MFMA gfx908+ / WMMA gfx11xx); on these archs its
 # headers static_assert (ROCm/TheRock#1944). Compile the WMMA paths out and
 # let backend_gpu_compat.h fall back via COLI_GPU_HAS_WMMA=0. The flag must
@@ -886,8 +882,15 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# MXFP4 (fmt=7) against the CPU decoder in quant.h. The reference is built
 	# as C on purpose: quant.h uses _Thread_local, which nvcc's C++ front end
 	# rejects, and re-implementing it for the test would defeat the comparison.
-	$(CC) $(CFLAGS) -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
-	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE) $(GPU_OMP_LINK)
+	# Built WITHOUT OpenMP (#971). This is a correctness oracle over matrices of
+	# at most S=4 I=2048 O=64, so threading it buys nothing measurable, while the
+	# dependency it creates has blocked this target on two hosts: a Linux box
+	# whose libgomp is absent (undefined reference to GOMP_parallel, at this very
+	# link step) and MSVC, whose OpenMP predates C99 loop declarations in C mode.
+	# It was also the only reason the final nvcc/hipcc link here had to drag in
+	# the host OpenMP runtime, so GPU_OMP_LINK goes with it.
+	$(CC) $(CFLAGS) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
+	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
 	./mxfp4_cuda_test$(EXE)
 
 
