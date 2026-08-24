@@ -3630,7 +3630,7 @@ void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state) {
 static void *indexer_scratch_alloc(ColiDeepSeekV4Indexer *state, size_t needed) {
     if (!state) return NULL;
     if (state->scratch_cap < needed) {
-        size_t new_cap = needed < 65536 ? 65536 : needed * 2;
+        size_t new_cap = needed < 65536 ? 65536 : (needed + needed / 4);
         void *new_buf = malloc(new_cap);
         if (!new_buf) return NULL;
         free(state->scratch_buf);
