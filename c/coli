@@ -490,7 +490,7 @@ def env_for_engine(a, arch, plan=None):
         else:
             if arch == "deepseek_v4":
                 if not dsv4_cuda_available(a.model):
-                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+                    sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
             elif not cuda_binary():
                 sys.exit(f"{C.yel}--gpu needs the CUDA build:{C.r} the engine binary is CPU-only")
             env["COLI_CUDA"] = "1"
@@ -500,7 +500,7 @@ def env_for_engine(a, arch, plan=None):
     if vram and gpu != "none":
         if arch == "deepseek_v4":
             if not dsv4_cuda_available(a.model):
-                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} build coli_cuda_dsv4.dll (make cuda-dsv4-dll)")
+                sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} {dsv4_cuda_build_hint()}")
         elif not cuda_binary():
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
@@ -543,11 +543,27 @@ def env_for_engine(a, arch, plan=None):
     return env
 
 def dsv4_cuda_available(model=None):
-    if sys.platform != "win32":
-        return False
+    # Windows loads the tier as a runtime DLL next to the engine; Linux links
+    # it straight into the binary (nvcc, -lcudart), so the DLL check there
+    # rejected every valid `make deepseek-v4 CUDA=1` build (#1219). Detect the
+    # Linux build the same way cuda_binary() detects GLM's: a dynamic libcudart
+    # (or libamdhip64) entry in the binary's link table.
     eng = engine_for(model) if model else GLM
-    dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
-    return os.path.exists(dll)
+    if sys.platform == "win32":
+        dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
+        return os.path.exists(dll)
+    if sys.platform == "linux" and os.path.exists(eng):
+        try:
+            linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
+            return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
+                       for line in linked.stdout.splitlines())
+        except Exception:
+            return False
+    return False
+
+def dsv4_cuda_build_hint():
+    return ("build coli_cuda_dsv4.dll (make cuda-dsv4-dll)" if sys.platform == "win32"
+            else "make deepseek-v4 CUDA=1 (this binary is CPU-only)")
 
 def need_worker_model(model):
     require_model(model, file="config.json")
