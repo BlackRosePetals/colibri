@@ -3807,9 +3807,8 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (max_count > state->count)
         return set_error(error, error_size, "indexer batch counts exceed cache");
 
-    if (state->in_use)
+    if (__atomic_test_and_set(&state->in_use, __ATOMIC_ACQUIRE))
         return set_error(error, error_size, "concurrent indexer batch selection on single instance");
-    state->in_use = 1;
 
     static int prof = -1;
     if (prof < 0) prof = getenv("DSV4_ATTN_PROF") != NULL;
@@ -3819,7 +3818,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (prof) clock_gettime(CLOCK_MONOTONIC, &ts_prev);
     ColiTensorView wq;
     if (fp8_view(&wq, state->weights, "attn.indexer.wq_b")) {
-        state->in_use = 0;
+        __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
         return set_error(error, error_size, "missing indexer query weight");
     }
     const uint16_t *raw_weights = value(
@@ -3850,7 +3849,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 
     char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
     if (!scratch_ptr || !raw_weights) {
-        state->in_use = 0;
+        __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
         return set_error(error, error_size, "out of memory scoring indexer batch");
     }
 
@@ -4029,7 +4028,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 gpu_scored ? "" : " (cpu-score)");
 #undef IDX_PROF_MARK
-    state->in_use = 0;
+    __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
     return result;
 }
 
