@@ -1160,6 +1160,12 @@ tests/test_olmoe_matmul_q$(EXE): tests/test_olmoe_matmul_q.c olmoe.c st.h json.h
 tests/test_olmoe_serve_framing$(EXE): tests/test_olmoe_serve_framing.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
+tests/test_olmoe_cache_index$(EXE): tests/test_olmoe_cache_index.c olmoe.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen36_cache_index$(EXE): tests/test_qwen36_cache_index.c qwen36.c st.h json.h compat.h sample.h tok.h tok_unicode.h tok_unicode_o200k.h omp_tune.h route_trace.h serve_codec.h qwen36_tier.h $(QWEN36_TIER_SRC) $(CUDA_OBJ)
+	$(CC) $(QWEN36_CFLAGS) $< $(QWEN36_TIER_SRC) $(CUDA_OBJ) -o $@ $(QWEN36_LDFLAGS)
+
 tests/test_idot$(EXE): tests/test_idot.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
@@ -1366,6 +1372,9 @@ tests/test_cap_mixed_width$(EXE): tests/test_cap_mixed_width.c colibri.c st.h ur
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_eslot_inflight$(EXE): tests/test_eslot_inflight.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_glm_cache_index$(EXE): tests/test_glm_cache_index.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h route_trace.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_ssd_probe$(EXE): tests/test_ssd_probe.c colibri.c st.h uring.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h quant.h sample.h kv_persist.h telemetry.h
