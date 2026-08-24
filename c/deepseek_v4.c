@@ -10382,16 +10382,120 @@ int coli_v4_route_bf16(float *weights, int *indices, const float *hidden,
  * it when the prefill loop finishes; the next large prefill re-creates and
  * re-fills it (per-layer refill cost only, on prompts that already run tens
  * of seconds). */
+#include "deepseek_v4_bank_pair.h"
+
 static Dsv4CudaExpertSet *v4_moe_bank;
 static int v4_moe_bank_layer = -1;
 static int v4_moe_bank_hash_layer = -1;
 static unsigned char v4_moe_bank_valid[256];
 static int v4_moe_bank_failed;
 
+/* ---- double-buffered bank (COLI_CUDA_MOE_DOUBLE=1, opt-in) ----
+ * While the compute stream chews layer L from the active bank, a worker
+ * thread loads layer L+1's complete expert set into the second bank over the
+ * aux stream — the transfer starts before L+1's routing is known. On the
+ * layer switch the banks swap; the per-expert valid map travels with the
+ * swap, so a PARTIAL prefetch is still profit (the route-aware refill tops
+ * up only the holes). Every failure path — second-bank allocation, an aux
+ * upload API that an older Windows DLL does not export, a fully failed
+ * layer — degrades to today's single-bank behaviour and says so once.
+ * The worker holds at most ONE store lease at a time (the expert cache's
+ * pin slots are bounded), and layer L+1's lookups live in L+1's own store
+ * partition, so the prefetch does not evict the computing layer. */
+static Dsv4CudaExpertSet *v4_moe_bank2;
+static int v4_bank2_layer = -1;      /* prefetched layer; read only post-join */
+static unsigned char v4_bank2_valid[256];
+static pthread_t v4_bank2_thread;
+static int v4_bank2_running;
+static int v4_bank2_disabled;
+static unsigned long long v4_bank2_swaps, v4_bank2_prefetched;
+static struct { ColiExpertStore *store; int layer; } v4_bank2_job;
+
+static int v4_bank_double_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *setting = getenv("COLI_CUDA_MOE_DOUBLE");
+        on = setting && atoi(setting) != 0;
+    }
+    return on;
+}
+
+static void *v4_bank2_worker(void *argument) {
+    (void)argument;
+    ColiExpertStore *store = v4_bank2_job.store;
+    int layer = v4_bank2_job.layer;
+    memset(v4_bank2_valid, 0, sizeof(v4_bank2_valid));
+    int loaded = 0;
+    for (int expert = 0; expert < 256; expert++) {
+        ColiExpertView view;
+        memset(&view, 0, sizeof(view));
+        if (coli_expert_lookup(store, (ColiExpertKey){layer, expert},
+                               &view) != 0)
+            continue;
+        Dsv4CudaTensor *bg = NULL, *bu = NULL, *bd = NULL;
+        int uploaded =
+            view.gate.data && view.gate.scales && view.gate.block_rows == 1 &&
+            view.up.data && view.up.scales && view.up.block_rows == 1 &&
+            view.down.data && view.down.scales && view.down.block_rows == 1 &&
+            view.gate.rows == 2048 && view.gate.columns == 4096 &&
+            view.up.rows == 2048 && view.up.columns == 4096 &&
+            view.down.rows == 4096 && view.down.columns == 2048 &&
+            dsv4_cuda_expert_bank_upload_aux(
+                v4_moe_bank2, expert,
+                (const uint8_t *)view.gate.data,
+                (const uint8_t *)view.gate.scales,
+                (const uint8_t *)view.up.data,
+                (const uint8_t *)view.up.scales,
+                (const uint8_t *)view.down.data,
+                (const uint8_t *)view.down.scales,
+                &bg, &bu, &bd);
+        coli_expert_release(store, &view);
+        if (bg) dsv4_cuda_tensor_free(bg);
+        if (bu) dsv4_cuda_tensor_free(bu);
+        if (bd) dsv4_cuda_tensor_free(bd);
+        if (uploaded) { v4_bank2_valid[expert] = 1; loaded++; }
+        else if (!loaded)
+            /* First attempted upload failed with nothing loaded yet: the
+             * aux path is structurally unavailable (older Windows DLL, or
+             * geometry off) — stop before reading the whole layer for
+             * nothing. Failures AFTER a success keep going: partial banks
+             * are profit. */
+            break;
+    }
+    v4_bank2_prefetched += (unsigned long long)loaded;
+    v4_bank2_layer = loaded ? layer : -1;
+    return NULL;
+}
+
+static void v4_bank2_join(void) {
+    if (!v4_bank2_running) return;
+    pthread_join(v4_bank2_thread, NULL);
+    v4_bank2_running = 0;
+    if (v4_bank2_layer < 0 && !v4_bank2_disabled) {
+        /* A fully failed layer (aux upload unavailable, e.g. an older Windows DLL,
+         * or the store refusing every lookup) will fail every layer: stop
+         * paying for workers and stay single-bank. */
+        v4_bank2_disabled = 1;
+        fprintf(stderr, "v4_gpu moe-double=off (prefetch produced nothing; "
+                        "single-bank stays)\n");
+    }
+}
+
 void coli_v4_gpu_moe_batch_release(void) {
     /* A create failure is retried after every release: the freed VRAM is
      * exactly what the next attempt needs. */
     v4_moe_bank_failed = 0;
+    v4_bank2_join();
+    if (v4_bank2_swaps || v4_bank2_prefetched)
+        fprintf(stderr, "v4_gpu moe-double swaps=%llu prefetched=%llu\n",
+                v4_bank2_swaps, v4_bank2_prefetched);
+    v4_bank2_swaps = 0;
+    v4_bank2_prefetched = 0;
+    v4_bank2_layer = -1;
+    if (v4_moe_bank2) {
+        dsv4_cuda_expert_set_free(v4_moe_bank2);
+        v4_moe_bank2 = NULL;
+    }
     if (!v4_moe_bank) return;
     dsv4_cuda_expert_set_free(v4_moe_bank);
     v4_moe_bank = NULL;
@@ -10465,9 +10569,51 @@ int coli_v4_gpu_moe_batch_union(float *outputs,
      * re-reads the same experts several times per layer under prefill's
      * expert-major sweeps (measured ~4-6x the layer's expert bytes). */
     if (bank_layer != weights->plan.layer) {
+        v4_bank2_join();
+        int double_on = v4_bank_double_on() && !v4_bank2_disabled;
+        if (coli_v4_bank_pair_decide(double_on, v4_bank2_layer,
+                                     weights->plan.layer) == V4_BANK_SWAP) {
+            /* The prefetched bank becomes the active one; its valid map
+             * travels with the swap, so a partial prefetch is topped up by
+             * the route-aware refill below instead of thrown away. */
+            Dsv4CudaExpertSet *spare = bank;
+            bank = v4_moe_bank2;
+            v4_moe_bank2 = spare;
+            memcpy(bank_valid, v4_bank2_valid, sizeof(v4_moe_bank_valid));
+            v4_bank2_swaps++;
+        } else {
+            memset(bank_valid, 0, sizeof(bank_valid));
+        }
+        v4_bank2_layer = -1;
         if (!dsv4_cuda_expert_bank_set_shared(bank, sg, su, sd)) return -1;
-        memset(bank_valid, 0, sizeof(bank_valid));
         bank_layer = weights->plan.layer;
+        if (double_on) {
+            int next = coli_v4_bank_pair_prefetch_target(
+                1, bank_layer, config->num_hidden_layers);
+            if (next >= 0) {
+                if (!v4_moe_bank2) {
+                    v4_moe_bank2 = dsv4_cuda_expert_bank_create(
+                        256, 4096, 2048, device, sg, su, sd);
+                    if (!v4_moe_bank2) {
+                        /* Not enough VRAM for two full banks: stay on the
+                         * proven single-bank path, permanently and loudly. */
+                        v4_bank2_disabled = 1;
+                        fprintf(stderr,
+                                "v4_gpu moe-double=off (second bank "
+                                "allocation failed; single-bank stays)\n");
+                    } else {
+                        fprintf(stderr, "v4_gpu moe-double=on\n");
+                    }
+                }
+                if (v4_moe_bank2) {
+                    v4_bank2_job.store = store;
+                    v4_bank2_job.layer = next;
+                    if (pthread_create(&v4_bank2_thread, NULL,
+                                       v4_bank2_worker, NULL) == 0)
+                        v4_bank2_running = 1;
+                }
+            }
+        }
     }
     long long elements = (long long)batch * config->hidden_size;
     if (!in_mirror) {
