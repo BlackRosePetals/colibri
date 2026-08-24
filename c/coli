@@ -71,6 +71,11 @@ except ModuleNotFoundError:
 from family_registry import (FamilyConfigError, UnknownFamilyError, all_families,
                              family_by_id, resolve_model, tuning_replay_prompt)
 
+_TUNE_ROTATION_PROMPT = (
+    "A service has high median throughput but poor tail latency. Explain how "
+    "you would distinguish a CPU, memory, and storage bottleneck."
+)
+
 # Run-in-place (source checkout, "cd c && ./coli ..."): the engine, the
 # support modules (resource_plan.py, doctor.py, autotune.py, openai_server.py) and
 # tools/ all live next to this script — unchanged from before.
@@ -363,9 +368,10 @@ def ngen_for(a, interactive=False, family=None):
         return limits.interactive_max_output if interactive else limits.default_max_output
     return 16384 if interactive else 1024
 
-def env_for_engine(a, arch):
+def env_for_engine(a, arch, plan=None):
     if arch == "glm":
         return env_for(a)
+    explicit_env = set(os.environ)
     env = os.environ.copy()
     # OMP_NUM_THREADS for the sister engines that do not size their own team.
     #
@@ -461,6 +467,40 @@ def env_for_engine(a, arch):
             sys.exit(f"{C.yel}--vram needs the CUDA build:{C.r} the engine binary is CPU-only")
         env["COLI_CUDA"] = "1"
         env["CUDA_EXPERT_GB"] = str(vram)
+    if getattr(a, "auto_tier", False):
+        # GLM has historically applied both the resource plan and its measured
+        # profile inside env_for().  The sibling launcher returned above that
+        # code path, so #1196 could measure and save a perfectly valid Kimi,
+        # Inkling, OLMoE, Qwen or V4 profile that chat/serve never loaded.
+        from resource_plan import build_plan, environment_for_plan
+        if plan is None:
+            ram,ctx,devices,vram=resource_request(a,env)
+            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                            kv_slots=requested_kv_slots(a,env))
+        # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
+        # selects a capable build above. Merely asking for auto-tier must not
+        # turn a CPU-only sibling binary into an attempted CUDA launch.
+        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
+                                  and (arch == "deepseek_v4"
+                                       or env.get("COLI_NO_OMP_TUNE")))
+        env=environment_for_plan(plan,env,
+                                 cuda_enabled=env.get("COLI_CUDA") == "1")
+        if plan_must_not_choose_omp:
+            # environment_for_plan supplies the physical-core default used by
+            # the other engines. V4 deliberately computes logical CPUs minus
+            # its loader reservation at startup; COLI_NO_OMP_TUNE likewise
+            # promises no automatic team. Keep those baselines unless a
+            # measured profile (V4 only, below) or the user explicitly chooses
+            # a team.
+            env.pop("OMP_NUM_THREADS",None)
+        if not getattr(a, "no_tune_profile", False):
+            from autotune import apply_profile, load_profile
+            profile=load_profile(plan,a.model,engine_for(a.model))
+            if profile:
+                env=apply_profile(env,profile,explicit_env)
+                gain=100.0*profile["gain"]
+                print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% "
+                      f"calibration throughput{C.r}",file=sys.stderr)
     return env
 
 def dsv4_cuda_available(model=None):
@@ -619,7 +659,17 @@ def env_for(a):
                 print(f"  {C.dim}[TUNE] applied measured profile · +{gain:.1f}% calibration throughput{C.r}",
                       file=sys.stderr)
         rt=plan["tiers"]["ram"]; vt=plan["tiers"]["vram"]
-        gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}" if has_cuda and vt["devices"] else " · CPU"
+        # The plan label used to derive the backend from CUDA alone, so on
+        # Apple Silicon it printed " · CPU" even when the calibration child
+        # processes ran on Metal (COLI_METAL is inherited through env_for and
+        # environment_for_plan, so the measurements are real). Report the
+        # active backend: CUDA VRAM first, then Metal, then CPU.
+        if has_cuda and vt["devices"]:
+            gpu=f" · VRAM {format_bytes(vt['budget_bytes'])}"
+        elif str(e.get("COLI_METAL","")).strip() not in ("","0"):
+            gpu=" · Metal (unified memory)"
+        else:
+            gpu=" · CPU"
         print(f"  {C.dim}[PLAN] RAM {format_bytes(rt['budget_bytes'])} · cap {rt['cache_slots_per_layer']}/layer{gpu}{C.r}",file=sys.stderr)
     else:
         # Windows: a bare `coli chat` (no --gpu/--vram/--auto-tier) used to ALWAYS
@@ -1005,19 +1055,32 @@ def cmd_tune(a):
         sys.exit(f"{family.display_name}: gateway adapter is not wired")
     engine=engine_for(a.model)
     need_model(a.model,engine)
-    base_env=env_for_engine(a,arch) if arch!="glm" else env_for(a)
-    # The replay prompt has to be the engine's own template: GLM's [gMASK]<sop>
-    # markers are ordinary text to every other tokenizer, so the sweep would have
-    # measured a different workload than the one users run.
-    prompt=tuning_replay_prompt(family,a.prompt)
+    base_env=(env_for_engine(a,arch,plan=plan) if arch!="glm" else env_for(a))
+    # Prompts have to use the engine's own template: GLM's [gMASK]<sop>
+    # markers are ordinary text to every other tokenizer. Sibling engines keep
+    # one serve process alive per candidate and alternate these prompts; this
+    # preserves their real expert-cache state without training it on one exact
+    # request. GLM retains its stronger fixed-token replay protocol.
+    raw_prompts=[a.prompt,*(a.rotate_prompt or [_TUNE_ROTATION_PROMPT])]
+    if len(set(raw_prompts)) < 2:
+        sys.exit(f"{C.yel}tuning rotation needs at least two distinct prompts{C.r}")
+    prompts=[tuning_replay_prompt(family,item) for item in raw_prompts]
+    prompt=prompts[0]
     banner("tune · measured execution profile", model=a.model)
-    print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
+    if arch=="glm":
+        print(f"  fixed replay: {a.tokens} tokens · {a.repeats} run(s) per candidate")
+    else:
+        active=min(a.repeats,len(prompts))
+        print(f"  persistent rotation: {a.tokens} tokens · {a.repeats} request(s) "
+              f"per candidate · {active} distinct prompt(s)")
     print("  only quality-preserving scheduling knobs are eligible\n")
     try:
         profile,path=run_tune(
-            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,tokens=a.tokens,
+            engine,a.cap,base_env,plan,a.model,prompt,arch=arch,family=family,
+            tokens=a.tokens,
             repeats=a.repeats,timeout=a.timeout,min_gain=a.min_gain,
             profile_dir=a.profile_dir,
+            prompts=prompts,
             progress=lambda message: print(f"  {C.dim}· {message}{C.r}",flush=True),
         )
     except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
@@ -1305,7 +1368,13 @@ def cmd_chat(a):
     p=subprocess.Popen([GLM,str(a.cap if a.cap is not None else 0)], env=e, stdin=subprocess.PIPE,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     sp=Spinner("waking the giant (744B)…"); sp.start()
-    st=stream_turn(p, READY, lambda b: None)
+    # Keep the pre-READY stdout preamble instead of discarding it: the engine's
+    # "loaded in Xs | resident dense: Y MB" line is a printf, i.e. STDOUT
+    # (colibri.c:9595 — same in inkling.c/olmoe.c), so it arrives HERE and never
+    # in errlog. The ready-line regex below used to scan stderr for it and could
+    # never match. A few hundred bytes of banner; nothing else reads them.
+    _preamble=bytearray()
+    st=stream_turn(p, READY, _preamble.extend)
     sp.stop()
     if st is None:
         try: errlog.write(p.stderr.read().decode("utf-8","replace"))
@@ -1321,7 +1390,16 @@ def cmd_chat(a):
     # of load-time status ([RAM_GB], [MTP], ...) that were already emitted.
     _drain_box={"done":False}
     def _drain():
-        try: errlog.write(p.stderr.read().decode("utf-8","replace"))
+        # readline(), NOT read(): read() returns only at EOF, and the engine is alive
+        # on stdin, so it never returned and errlog.write() below it never ran — the
+        # bounded wait always timed out on an EMPTY file and the whole status block
+        # (including "ready in Xs") silently displayed nothing. Per-line write+flush
+        # makes each status line visible to the reader below as soon as it arrives.
+        try:
+            while True:
+                raw=p.stderr.readline()
+                if not raw: break
+                errlog.write(raw.decode("utf-8","replace")); errlog.flush()
         except (OSError, ValueError): pass
         _drain_box["done"]=True
     threading.Thread(target=_drain, daemon=True).start()
@@ -1330,12 +1408,17 @@ def cmd_chat(a):
         if _drain_box["done"]: break
         time.sleep(0.05)
     errlog.flush()
+    mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB",
+                    _preamble.decode("utf-8","replace"))
+    if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
     try:
         elog=open(errlog.name).read()
-        mload=re.search(r"loaded in ([0-9.]+)s \| resident dense: ([0-9.]+) MB", elog)
-        if mload: print(f"  {C.grn}✓{C.r} ready in {mload.group(1)}s {C.dim}· resident {float(mload.group(2))/1000:.1f} GB · RSS {st.get('rss','?')} GB{C.r}")
         for l in elog.splitlines():                     # una riga di stato per riga, senza path
-            if l.startswith(("[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
+            # [METAL]/[CUDA] first: the splash tagline (model_banner_line) names the
+            # checkpoint, not the backend — this engine line is the only confirmation
+            # the GPU tier actually engaged (it can still fall back per-block). The
+            # engine prints it to stderr, we drain it into errlog; keep it whitelisted.
+            if l.startswith(("[METAL]","[CUDA]","[RAM_GB","[PIN]","[MTP]","[USAGE]","[DSA]","[KV]")):
                 l=re.sub(r" ?\(?/[^ )]+\)?","",l.strip())       # via i percorsi lunghi
                 l=re.sub(r" from$","",l)
                 for chunk in textwrap.wrap(l, term_w()-4) or [l]:
@@ -1642,7 +1725,7 @@ def project_python():
 
 def cmd_bench(a):
     need_model(a.model)
-    banner("bench")
+    banner("bench", model=a.model)
     # python con `tokenizers`: l'ambiente del progetto se c'e', altrimenti quello corrente
     py = project_python()
     tasks = ",".join(a.tasks) if a.tasks else "hellaswag,arc_challenge,mmlu"
@@ -1766,8 +1849,11 @@ def main():
                       description="measure and save the fastest quality-preserving execution profile",
                       help="measure and save the fastest quality-preserving execution profile")
     pt.add_argument("--prompt",default="Explain why fixed-token replay makes a benchmark reproducible.")
+    pt.add_argument("--rotate-prompt",action="append",default=None,
+                    help="additional persistent-workload prompt; repeat for a custom rotation")
     pt.add_argument("--tokens",type=int,default=16,help="calibration continuation length")
-    pt.add_argument("--repeats",type=int,choices=range(1,6),default=2)
+    pt.add_argument("--repeats",type=int,choices=range(1,6),default=2,
+                    help="requests per candidate (one persistent engine on non-GLM)")
     pt.add_argument("--timeout",type=int,default=900,help="seconds allowed for each engine run")
     pt.add_argument("--min-gain",type=float,default=0.03,
                     help="minimum fractional throughput gain required to accept a candidate")

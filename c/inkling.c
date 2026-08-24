@@ -39,6 +39,7 @@
 #include "omp_tune.h"
 #include "route_trace.h"
 #include "kv_prefix.h"                          /* KV prefix reuse (shared) */                          /* shared routing telemetry (#700) */
+#include "serve_codec.h"
 #ifdef COLI_CUDA
 #include "backend_cuda_ink.h"
 static int g_cuda = 0;
@@ -123,7 +124,11 @@ typedef struct {
     int8_t *q13, *q2;                     /* bits>0: runtime-quantized int8 */
     float *f13, *f2;                      /* bits==0: raw f32 (oracle) */
 } Slot;
-typedef struct { Slot *slots; int n, cap; } LCache;
+typedef struct {
+    Slot *slots;
+    int *slot_by_expert;                  /* expert id -> local slot, -1 if absent */
+    int n, cap;
+} LCache;
 
 typedef struct {
     Cfg c;
@@ -207,16 +212,73 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
         #pragma omp parallel for schedule(static)
         for (int o = 0; o < O; o++) {
             const uint16_t *w = W + (int64_t)o * I;
-            for (int s = 0; s < S; s++) {
-                const uint16_t *xs = xh + (int64_t)s * I;
+            int s = 0;
+            for (; s + 3 < S; s += 4) {
+                const uint16_t *x0 = xh + (int64_t)(s+0)*I;
+                const uint16_t *x1 = xh + (int64_t)(s+1)*I;
+                const uint16_t *x2 = xh + (int64_t)(s+2)*I;
+                const uint16_t *x3 = xh + (int64_t)(s+3)*I;
+                __m512 a0 = _mm512_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+                for (int i = 0; i < I; i += 32) {
+                    __m512bh wb = (__m512bh)_mm512_loadu_si512(w + i);
+                    a0 = _mm512_dpbf16_ps(a0, (__m512bh)_mm512_loadu_si512(x0 + i), wb);
+                    a1 = _mm512_dpbf16_ps(a1, (__m512bh)_mm512_loadu_si512(x1 + i), wb);
+                    a2 = _mm512_dpbf16_ps(a2, (__m512bh)_mm512_loadu_si512(x2 + i), wb);
+                    a3 = _mm512_dpbf16_ps(a3, (__m512bh)_mm512_loadu_si512(x3 + i), wb);
+                }
+                y[(int64_t)(s+0)*O + o] = _mm512_reduce_add_ps(a0);
+                y[(int64_t)(s+1)*O + o] = _mm512_reduce_add_ps(a1);
+                y[(int64_t)(s+2)*O + o] = _mm512_reduce_add_ps(a2);
+                y[(int64_t)(s+3)*O + o] = _mm512_reduce_add_ps(a3);
+            }
+            for (; s < S; s++) {
+                const uint16_t *xs = xh + (int64_t)s*I;
                 __m512 acc = _mm512_setzero_ps();
                 for (int i = 0; i < I; i += 32)
                     acc = _mm512_dpbf16_ps(acc, (__m512bh)_mm512_loadu_si512(xs + i),
                                                 (__m512bh)_mm512_loadu_si512(w + i));
-                y[(int64_t)s * O + o] = _mm512_reduce_add_ps(acc);
+                y[(int64_t)s*O + o] = _mm512_reduce_add_ps(acc);
             }
         }
         free(xh);
+        return;
+    }
+#endif
+    /* Prefill tile: decode each bf16 weight once for four independent rows.
+     * Explicit mul+add (rather than a C expression that the compiler may fuse)
+     * matches the non-FMA scalar oracle bit for bit.  Every SIMD lane still
+     * accumulates i=0..I-1 in the original order. */
+#if defined(__AVX2__)
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint16_t *w = W + (int64_t)o * I;
+            int s = 0;
+            for (; s + 3 < S; s += 4) {
+                const float *x0 = x + (int64_t)(s+0)*I;
+                const float *x1 = x + (int64_t)(s+1)*I;
+                const float *x2 = x + (int64_t)(s+2)*I;
+                const float *x3 = x + (int64_t)(s+3)*I;
+                __m128 acc = _mm_setzero_ps();
+                for (int i = 0; i < I; i++) {
+                    union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
+                    __m128 xv = _mm_set_ps(x3[i], x2[i], x1[i], x0[i]);
+                    acc = _mm_add_ps(acc, _mm_mul_ps(xv, _mm_set1_ps(v.f)));
+                }
+                float a[4]; _mm_storeu_ps(a, acc);
+                y[(int64_t)(s+0)*O + o] = a[0]; y[(int64_t)(s+1)*O + o] = a[1];
+                y[(int64_t)(s+2)*O + o] = a[2]; y[(int64_t)(s+3)*O + o] = a[3];
+            }
+            for (; s < S; s++) {
+                const float *xs = x + (int64_t)s * I;
+                float acc = 0.f;
+                for (int i = 0; i < I; i++) {
+                    union { uint32_t u; float f; } v = { (uint32_t)w[i] << 16 };
+                    acc += xs[i] * v.f;
+                }
+                y[(int64_t)s * O + o] = acc;
+            }
+        }
         return;
     }
 #endif
@@ -240,16 +302,71 @@ static void matmul_h(float *y, const float *x, const uint16_t *W, int S, int I, 
  * una scala f32 ogni `gs` elementi lungo I (ng = ceil(I/gs) scale per riga).
  * Differenza da matmul_q4 (per-riga): la scala cambia DENTRO la riga, quindi
  * l'accumulo va chiuso a ogni gruppo invece che una volta sola a fine riga. */
+#if defined(__AVX2__) && defined(__FMA__)
+static inline float matmul_i4g_row_fma(const float *xs, const uint8_t *w,
+                                       const float *sc, int I, int gs, int ng) {
+    __m128 acc = _mm_setzero_ps();
+    for (int g = 0; g < ng; g++) {
+        int i0 = g*gs, i1 = i0+gs; if (i1 > I) i1 = I;
+        __m128 part = _mm_setzero_ps();
+        for (int i = i0; i < i1; i++) {
+            uint8_t b = w[i >> 1]; int q = (i & 1) ? (b >> 4) : (b & 15);
+            part = _mm_fmadd_ss(_mm_set_ss(xs[i]), _mm_set_ss((float)(q-8)), part);
+        }
+        acc = _mm_add_ss(acc, _mm_mul_ss(part, _mm_set_ss(sc[g])));
+    }
+    return _mm_cvtss_f32(acc);
+}
+#endif
 static void matmul_i4g(float *y, const float *x, const uint8_t *p, const float *scale,
                        int S, int I, int O, int gs) {
     int ng = (I + gs - 1) / gs;
     int64_t rb = (I + 1) / 2;
+#if defined(__AVX2__) && defined(__FMA__)
+    /* Four prompt rows share nibble unpack and scale loads.  The explicit FMA
+     * for each lane and the group-boundary mul+add match the scalar kernel's
+     * generated operation order bit for bit. */
+    if (S > 1) {
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; o++) {
+            const uint8_t *w = p + (int64_t)o * rb;
+            const float *sc = scale + (int64_t)o * ng;
+            int s = 0;
+            for (; s + 3 < S; s += 4) {
+                const float *x0 = x + (int64_t)(s+0)*I, *x1 = x + (int64_t)(s+1)*I;
+                const float *x2 = x + (int64_t)(s+2)*I, *x3 = x + (int64_t)(s+3)*I;
+                __m128 acc = _mm_setzero_ps();
+                for (int g = 0; g < ng; g++) {
+                    int i0 = g*gs, i1 = i0+gs; if (i1 > I) i1 = I;
+                    __m128 part = _mm_setzero_ps();
+                    for (int i = i0; i < i1; i++) {
+                        uint8_t b = w[i >> 1]; int q = (i & 1) ? (b >> 4) : (b & 15);
+                        __m128 xv = _mm_set_ps(x3[i], x2[i], x1[i], x0[i]);
+                        part = _mm_fmadd_ps(xv, _mm_set1_ps((float)(q-8)), part);
+                    }
+                    acc = _mm_add_ps(acc, _mm_mul_ps(part, _mm_set1_ps(sc[g])));
+                }
+                float a[4]; _mm_storeu_ps(a, acc);
+                y[(int64_t)(s+0)*O + o] = a[0]; y[(int64_t)(s+1)*O + o] = a[1];
+                y[(int64_t)(s+2)*O + o] = a[2]; y[(int64_t)(s+3)*O + o] = a[3];
+            }
+            for (; s < S; s++) {
+                const float *xs = x + (int64_t)s*I;
+                y[(int64_t)s*O + o] = matmul_i4g_row_fma(xs, w, sc, I, gs, ng);
+            }
+        }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const uint8_t *w = p + (int64_t)o * rb;
         const float *sc = scale + (int64_t)o * ng;
         for (int s = 0; s < S; s++) {
             const float *xs = x + (int64_t)s * I;
+#if defined(__AVX2__) && defined(__FMA__)
+            y[(int64_t)s * O + o] = matmul_i4g_row_fma(xs, w, sc, I, gs, ng);
+#else
             float acc = 0.f;
             for (int g = 0; g < ng; g++) {
                 int i0 = g * gs, i1 = i0 + gs; if (i1 > I) i1 = I;
@@ -262,6 +379,7 @@ static void matmul_i4g(float *y, const float *x, const uint8_t *p, const float *
                 acc += part * sc[g];               /* scala chiusa per gruppo */
             }
             y[(int64_t)s * O + o] = acc;
+#endif
         }
     }
 }
@@ -280,7 +398,13 @@ static void matmul_i8r(float *y, const float *x, const int8_t *q, const float *s
     }
 }
 
+#ifdef COLI_INKLING_SHARED_BATCH_TEST
+static uint64_t g_matmul_w_calls;
+#endif
 static void matmul_w(float *y, const float *x, Wt W, int S, int I, int O) {
+#ifdef COLI_INKLING_SHARED_BATCH_TEST
+    g_matmul_w_calls++;
+#endif
 #ifdef COLI_CUDA
     if (W.dev) {
         if (ink_cuda_matmul_bf16(y, x, W.dev, S, I, O) == 0) return;
@@ -918,7 +1042,16 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
                 cap, (double)cap*slotb*nsp/1e9);
     }
     m->cache = calloc(c->n_layers, sizeof(LCache));
-    for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
+    for (int i = 0; i < c->n_layers; i++) {
+        LCache *lc = &m->cache[i];
+        lc->cap = cap;
+        lc->slots = calloc(cap, sizeof(Slot));
+        if (c->sparse[i]) {
+            lc->slot_by_expert = malloc((size_t)E * sizeof(int));
+            if (!lc->slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
+            for (int e = 0; e < E; e++) lc->slot_by_expert[e] = -1;
+        }
+    }
     /* container mode: slot storage is one page-aligned slab per sparse layer
      * (weights) plus one for the row scales, with every slot's pointers carved
      * out up front. Slots then recycle their region on eviction — no per-slot
@@ -976,18 +1109,35 @@ static double mem_avail_bytes(void) {
 }
 
 /* ---------- routed-expert slots: serial bookkeeping, parallel fills ---------- */
-static Slot *slot_find(Model *m, int layer, int eid) {
+#ifdef COLI_CACHE_INDEX_TEST
+static uint64_t g_slot_index_probes;
+#define SLOT_INDEX_PROBE() (g_slot_index_probes++)
+#else
+#define SLOT_INDEX_PROBE() ((void)0)
+#endif
+/* Cache identity is mutated only by slot_acquire(), which keeps this index in
+ * lockstep with the slot. Fills change bytes/filled but never identity. The
+ * validation makes a stale/corrupt entry a miss instead of serving another
+ * expert's weights; production slot_find then touches the LRU clock. */
+static Slot *slot_indexed(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer];
-    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) {
-        lc->slots[i].used = ++m->clock;
-        return &lc->slots[i];
-    }
-    return NULL;
+    if (eid < 0 || eid >= m->c.n_experts || !lc->slot_by_expert) return NULL;
+    SLOT_INDEX_PROBE();
+    int i = lc->slot_by_expert[eid];
+    if (i < 0 || i >= lc->n || lc->slots[i].eid != eid) return NULL;
+    return &lc->slots[i];
+}
+static Slot *slot_find(Model *m, int layer, int eid) {
+    Slot *s = slot_indexed(m, layer, eid);
+    if (s) s->used = ++m->clock;
+    return s;
 }
 
 /* allocate a slot (or evict the LRU non-pinned one); serial callers only */
 static Slot *slot_acquire(Model *m, int layer, int eid) {
     LCache *lc = &m->cache[layer]; Cfg *c = &m->c;
+    if (eid < 0 || eid >= c->n_experts || !lc->slot_by_expert) {
+        fprintf(stderr,"layer %d: invalid expert id %d for cache index\n",layer,eid); exit(1); }
     int64_t D = c->hidden, I = c->moe_inter, n13 = 2*I*D, n2 = D*I;
     Slot *s;
     if (lc->n < lc->cap) {
@@ -1004,7 +1154,12 @@ static Slot *slot_acquire(Model *m, int layer, int eid) {
         if (lru < 0) { fprintf(stderr, "layer %d: cache cap %d entirely pinned\n", layer, lc->cap); exit(1); }
         s = &lc->slots[lru];
     }
+    int si = (int)(s - lc->slots);
+    if (s->eid >= 0 && s->eid < c->n_experts &&
+        lc->slot_by_expert[s->eid] == si)
+        lc->slot_by_expert[s->eid] = -1;
     s->eid = eid; s->used = ++m->clock; s->filled = 0; s->pinned = 0;
+    lc->slot_by_expert[eid] = si;
     return s;
 }
 
@@ -1077,8 +1232,7 @@ static void pins_load(Model *m, const char *snap) {
         for (int r = 0; r < m->npin; r++) {                /* top-N selection */
             int best = -1; uint32_t bv = 0;
             for (int e = 0; e < E; e++) {
-                int taken = 0;
-                for (int z = 0; z < r; z++) if (ps[np-r+z]->eid == e) { taken = 1; break; }
+                int taken = slot_indexed(m, i, e) != NULL;
                 if (!taken && tmp[e] >= bv && tmp[e] > 0) { bv = tmp[e]; best = e; }
             }
             if (best < 0) break;
@@ -1105,8 +1259,7 @@ static int usage_save(Model *m, const char *snap) {
     (void)m;                              /* the counters live in route_trace.h now */
     char up[2048];
     const char *env = getenv("PIN");
-    const char *sv = getenv("USAGE_SAVE");
-    if (sv && *sv == '0') return 0;
+    /* USAGE_SAVE=0 is honoured inside rt_save itself (#1039) */
     if (env && (!strcmp(env, "off") || !strcmp(env, "0"))) return 0;
     if (env) snprintf(up, sizeof(up), "%s", env);
     else snprintf(up, sizeof(up), "%s/.coli_usage", snap);
@@ -1239,24 +1392,70 @@ static void dense_mlp(Model *m, Layer *l, float *x, int S, float *out) {
  * (3) compute. */
 /* shared experts for all S positions: gamma inside (before down_proj is
  * linear, so applied at the end). Factored out so the Metal path can run it
- * on the CPU while the last routed-expert round is in flight on the GPU. */
+ * on the CPU while the last routed-expert round is in flight on the GPU.
+ *
+ * Prefill batches positions so each shared matrix is traversed once per chunk,
+ * rather than once per token. Decode (S=1) deliberately stays on the original
+ * scalar path: its scratch remains tiny and the compiler sees a one-row GEMV.
+ * Bound the batch scratch to 64 MiB so a long prompt cannot turn this speedup
+ * into a memory spike. INK_SHARED_BATCH=0 restores the scalar path; a positive
+ * value sets a smaller maximum row count for deterministic A/B tests. */
+static int shared_batch_rows(int S, int D, int I) {
+    if (S <= 1) return 1;
+    const char *env = getenv("INK_SHARED_BATCH");
+    if (env) {
+        int requested = atoi(env);
+        if (requested <= 0) return 1;
+        if (requested < S) S = requested;
+    }
+    int64_t row_bytes = ((int64_t)2*I + D) * (int64_t)sizeof(float);
+    int64_t bounded = (64LL << 20) / (row_bytes > 0 ? row_bytes : 1);
+    if (bounded < 1) bounded = 1;
+    if (S > bounded) S = (int)bounded;
+    return S;
+}
 static void shared_experts_cpu(Model *m, Layer *l, const float *x, int S,
                                float *out, const float *wgt,
                                float *g, float *u, float *hh) {
     Cfg *c = &m->c;
     int D = c->hidden, K = c->topk, I = c->moe_inter, ns = c->n_shared;
-    for (int s = 0; s < S; s++) {
-        const float *xs = x + (int64_t)s*D;
-        float *os = out + (int64_t)s*D;
-        const float *w = wgt + (int64_t)s*(K+ns);
+    if (ns <= 0 || S <= 0) return;
+    int B = shared_batch_rows(S, D, I);
+    if (B == 1) {
+        for (int s = 0; s < S; s++) {
+            const float *xs = x + (int64_t)s*D;
+            float *os = out + (int64_t)s*D;
+            const float *w = wgt + (int64_t)s*(K+ns);
+            for (int j = 0; j < ns; j++) {
+                matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
+                matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
+                for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
+                matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
+                for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+            }
+        }
+        return;
+    }
+    float *bg = falloc((int64_t)2*B*I), *bu = bg + (int64_t)B*I;
+    float *bh = falloc((int64_t)B*D);
+    for (int base = 0; base < S; base += B) {
+        int rows = S - base < B ? S - base : B;
         for (int j = 0; j < ns; j++) {
-            matmul_w(g, xs, wt_off_i(l->sh_g, (int64_t)j*I*D, D), 1, D, I);
-            matmul_w(u, xs, wt_off_i(l->sh_u, (int64_t)j*I*D, D), 1, D, I);
-            for (int i = 0; i < I; i++) g[i] = siluf(g[i]) * u[i];
-            matmul_w(hh, g, wt_off_i(l->sh_d, (int64_t)j*D*I, I), 1, I, D);
-            for (int d = 0; d < D; d++) os[d] += w[K+j] * hh[d];
+            matmul_w(bg, x + (int64_t)base*D,
+                     wt_off_i(l->sh_g, (int64_t)j*I*D, D), rows, D, I);
+            matmul_w(bu, x + (int64_t)base*D,
+                     wt_off_i(l->sh_u, (int64_t)j*I*D, D), rows, D, I);
+            for (int64_t q = 0; q < (int64_t)rows*I; q++) bg[q] = siluf(bg[q]) * bu[q];
+            matmul_w(bh, bg, wt_off_i(l->sh_d, (int64_t)j*D*I, I), rows, I, D);
+            for (int s = 0; s < rows; s++) {
+                float *os = out + (int64_t)(base+s)*D;
+                const float *w = wgt + (int64_t)(base+s)*(K+ns);
+                const float *hs = bh + (int64_t)s*D;
+                for (int d = 0; d < D; d++) os[d] += w[K+j] * hs[d];
+            }
         }
     }
+    free(bg); free(bh);
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
@@ -1383,7 +1582,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             }
         }
         sxoff[ns] = ns*S;
-        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, sgp, sup, sdp,
+        sh_h = coli_metal_moe_block_begin(ns, D, I, 5, 0, sgp, sup, sdp,
                                           sscale, sscale, sscale,
                                           sxg, sxoff, snr, srows, srw);
         free(srows);
@@ -1466,7 +1665,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                  * the round; shared_done stays set either way. */
                 if (base + cap >= npair && !sh_h) {
                     ColiMetalMoeHandle *h = coli_metal_moe_block_begin(
-                        nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                        nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                         mxg, mxoff, mnr, mrows, mrw);
                     if (h) {
                         double ts = now_s();
@@ -1480,7 +1679,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
                         te = now_s();                      /* fault: CPU redo below */
                     }
                 }
-                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, mgp, mup, mdp, mgs, mus, mds,
+                if (coli_metal_moe_block(nb, D, I, q4 ? 2 : 1, 0, mgp, mup, mdp, mgs, mus, mds,
                                          mxg, mxoff, mnr, mrows, mrw, out, S)) {
                     m->t_expert += now_s() - te;
                     continue;                              /* round done on the GPU */
@@ -1858,6 +2057,22 @@ typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int
                  uint8_t *audio; int alen; } SReq;   /* raw DMel bytes after the payload */
 #define SRV_QMAX 16
 static SReq g_q[SRV_QMAX]; static int g_qn = 0;
+static const ColiServeWireProfile inkling_wire = {
+    .max_header_bytes = 511,
+    .max_payload_bytes = 1u << 22,
+    .max_extension_bytes = 1u << 26,
+    .max_tokens = 1 << 20,
+    .require_exact_lf = 1,
+    .require_finite_sampling = 0,
+    .allow_extension_bytes = 1,
+    .allow_prefix_hint = 0,
+};
+
+static void serve_request_dispose(SReq *request) {
+    if (!request) return;
+    free(request->payload);
+    memset(request, 0, sizeof(*request));
+}
 
 static int stdin_readable(void) {
     /* Windows non ha fd_set/select in questa forma: la build falliva del tutto.
@@ -1867,15 +2082,16 @@ static int stdin_readable(void) {
 
 /* read one control line (+ payload for SUBMIT). cur_id: request in flight;
  * returns 1 if that request was cancelled, 0 otherwise, -1 on stdin EOF. */
-static int serve_read_cmd(const char *cur_id) {
-    char ln[512];
-    if (!fgets(ln, sizeof(ln), stdin)) return -1;
-    char cmd[16], id[64];
-    if (sscanf(ln, "%15s %63s", cmd, id) < 2) return 0;
-    if (!strcmp(cmd, "CANCEL")) return cur_id && !strcmp(id, cur_id);
-    if (!strcmp(cmd, "SUBMIT")) {
-        int slot, plen, max_tok, alen = 0; float temp, top_p;
-        int nf = sscanf(ln, "%*s %*s %d %d %d %f %f %d", &slot, &plen, &max_tok, &temp, &top_p, &alen);
+static int serve_read_cmd(FILE *input, FILE *output, const char *cur_id) {
+    ColiServeCommand command;
+    ColiServeReadResult result=coli_serve_read_command(input,&inkling_wire,&command);
+    if(result==COLI_SERVE_READ_EOF) return -1;
+    if(result==COLI_SERVE_READ_BAD_FRAME) return -2;
+    if(result==COLI_SERVE_READ_NOMEM){
+        coli_serve_write_error(output,command.id,"out of memory"); return -2;
+    }
+    if(result==COLI_SERVE_READ_BAD_REQUEST&&
+       command.kind==COLI_SERVE_COMMAND_SUBMIT){
         /* 6th field (optional, backward compatible): DMel byte count appended
          * verbatim after the text payload — frames x mel_bins u8 levels */
         /* SEC: max_tok was the one field nobody validated, and it is the one
@@ -1891,45 +2107,48 @@ static int serve_read_cmd(const char *cur_id) {
          * anything bridging it (socat, a custom gateway, a sidecar) exposes it
          * directly, so the check belongs here, next to the one plen already
          * has, rather than in one of its callers. */
-        if (nf < 5 || plen < 0 || plen > (1<<22) || alen < 0 || alen > (1<<26) ||
-            max_tok < 1 || max_tok > (1<<20)) {
-            printf("ERROR %s bad submit header\n", id); fflush(stdout); return 0; }
-        (void)slot;
-        char *pl = malloc((size_t)plen + 1);
-        if (fread(pl, 1, (size_t)plen, stdin) != (size_t)plen) { free(pl); return -1; }
-        pl[plen] = 0;
-        uint8_t *au = NULL;
-        if (alen > 0) {
-            au = malloc((size_t)alen);
-            if (fread(au, 1, (size_t)alen, stdin) != (size_t)alen) { free(pl); free(au); return -1; }
-        }
-        int nl = fgetc(stdin); (void)nl;
+        coli_serve_write_error(output,command.id,"bad submit header"); return -2;
+    }
+    if(result!=COLI_SERVE_READ_OK) return 0;
+    if(command.kind==COLI_SERVE_COMMAND_CANCEL){
+        int matched=cur_id&&!strcmp(command.id,cur_id);
+        coli_serve_command_dispose(&command); return matched;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_STOP){
+        coli_serve_command_dispose(&command); return 0;
+    }
+    if(command.kind==COLI_SERVE_COMMAND_SUBMIT){
         if (g_qn < SRV_QMAX) {
             SReq *q = &g_q[g_qn++];
-            snprintf(q->id, sizeof(q->id), "%s", id);
-            q->max_tok = max_tok; q->temp = temp; q->top_p = top_p;
-            q->payload = pl; q->plen = plen;
-            q->audio = au; q->alen = alen;
-        } else { printf("ERROR %s queue full\n", id); fflush(stdout); free(pl); free(au); }
+            snprintf(q->id, sizeof(q->id), "%s", command.id);
+            q->max_tok=command.max_tokens; q->temp=command.temperature;
+            q->top_p=command.top_p; q->plen=(int)command.payload_bytes;
+            q->alen=(int)command.extension_bytes;
+            q->audio=coli_serve_command_extension(&command);
+            q->payload=(char*)coli_serve_command_take_payload(&command);
+        } else coli_serve_write_error(output,command.id,"queue full");
     }
+    coli_serve_command_dispose(&command);
     return 0;
 }
 
-static void serve_one(Model *m, Tok *T, SReq *q) {
+static int serve_one(Model *m, Tok *T, SReq *q) {
     Cfg *c = &m->c;
     int cap = q->plen + 16;
     int *ids = malloc((size_t)cap * sizeof(int));
     int np = tok_encode(T, q->payload, q->plen, ids, cap);
-    if (np <= 0) { printf("ERROR %s empty prompt\n", q->id); fflush(stdout); free(ids); return; }
+    if (np <= 0) { coli_serve_write_error(stdout,q->id,"empty prompt"); free(ids); return 0; }
     const char *bad = prompt_reject(np, q->max_tok);
-    if (bad) { printf("ERROR %s %s\n", q->id, bad); fflush(stdout); free(ids); return; }
+    if (bad) { coli_serve_write_error(stdout,q->id,bad); free(ids); return 0; }
     /* audio: every <|audio|> placeholder must have exactly one DMel frame */
     int naud = q->alen / m->c.mel_bins;
     if (q->alen % m->c.mel_bins != 0 || audio_tok_count(m, ids, np) != naud) {
-        printf("ERROR %s audio frames (%d) do not match <|audio|> placeholders (%d)%s\n",
-               q->id, naud, audio_tok_count(m, ids, np),
-               m->audio_norm ? "" : " — snapshot has no audio tensors");
-        fflush(stdout); free(ids); return;
+        char message[256];
+        snprintf(message,sizeof(message),
+                 "audio frames (%d) do not match <|audio|> placeholders (%d)%s",
+                 naud,audio_tok_count(m,ids,np),
+                 m->audio_norm?"":" — snapshot has no audio tensors");
+        coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
@@ -1988,13 +2207,11 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
         if (nhist < 128) hist[nhist++] = tk;
         else { memmove(hist, hist+1, 127*sizeof(int)); hist[127] = tk; }
         int nb = tok_decode(T, &tk, 1, buf, sizeof(buf)-1);
-        printf("DATA %s %d\n", q->id, nb);
-        fwrite(buf, 1, (size_t)nb, stdout);
-        fputc('\n', stdout); fflush(stdout);
+        coli_serve_write_data(stdout,q->id,buf,(size_t)nb);
         gen++; len++;
         while (stdin_readable()) {
-            int r = serve_read_cmd(q->id);
-            if (r < 0) { free(ids); return; }
+            int r = serve_read_cmd(stdin, stdout, q->id);
+            if (r < 0) { free(ids); return -1; }
             if (r > 0) { cancelled = 1; limited = 0; }
         }
         if (cancelled || s == q->max_tok - 1) break;
@@ -2003,14 +2220,18 @@ static void serve_one(Model *m, Tok *T, SReq *q) {
     free(logit);
     double dt = now_s() - t0;
     double tot = (double)(m->hits - h0 + m->miss - m0);
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n", q->id, gen,
-           dt > 0 ? gen/dt : 0.0, tot ? 100.0*(m->hits-h0)/tot : 0.0, rss_gb(), np, limited);
+    ColiServeDone done={gen,dt>0?gen/dt:0.0,
+                        tot?100.0*(m->hits-h0)/tot:0.0,rss_gb(),np,limited};
+    char done_line[256];
+    int done_bytes=coli_serve_format_done(done_line,sizeof(done_line),q->id,&done);
+    if(done_bytes>0) fwrite(done_line,1,(size_t)done_bytes,stdout);
     /* PROF: per-turn phase timings for the dashboard (gateway schema — we map
      * expert_wait -> shared-expert compute, lm_head folded into 0). */
     printf("PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %d\n", dt, np, gen,
            m->t_fill - f0, m->t_shared - s0, m->t_expert - e0, m->t_attn - a0, 0.0, gen + 1);
     fflush(stdout);
     free(ids);
+    return 0;
 }
 
 /* ---------- dashboard protocol (HWINFO / TIERS / EMAP) ----------
@@ -2056,10 +2277,9 @@ static void serve_tiers_emap(Model *m) {
     char *hex = malloc((size_t)nsp*E*2 + 1); int w = 0;
     for (int i = 0; i < c->n_layers; i++) {
         if (!c->sparse[i]) continue;
-        LCache *lc = &m->cache[i];
         for (int e = 0; e < E; e++) {
-            int tier = 0;
-            for (int z = 0; z < lc->n; z++) if (lc->slots[z].eid == e && lc->slots[z].filled) { tier = 1; break; }
+            Slot *resident = slot_indexed(m, i, e);
+            int tier = resident && resident->filled;
             uint32_t u = m->eusage[i] ? m->eusage[i][e] : 0;
             int heat = 0; while (u) { heat++; u >>= 1; } if (heat > 63) heat = 63;
             int b = (tier << 6) | heat;
@@ -2077,25 +2297,23 @@ static void serve_loop(Model *m, Tok *T) {
      * as \r\n, the gateway never matches it and waits forever (#748). Lives in
      * compat.h because colibri.c has had it since #195 and this engine was
      * written without it. */
-    coli_serve_binary_mode();
-    setvbuf(stdin, NULL, _IONBF, 0);
+    coli_serve_stdio_init();
     const char *sd = getenv("SEED");
     if (sd) g_rng ^= (uint64_t)strtoull(sd, NULL, 10);
     else g_rng ^= (uint64_t)time(NULL) * 2654435761u;
     /* the gateway reads a STAT line right after the READY sentinel (colibri
      * reports its load stats there) — match the handshake */
-    fputs("\x01\x01READY\x01\x01\n", stdout);
-    printf("STAT 0 0.0 0.0 %.2f 0 0\n", rss_gb());
-    fflush(stdout);
+    coli_serve_write_ready(stdout,rss_gb());
     serve_hwinfo(m);
     serve_tiers_emap(m);
     for (;;) {
-        while (!g_qn) if (serve_read_cmd(NULL) < 0) return;   /* blocks on stdin */
+        while (!g_qn) if (serve_read_cmd(stdin, stdout, NULL) < 0) return;   /* blocks on stdin */
         SReq q = g_q[0];
         memmove(g_q, g_q+1, (size_t)(--g_qn) * sizeof(SReq));
-        serve_one(m, T, &q);
+        int fatal=serve_one(m,T,&q);
         serve_tiers_emap(m);
-        free(q.payload); free(q.audio);
+        serve_request_dispose(&q);
+        if(fatal<0){ while(g_qn) serve_request_dispose(&g_q[--g_qn]); return; }
     }
 }
 

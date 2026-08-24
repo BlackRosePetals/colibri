@@ -1271,6 +1271,12 @@ extern "C" int coli_cuda_init(const int *devices, int count) {
     return 1;
 }
 
+extern "C" int coli_cuda_available_device_count(void) {
+    int available = 0;
+    if (cudaGetDeviceCount(&available) != cudaSuccess) return 0;
+    return available;
+}
+
 extern "C" void coli_cuda_shutdown(void) {
     for (int i = 0; i < g_nctx; i++) {
         DeviceContext *ctx = &g_ctx[i];
@@ -1407,12 +1413,18 @@ extern "C" int coli_cuda_tensor_upload(ColiCudaTensor **tensor,
         t->ng = (I + 127) / 128;
         t->scale_count = (size_t)((O + 127) / 128) * (size_t)t->ng;
     }
-    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation") ||
-        !cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+    if (!cuda_ok(cudaMalloc(&t->weights, t->weight_bytes), "tensor allocation")) {
         coli_cuda_tensor_free(t);
         return 0;
     }
+    /* Ownership is a fact of the allocation, not the copy: set it BEFORE the
+     * memcpy, or a failed H2D upload frees the tensor while weights_owned is
+     * still 0 and free()'s ownership gate leaks the device buffer. */
     t->weights_owned=1;
+    if (!cuda_ok(cudaMemcpy(t->weights, weights, t->weight_bytes, cudaMemcpyHostToDevice), "tensor upload")) {
+        coli_cuda_tensor_free(t);
+        return 0;
+    }
     if(fmt==2||fmt==4){ /* same nibble layout: offset-binary -> signed in place */
         offset_to_signed_s4<<<(unsigned)((t->weight_bytes+255)/256),256>>>((uint8_t*)t->weights,t->weight_bytes);
         if(!cuda_ok(cudaGetLastError(),"int4 weight conversion")){coli_cuda_tensor_free(t);return 0;}}
@@ -2341,17 +2353,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
     DeviceContext *ctx = find_ctx(tensor->device);
     if (ctx) select_ctx(ctx);
     if (tensor->tracked && ctx) {
-        int ng = tensor->ng > 0 ? tensor->ng : 1;
-        /* Must mirror the upload's accounting exactly: fmt=6 never charged for a
-         * scale buffer, and over-subtracting here trips the >= guard below, which
-         * silently leaves the tensor's bytes on the device counter forever. */
+        /* Must mirror the upload's accounting exactly -- literally the same
+         * expression upload uses to charge (scale_count * sizeof(float), gated
+         * on fmt=6 never having a separate scale buffer), so the two can no
+         * longer drift independently. Over-subtracting here trips the >= guard
+         * below, which silently leaves the tensor's bytes on the device counter
+         * forever. */
         size_t storage_bytes =
 #ifdef COLI_ANS
             tensor->compressed ? tensor->archive_bytes :
 #endif
             tensor->weight_bytes;
         size_t bytes = storage_bytes +
-            ((tensor->fmt && tensor->fmt != 6) ? (size_t)tensor->O * ng * sizeof(float) : 0);
+            ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
         if (ctx->tensor_count) ctx->tensor_count--;
         if (ctx->tensor_bytes >= bytes) ctx->tensor_bytes -= bytes;
     }
@@ -2363,13 +2377,19 @@ extern "C" void coli_cuda_tensor_free(ColiCudaTensor *tensor) {
 
 extern "C" size_t coli_cuda_tensor_bytes(const ColiCudaTensor *tensor) {
     if (!tensor) return 0;
-    int ng = tensor->ng > 0 ? tensor->ng : 1;
+    /* Must mirror upload's and free's accounting exactly -- literally the same
+     * expression they use (scale_count * sizeof(float), gated on fmt=6 never
+     * having a separate scale buffer) -- so all three can no longer drift
+     * independently. The prior `O * ng` shape over-reported for fmt=8 (real
+     * footprint is (O+127)/128 * ng block scales, not O * ng) and for fmt=6
+     * (which has no separate scale buffer at all). */
     size_t storage_bytes =
 #ifdef COLI_ANS
         tensor->compressed ? tensor->archive_bytes :
 #endif
         tensor->weight_bytes;
-    return storage_bytes + (tensor->fmt ? (size_t)tensor->O * ng * sizeof(float) : 0);
+    return storage_bytes +
+        ((tensor->fmt && tensor->fmt != 6) ? tensor->scale_count * sizeof(float) : 0);
 }
 
 extern "C" int coli_cuda_tensor_device(const ColiCudaTensor *tensor) {

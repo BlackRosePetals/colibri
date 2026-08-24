@@ -71,12 +71,19 @@ coli tune --model /models/glm52_i4
 coli run --model /models/glm52_i4 --auto-tier "Explain MoE offloading"
 ```
 
-The calibration prompt is generated once. Every candidate then teacher-forces
-the same continuation, so answer length and sampling do not contaminate the
-comparison. The bounded sweep only includes execution knobs such as OpenMP
-thread count, NUMA placement, I/O overlap, direct I/O, and CUDA pipelining. It
-never changes weights, quantization, router decisions, `TOPK`, `TOPP`, or
-sampling.
+GLM generates one calibration continuation and teacher-forces it for every
+candidate. The sibling engines use their common serving protocol instead: one
+engine stays alive for all requests of a candidate, and deterministic prompts
+rotate in a fixed order. That preserves the expert cache and measures a real
+mixed chat instead of repeatedly loading one process or teaching the cache one
+exact prompt. Greedy output is compared per prompt across every candidate; any
+byte drift disqualifies the scheduling change.
+
+The bounded sweep only includes execution knobs such as OpenMP thread count,
+NUMA placement, I/O overlap, direct I/O, CUDA pipelining, and DeepSeek V4 expert
+loader lanes when cold experts remain on disk. It never changes weights,
+quantization, router decisions, `TOPK`, `TOPP`, or sampling. Add repeatable
+`--rotate-prompt` options to replace the secondary built-in workload prompt.
 
 A candidate is saved only when median throughput improves by at least 3% while
 expert hit rate remains within 0.5 percentage points and p99 latency stays

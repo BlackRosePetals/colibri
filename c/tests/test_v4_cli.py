@@ -133,6 +133,47 @@ class V4CliTest(unittest.TestCase):
         env = self.cli.env_for_engine(args, "kimi")
         self.assertNotIn("RAM_GB", env)
 
+    def test_auto_tier_applies_saved_profile_to_sibling_engine(self):
+        """#1196 saved sibling profiles, but only GLM's env_for() loaded them.
+        A measured V4 lane winner must reach the real chat/serve child, while
+        an explicit environment override remains authoritative."""
+        directory, root = self.make_model()
+        args = argparse.Namespace(
+            model=str(root), ngen=8, temp=0.0, ram=0, ctx=0,
+            gpu=None, vram=0, auto_tier=True, no_tune_profile=False,
+            policy="quality", kv_slots=1,
+        )
+        measured = {
+            "gain": 0.20,
+            "winner": {"env": {"V4_LOADER_LANES": "3"}},
+        }
+        planned = {"sentinel": "same plan used by tune and launch"}
+        def passthrough(_plan, env, cuda_enabled):
+            result = dict(env)
+            result.setdefault("OMP_NUM_THREADS", "16")
+            return result
+        try:
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["V4_LOADER_LANES"], "3")
+            self.assertNotIn("OMP_NUM_THREADS", env)
+
+            with mock.patch.dict(os.environ, {"V4_LOADER_LANES": "12"}, clear=True), \
+                 mock.patch("resource_plan.environment_for_plan",
+                            side_effect=passthrough), \
+                 mock.patch("autotune.load_profile", return_value=measured), \
+                 mock.patch.object(self.cli, "engine_for",
+                                   return_value="/engines/deepseek_v4"):
+                env = self.cli.env_for_engine(args, "deepseek_v4", plan=planned)
+            self.assertEqual(env["V4_LOADER_LANES"], "12")
+        finally:
+            directory.cleanup()
+
     def test_ngen_default_differs_for_interactive_commands(self):
         """#889: `coli web` passed --max-tokens 1024, and openai_server clamps a
         request to that ceiling (#260), so the browser's own "max output tokens"
@@ -183,6 +224,7 @@ class V4CliTest(unittest.TestCase):
                                    return_value="deepseek_v4.exe"), \
                  mock.patch.object(self.cli, "need_model"), \
                  mock.patch.object(self.cli, "banner"), \
+                 mock.patch("resource_plan.physical_cpu_count", return_value=8), \
                  mock.patch.object(self.cli.subprocess, "call",
                                    side_effect=fake_call):
                 with self.assertRaises(SystemExit) as stopped:
