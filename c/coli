@@ -546,8 +546,9 @@ def dsv4_cuda_available(model=None):
     # Windows loads the tier as a runtime DLL next to the engine; Linux links
     # it straight into the binary (nvcc, -lcudart), so the DLL check there
     # rejected every valid `make deepseek-v4 CUDA=1` build (#1219). Detect the
-    # Linux build the same way cuda_binary() detects GLM's: a dynamic libcudart
-    # (or libamdhip64) entry in the binary's link table.
+    # Linux build through the dynamic libcudart entry added by the in-tree
+    # CUDA=1 target. DeepSeek V4 has no HIP backend, so libamdhip64 alone must
+    # not make a CPU engine look GPU-capable.
     eng = engine_for(model) if model else GLM
     if sys.platform == "win32":
         dll = os.path.join(os.path.dirname(eng), "coli_cuda_dsv4.dll")
@@ -555,15 +556,18 @@ def dsv4_cuda_available(model=None):
     if sys.platform == "linux" and os.path.exists(eng):
         try:
             linked = subprocess.run(["ldd", eng], capture_output=True, text=True, timeout=3)
-            return any(("libcudart" in line or "libamdhip64" in line) and "not found" not in line
+            return any("libcudart" in line and "not found" not in line
                        for line in linked.stdout.splitlines())
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return False
     return False
 
 def dsv4_cuda_build_hint():
-    return ("build coli_cuda_dsv4.dll (make cuda-dsv4-dll)" if sys.platform == "win32"
-            else "make deepseek-v4 CUDA=1 (this binary is CPU-only)")
+    if sys.platform == "win32":
+        return "build coli_cuda_dsv4.dll (make cuda-dsv4-dll)"
+    if sys.platform == "linux":
+        return "make deepseek-v4 CUDA=1 (this binary is CPU-only)"
+    return "the DeepSeek V4 CUDA tier is supported only on Linux and Windows"
 
 def need_worker_model(model):
     require_model(model, file="config.json")
