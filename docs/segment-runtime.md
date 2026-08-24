@@ -93,7 +93,7 @@ The fixture schemas are prefixed with `fixture/`. They exercise the contract;
 they are not model math and are never registered by a shipping executable. A
 model is ready for distributed Segment execution only after its real adapter
 passes these lifecycle checks against the repository's generated tiny oracle
-and the existing token/numerical oracle for that engine. The public Lumibri
+and the existing token/numerical oracle for that engine. The public Lumabri
 release gate is all-or-nothing across all six families: a passing synthetic
 fixture alone must never be advertised as model support.
 
