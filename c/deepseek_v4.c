@@ -3518,7 +3518,7 @@ struct ColiDeepSeekV4Indexer {
      * Assumes single-threaded execution per indexer instance (standard in SERVE chunk prefill). */
     void *scratch_buf;
     size_t scratch_cap;
-    int in_use;
+    char in_use;
 };
 
 typedef struct { float score; int index; } IndexScore;
