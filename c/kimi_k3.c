@@ -2829,6 +2829,11 @@ static void serve_data(const char *id, const char *p, int n){
     coli_serve_write_data(stdout,id,p,(size_t)n);
 }
 
+static void serve_tool(const char *id, const char *p, int n){
+    if(n<0) return;
+    coli_serve_write_tool(stdout,id,p,(size_t)n);
+}
+
 static int serve_one(Model *m, Tok *T, ServeReq *q){
     int cap=65536, *ids=malloc((size_t)cap*sizeof(int)), np=0;
     if(!ids){ coli_serve_write_error(stdout,q->id,"out of memory"); return 0; }
@@ -2861,6 +2866,10 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         coli_serve_write_error(stdout,q->id,message); free(ids); return 0;
     }
     coli_serve_write_accept(stdout,q->id,np);
+    /* Declare the structured sideband before any generated DATA. Even an
+     * empty sideband is meaningful: it tells the gateway that literal K3
+     * marker lookalikes in DATA are content, not engine-proven structure. */
+    if(chat) serve_tool(q->id,NULL,0);
     /* KV PREFIX REUSE (#639 for GLM; this engine re-prefilled every turn).
      * A chat client resends the whole transcript each turn, so turn N used to
      * re-process turns 1..N-1 from scratch — the cost of a message grew with
@@ -2909,7 +2918,7 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
     /* Turn boundary: the state now covers exactly the prompt. A photo here is
      * what an agentic edit of the NEXT request restores from. */
     k3_ckpt_save(m);
-    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0;
+    int gen=0, limited=1, cancelled=0, xsup=0, xopen=0, xtl=0, xtool=0;
     char buf[512], xtag[320];   /* tool-call open tags carry attributes: call tool="..." index="..." (#1143) */
     double tg=now_s();
     for(int s=0;s<q->max_tok&&!cancelled;s++){
@@ -2926,13 +2935,13 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
                     if(xopen&&!strcmp(xtag,"response")&&thinking)
                         serve_data(q->id,"</think>",8);
                     else if(k3_tool_tag(xtag)){
-                        /* #1143: re-emit tool-call structure literally so the gateway can
-                         * parse it back into OpenAI tool_calls. Everything else XTML stays
-                         * suppressed as before; the gateway strips these markers from the
-                         * client-visible deltas the same way the GLM path does. */
+                        /* #1147: preserve engine-proven special-token structure on the
+                         * TOOL sideband. Text that only resembles these markers remains
+                         * DATA and cannot be promoted by the gateway. */
                         char lb[352];
                         int n=snprintf(lb,sizeof lb,"%s%s<|sep|>",xopen?"<|open|>":"<|close|>",xtag);
-                        if(n>0&&n<(int)sizeof lb) serve_data(q->id,lb,n);
+                        if(n>0&&n<(int)sizeof lb) serve_tool(q->id,lb,n);
+                        if(!strcmp(xtag,"tools")) xtool=xopen;
                     }
                 }
                 show=0;
@@ -2944,7 +2953,8 @@ static int serve_one(Model *m, Tok *T, ServeReq *q){
         }
         if(show){
             int nb=tok_decode(T,&tk,1,buf,sizeof(buf)-1);
-            serve_data(q->id,buf,nb);
+            if(xtool) serve_tool(q->id,buf,nb);
+            else serve_data(q->id,buf,nb);
         }
         if(!eos) gen++;
         while(serve_stdin_readable()){
