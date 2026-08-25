@@ -51,6 +51,10 @@ static int register_all(void) {
 
 static int close_enough(const float *left, const float *right, size_t count,
                         const char *label) {
+    /* A segment boundary may change the engine's reduction schedule and the
+     * point at which an activation is rounded/stored.  Require a tight f32
+     * numerical match instead of bit identity; token-exact standalone oracles
+     * remain the stricter end-to-end gate. */
     for (size_t item = 0; item < count; item++) {
         float difference = fabsf(left[item] - right[item]);
         float scale = fmaxf(1.0f, fmaxf(fabsf(left[item]), fabsf(right[item])));

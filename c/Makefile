@@ -1343,6 +1343,8 @@ segment-adapters: tests/test_segment_adapters_registration$(EXE)
 
 # Maintainer/release gate. Paths point at generated/converted tiny Colibri
 # containers; see docs/segment-runtime.md for the exact generators.
+# OMP_NUM_THREADS defaults to a stable, non-single-threaded 2 for reproducible
+# reductions, but callers can override it to exercise a different schedule.
 segment-adapters-real: tests/test_segment_adapters_real$(EXE)
 	@test -n "$(GLM_SEGMENT_MODEL)" || { echo "set GLM_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(INKLING_SEGMENT_MODEL)" || { echo "set INKLING_SEGMENT_MODEL" >&2; exit 2; }
