@@ -889,7 +889,13 @@ cuda-test: backend_cuda.cu backend_cuda.h backend_gpu_compat.h tests/test_backen
 	# link step) and MSVC, whose OpenMP predates C99 loop declarations in C mode.
 	# It was also the only reason the final nvcc/hipcc link here had to drag in
 	# the host OpenMP runtime, so GPU_OMP_LINK goes with it.
-	$(CC) $(CFLAGS) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
+	# The OpenMP flags are FILTERED OUT rather than overridden with -fno-openmp
+	# alone: on macOS they arrive as `-Xclang -fopenmp`, which goes straight to
+	# the frontend and is not necessarily undone by a driver-level -fno-openmp.
+	# Getting that wrong would leave OpenMP symbols in the object while the link
+	# below no longer pulls the runtime, and CI could not catch it because CI
+	# never runs cuda-test. -Xclang appears nowhere else in CFLAGS.
+	$(CC) $(filter-out -Xclang -fopenmp,$(CFLAGS)) -fno-openmp -c tests/mxfp4_ref.c -o tests/mxfp4_ref.o
 	"$(GPUCC)" $(GPUFLAGS) backend_cuda.cu tests/test_mxfp4_cuda.cu tests/mxfp4_ref.o -o mxfp4_cuda_test$(EXE)
 	./mxfp4_cuda_test$(EXE)
 
