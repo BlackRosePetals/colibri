@@ -508,6 +508,7 @@ Two things that differ per model, both documented in the per-model page:
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
 | Experimental layer-segment embedding ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
+| Experimental tokenizer/embedding/head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 
