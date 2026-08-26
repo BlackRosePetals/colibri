@@ -10610,7 +10610,8 @@ int main(int argc, char **argv){
         puts("AVX512 i3 selftest: ok"); return 0;
     }
 #endif
-    const char *snap=getenv("SNAP"); if(!snap){fprintf(stderr,"SNAP=<dir>\n");return 1;}
+    const char *snap=getenv("SNAP");
+    if(!snap){ coli_print_launcher_help("GLM-5.2"); return 1; }
     g_nopack = getenv("NOPACK")?1:0;
     g_drop = getenv("DROP")?1:0;
     g_prefetch = getenv("PREFETCH")?atoi(getenv("PREFETCH")):0;
