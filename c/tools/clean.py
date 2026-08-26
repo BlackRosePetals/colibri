@@ -14,6 +14,8 @@ FILES = [
     "inkling", "inkling.exe",
     "kimi_k3", "kimi_k3.exe",
     "olmoe", "olmoe.exe",
+    "qwen36", "qwen36.exe",
+    "qwen38", "qwen38.exe",
     "glm", "glm.exe",                       # pre-rename name of the colibri engine
     "iobench", "iobench.exe",
     "backend_cuda.o", "backend_loader.o",

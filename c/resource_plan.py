@@ -11,7 +11,8 @@ import sys
 import threading
 from pathlib import Path
 
-from family_registry import expert_contributions, planner_geometry, resolve_model
+from family_registry import (expert_contributions, planner_geometry,
+                             resident_contribution, resolve_model)
 
 
 GB = 1_000_000_000
@@ -23,7 +24,7 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 1
+_ANALYSIS_CACHE_VERSION = 3
 
 
 def _analysis_signature(shards, config_path):
@@ -118,7 +119,7 @@ def analyze_model(model):
                     key = (layer, expert)
                     expert_groups[key] = expert_groups.get(key, 0) + byte_count
             else:
-                dense_bytes += size
+                dense_bytes += resident_contribution(resolved, name, size)
 
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
@@ -805,6 +806,18 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     physical_cpus = physical_cpu_count() if physical_cpus is None else physical_cpus
     cpu_sockets = cpu_socket_count() if cpu_sockets is None else cpu_sockets
     resolved = info["resolved_family"]
+    if not resolved.descriptor.supports_accelerator:
+        if gpu_indices:
+            raise ValueError(
+                f"{resolved.descriptor.display_name} currently supports CPU only; "
+                "GPU selection is unavailable")
+        if vram_gb > 0:
+            raise ValueError(
+                f"{resolved.descriptor.display_name} currently supports CPU only; "
+                "a VRAM budget is unavailable")
+        # Do not let unrelated GPUs distort unified-memory/RAM/cache planning
+        # for an engine that cannot execute any part of this model on them.
+        gpus = []
     geometry = planner_geometry(resolved, context)
     if (isinstance(kv_slots, bool) or not isinstance(kv_slots, int) or
             not 1 <= kv_slots <= resolved.descriptor.limits.max_kv_slots):
@@ -965,8 +978,8 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
         "bottleneck_class": bottleneck_class,
         "projected_hit_rate": round(projected_hit, 4),
         "tune": tune,
-        "decisions": [
-            {"target": "VRAM", "reason": "profile-ranked hot experts"},
+        "decisions": ([{"target": "VRAM", "reason": "profile-ranked hot experts"}]
+                      if resolved.descriptor.supports_accelerator else []) + [
             {"target": "RAM", "reason": "warm experts execute on CPU without quality loss"},
             {"target": "Disk", "reason": "immutable recovery source for cold experts"},
         ],
@@ -1006,6 +1019,17 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
         result.setdefault("REPIN", "64")
     ram = plan["tiers"]["ram"]
     result.setdefault("RAM_GB", f"{ram['budget_bytes'] / GB:.3f}")
+    planned_cap = ram.get("cache_slots_per_layer")
+    if (plan.get("model", {}).get("family_id") == "qwen38" and
+            (not isinstance(planned_cap, int) or
+             isinstance(planned_cap, bool) or planned_cap < 1)):
+        raise ValueError(
+            "Qwen3.8 RAM budget cannot hold one expert slot per loaded layer")
+    if (isinstance(planned_cap, int) and not isinstance(planned_cap, bool) and
+            planned_cap >= 1):
+        # Private bridge for engines whose expert capacity is an argv value.
+        # The gateway consumes and removes it before starting the engine.
+        result.setdefault("COLI_PLAN_CAP", str(planned_cap))
 
     vram = plan["tiers"]["vram"]
     # Report every device, but only name the placement-qualified ones to the

@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 import json
+import math
 import re
 from pathlib import Path
 
@@ -72,9 +73,11 @@ class FamilyDescriptor:
     config_section: str
     limits: FamilyLimits
     capabilities: FamilyCapabilities
+    resident_inventory: object = None
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
+    supports_accelerator: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +150,124 @@ def _qwen36_geometry(config, context, _model_dir):
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
+
+
+def _qwen38_geometry(config, context, _model_dir):
+    """Qwen3.8-Flash-Next's hybrid state layout.
+
+    Full-attention layers retain GQA K/V plus the raw QSA index key.  Linear
+    (GDN) layers retain a recurrent matrix and a four-stream convolution ring;
+    the single PLE layer adds its own convolution history and two int64 ngram
+    history positions.  Hyper-connection streams also contribute to prefill
+    scratch, so workspace is deliberately conservative rather than zero.
+    """
+    family = "qwen38"
+    layers = _required_int(config, "num_hidden_layers", family)
+    hidden = _required_int(config, "hidden_size", family)
+    vocab = _required_int(config, "vocab_size", family)
+    max_positions = _required_int(config, "max_position_embeddings", family)
+    eos = _required_int(config, "eos_token_id", family, 0)
+    if layers > 512 or hidden > 65536 or max_positions > 262144 or eos >= vocab:
+        raise ValueError(f"{family}: model dimensions exceed the native engine limits")
+    if context > max_positions:
+        raise ValueError(f"{family}: context {context} exceeds max_position_embeddings "
+                         f"{max_positions}")
+    kinds = config.get("layer_types")
+    if not isinstance(kinds, list) or len(kinds) != layers:
+        raise ValueError(f"{family}: missing or invalid planning key 'layer_types'")
+    # Upstream calls these ``full_attention``; early Qwen4-Exp exports and the
+    # tiny oracle call the same QSA layer ``qwen_sparse_attention``.
+    allowed_kinds = {"linear_attention", "full_attention", "qwen_sparse_attention"}
+    unknown_kinds = sorted({kind for kind in kinds if kind not in allowed_kinds})
+    if unknown_kinds:
+        raise ValueError(f"{family}: unsupported layer types {unknown_kinds!r}")
+    full = sum(kind in ("full_attention", "qwen_sparse_attention") for kind in kinds)
+    linear = layers - full
+
+    n_kv = _required_int(config, "num_key_value_heads", family)
+    head_dim = _required_int(config, "head_dim", family)
+    q_heads = _required_int(config, "num_attention_heads", family)
+    if q_heads % n_kv:
+        raise ValueError(f"{family}: attention heads are not divisible by KV heads")
+    rope = config.get("rope_parameters")
+    rope = rope if isinstance(rope, dict) else config
+    partial = rope.get("partial_rotary_factor", config.get("partial_rotary_factor", 1.0))
+    if (isinstance(partial, bool) or not isinstance(partial, (int, float)) or
+            not math.isfinite(partial) or partial <= 0):
+        raise ValueError(f"{family}: invalid partial_rotary_factor")
+    rotary_dim = int(head_dim * partial)
+    if rotary_dim < 1 or rotary_dim > head_dim or rotary_dim % 2:
+        raise ValueError(f"{family}: invalid derived rotary dimension")
+    index_kv = _required_int(config, "indexer_kv_heads", family)
+    index_dim = _required_int(config, "indexer_head_dim", family)
+    index_q = _required_int(config, "indexer_n_heads", family)
+    index_budget = _required_int(config, "indexer_budget", family)
+    index_ratio = _required_int(config, "indexer_compress_ratio", family)
+    if index_kv != 1 or index_dim < rotary_dim or index_budget % index_ratio:
+        raise ValueError(f"{family}: invalid sparse indexer geometry")
+    context_state = full * context * (2 * n_kv * head_dim + index_kv * index_dim) * 4
+
+    value_heads = _required_int(config, "linear_num_value_heads", family)
+    key_dim = _required_int(config, "linear_key_head_dim", family)
+    value_dim = _required_int(config, "linear_value_head_dim", family)
+    hc_count = _required_int(config, "hc_count", family)
+    hc_rank = _required_int(config, "hc_lowrank", family)
+    if hc_count > 16 or hc_rank > 65536:
+        raise ValueError(f"{family}: invalid hyper-connection geometry")
+    key_heads = _required_int(config, "linear_num_key_heads", family)
+    gdn_conv = _required_int(config, "linear_conv_kernel_dim", family, 2) - 1
+    if value_heads % key_heads or value_dim > 512:
+        raise ValueError(f"{family}: invalid Gated DeltaNet geometry")
+    gdn_conv_width = (2 * key_heads * key_dim + value_heads * value_dim)
+    fixed = linear * (value_heads * key_dim * value_dim +
+                      gdn_conv_width * gdn_conv) * 4
+
+    ple_ids = config.get("ple_layer_ids", [])
+    if (not isinstance(ple_ids, list) or len(ple_ids) != 1 or
+            isinstance(ple_ids[0], bool) or not isinstance(ple_ids[0], int) or
+            not 1 <= ple_ids[0] <= layers):
+        raise ValueError(f"{family}: invalid planning key 'ple_layer_ids'")
+    ple_conv = _required_int(config, "ple_conv_kernel_size", family, 2) - 1
+    ngram = _required_int(config, "ngram_size", family, 2)
+    heads_per_ngram = _optional_int(config, "heads_per_ngram", 8, 1)
+    ngram_heads = (ngram - 1) * heads_per_ngram
+    ple_dim = _required_int(config, "ple_embed_dim", family)
+    ngram_parts = _optional_int(config, "split_ngram_parts", 1, 1)
+    if (ngram != 3 or not 1 <= ngram_heads <= 64 or ple_dim % ngram_heads or
+            ple_dim // ngram_heads > 512 or ngram_parts > 512):
+        raise ValueError(f"{family}: invalid PLE geometry")
+    # PLE's retained convolution ring is per hyper-connection stream: the
+    # runtime allocates hc_count * hidden, not the projection embed dimension.
+    hc_width = hc_count * hidden
+    fixed += len(ple_ids) * (hc_width * ngram * ple_conv * 4 +
+                             (ngram - 1) * 8)
+
+    # Match the peak buffers held concurrently by step(): the persistent
+    # hyper/mixed/inject/block rows plus the largest layer-local row set. The
+    # base planner reserve still covers allocator and non-scaling overhead.
+    base_row = hc_width + 2 * hidden + hc_count
+    gated_residual_row = base_row + 2 * hc_width + hc_rank
+    qsa_row = (base_row + 2 * q_heads * head_dim + 2 * n_kv * head_dim +
+               (index_q + index_kv) * index_dim + q_heads * head_dim)
+    ple_row = base_row + hc_width
+
+    experts = _required_int(config, "num_experts", family)
+    topk = _required_int(config, "num_experts_per_tok", family)
+    if experts > 1024 or topk > 256 or topk > experts:
+        raise ValueError(f"{family}: invalid routed-expert geometry")
+    intermediate = _required_int(config, "moe_intermediate_size", family)
+    shared = _required_int(config, "shared_expert_intermediate_size", family)
+    moe_fixed = experts + 3 * shared + 3 * intermediate + 2 * hidden
+    gdn_fixed = (2 * gdn_conv_width + 3 * value_heads * value_dim +
+                 2 * value_heads + 2 * value_heads * key_dim)
+    ple_fixed = ple_dim + 5 * hc_width + hidden
+    qsa_fixed = (index_q * index_dim + index_dim + index_budget + index_ratio - 1 +
+                 max(2 * (context // index_ratio),
+                     head_dim + index_budget + index_ratio - 1))
+    workspace = (context * max(gated_residual_row, qsa_row, ple_row) +
+                 max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+    return PlannerGeometry(context_state, fixed, workspace,
+                           experts)
 
 
 def _olmoe_geometry(config, context, _model_dir):
@@ -405,6 +526,18 @@ _INKLING_EXPERT = re.compile(
     r"^model\.layers\.(\d+)\.mlp\.experts\."
     r"(?:gate_up_proj|down_proj)(?:\.|$)"
 )
+_QWEN38_EXPERT = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+_QWEN38_EXPERT_SCALE = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(\d+)\.(?:gate_proj|up_proj|down_proj)\.weight_scale_inv$"
+)
+_QWEN38_FUSED_EXPERT = re.compile(
+    r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
+    r"(gate_up_proj|down_proj)$"
+)
 
 
 def _individual_expert_inventory(pattern):
@@ -427,6 +560,61 @@ def _inkling_expert_inventory(name, size, config):
     per_expert = size // experts
     layer = int(match.group(1))
     return tuple((layer, expert, per_expert) for expert in range(experts))
+
+
+def _qwen38_expert_inventory(name, size, config):
+    """Index both per-expert FP8 and fused BF16 expert tensor layouts.
+
+    Resource planning calls this once per tensor; summing the returned byte
+    counts therefore combines gate/up and down tensors for each expert without
+    multiplying either tensor by the expert count a second time.
+    """
+    match = _QWEN38_EXPERT.fullmatch(name)
+    if match:
+        hidden = _required_int(config, "hidden_size", "qwen38")
+        intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+        elements = hidden * intermediate
+        if size not in (elements, elements * 2, elements * 4):
+            raise ValueError(f"qwen38: expert tensor {name!r} has unexpected size {size}")
+        # All supported source dtypes are decoded to f32 in q38_load_expert().
+        return ((int(match.group(1)), int(match.group(2)), elements * 4),)
+    match = _QWEN38_EXPERT_SCALE.fullmatch(name)
+    if match:
+        # The scale sidecar is streamed with its expert, never dense-resident.
+        return ((int(match.group(1)), int(match.group(2)), 0),)
+    match = _QWEN38_FUSED_EXPERT.fullmatch(name)
+    if not match:
+        return ()
+    experts = _required_int(config, "num_experts", "qwen38")
+    hidden = _required_int(config, "hidden_size", "qwen38")
+    intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+    matrices = 2 if match.group(2) == "gate_up_proj" else 1
+    elements = experts * matrices * hidden * intermediate
+    if size not in (elements * 2, elements * 4):
+        raise ValueError(f"qwen38: fused expert tensor {name!r} has unexpected size {size}")
+    per_expert = matrices * hidden * intermediate * 4
+    layer = int(match.group(1))
+    return tuple((layer, expert, per_expert) for expert in range(experts))
+
+
+def _qwen38_resident_inventory(name, size, _config):
+    """Resident f32 bytes for tensors the native text engine actually loads."""
+    if name.startswith("mtp.") or name.startswith("model.visual."):
+        return 0
+    if ".ple.ple_embedding.ngram_embedding." in name and name.endswith(".weight"):
+        return 0  # 51B-parameter PLE table stays pageable in st.h.
+    if name.endswith((".ple.ple_embedding.layer_multipliers",
+                      ".ple.ple_embedding.ngram_heads_vocab_sizes",
+                      ".ple.ple_embedding.ngram_heads_offsets",
+                      ".ple.ple_embedding.ngram_embedding.weight_scale")):
+        # These few values are read into fixed fields in Model, not retained as
+        # separately allocated source tensors.
+        return 0
+    text_tensor = (name == "lm_head.weight" or
+                   name.startswith("model.language_model.") or
+                   (name.startswith("model.") and
+                    not name.startswith("model.visual.")))
+    return size * 2 if text_tensor else 0  # supported checkpoints store BF16.
 
 
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
@@ -566,6 +754,40 @@ FAMILIES = (
             "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"),
     ),
     FamilyDescriptor(
+        id="qwen38",
+        model_types=("qwen4_exp", "qwen4_exp_text"),
+        display_name="Qwen3.8-Flash-Next",
+        display_scale="176B",
+        engine_artifact="qwen38",
+        engine_aliases=(),
+        engine_group="qwen38",
+        internal_arch="qwen38",
+        build_target="qwen38",
+        process_names=("qwen38",),
+        default_model_id="qwen3.8-flash-next-colibri",
+        cli_adapter="qwen38",
+        gateway_adapter="qwen38",
+        planner_id="qwen38_hybrid",
+        planner_geometry=_qwen38_geometry,
+        planner_unsupported_reason="",
+        expert_inventory=_qwen38_expert_inventory,
+        resident_inventory=_qwen38_resident_inventory,
+        config_section="text_config",
+        limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
+        capabilities=FamilyCapabilities(False, False, False, True),
+        has_gateway_adapter=True,
+        # Like Qwen3.6, direct `coli run` is intentionally not exposed until
+        # an engine-specific CLI prompt path exists; chat/serve use the gateway.
+        has_cli_adapter=False,
+        tune_prompt_template=(
+            "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
+            "through the task, validate key assumptions, consider plausible alternatives, "
+            "and prioritize correctness, consistency, and clarity in the final answer."
+            "<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n"),
+        supports_accelerator=False,
+    ),
+    FamilyDescriptor(
         id="deepseek_v4",
         model_types=("deepseek_v4",),
         display_name="DeepSeek V4 Flash",
@@ -602,7 +824,10 @@ def _build_registry(families):
         if (not family.model_types or
                 (not callable(family.planner_geometry) and
                   not family.planner_unsupported_reason) or
-                not callable(family.expert_inventory) or
+                 not callable(family.expert_inventory) or
+                (family.resident_inventory is not None and
+                 not callable(family.resident_inventory)) or
+                not isinstance(family.supports_accelerator, bool) or
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
                 not isinstance(family.tune_prompt_template, str) or
@@ -721,6 +946,17 @@ def expert_contributions(resolved, name, size):
     return contributions
 
 
+def resident_contribution(resolved, name, size):
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError("tensor size must be a non-negative integer")
+    inventory = resolved.descriptor.resident_inventory
+    contribution = size if inventory is None else inventory(
+        name, size, resolved.family_config)
+    if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
+        raise RegistryError(f"invalid resident inventory for {resolved.descriptor.id}")
+    return contribution
+
+
 def public_metadata(family):
     return {
         "id": family.id,
@@ -737,6 +973,7 @@ def public_metadata(family):
         "cli_adapter": family.cli_adapter,
         "gateway_adapter": family.gateway_adapter,
         "planner_id": family.planner_id,
+        "supports_accelerator": family.supports_accelerator,
         "limits": {
             "default_context": family.limits.default_context,
             "max_context": family.limits.max_context,

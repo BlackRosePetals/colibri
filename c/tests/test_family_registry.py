@@ -17,9 +17,11 @@ from family_registry import (
     UnknownFamilyError,
     PlannerUnsupportedError,
     _build_registry,
+    expert_contributions,
     family_for_config,
     planner_geometry,
     public_metadata,
+    resident_contribution,
     resolve_model,
     tuning_replay_prompt,
 )
@@ -150,6 +152,126 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(geometry.fixed_state_bytes, 6 * (8 * 8 * 8 + 128 * 3) * 4)
         for model_type in ("qwen2", "qwen3_moe", "my_qwen_model"):
             self.assertNotIn(model_type, by_type)
+
+    def test_qwen38_fixture_resolves_nested_text_config_and_sizes_all_state(self):
+        config = {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "num_hidden_layers": 48,
+                "hidden_size": 2560,
+                "vocab_size": 248320,
+                "max_position_embeddings": 262144,
+                "eos_token_id": 248044,
+                "num_attention_heads": 24,
+                "num_key_value_heads": 2,
+                "head_dim": 256,
+                "rope_parameters": {"partial_rotary_factor": 0.25},
+                "layer_types": ["linear_attention"] * 36 + ["full_attention"] * 12,
+                "indexer_kv_heads": 1, "indexer_head_dim": 128,
+                "indexer_n_heads": 4, "indexer_budget": 2048,
+                "indexer_compress_ratio": 4,
+                "linear_num_value_heads": 48,
+                "linear_num_key_heads": 16,
+                "linear_key_head_dim": 128, "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "hc_count": 4, "hc_lowrank": 320,
+                "ple_layer_ids": [2], "ple_embed_dim": 2560,
+                "ple_conv_kernel_size": 4, "ngram_size": 3,
+                "heads_per_ngram": 8, "split_ngram_parts": 128,
+                "num_experts": 512, "moe_intermediate_size": 640,
+                "num_experts_per_tok": 10,
+                "shared_expert_intermediate_size": 640,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            resolved = resolve_model(root)
+        self.assertEqual(resolved.descriptor.id, "qwen38")
+        self.assertEqual(resolved.family_config["model_type"], "qwen4_exp_text")
+        geometry = planner_geometry(resolved, 32)
+        self.assertEqual(geometry.configured_experts, 512)
+        self.assertEqual(geometry.context_state_bytes,
+                         12 * 32 * (2 * 2 * 256 + 128) * 4)
+        expected_fixed = (36 * (48 * 128 * 128 + 10240 * 3) * 4 +
+                          10240 * 9 * 4 + 2 * 8)
+        self.assertEqual(geometry.fixed_state_bytes, expected_fixed)
+        base_row = 4 * 2560 + 2 * 2560 + 4
+        gated_residual_row = base_row + 2 * 4 * 2560 + 320
+        qsa_row = (base_row + 2 * 24 * 256 + 2 * 2 * 256 +
+                   (4 + 1) * 128 + 24 * 256)
+        ple_row = base_row + 4 * 2560
+        moe_fixed = 512 + 3 * 640 + 3 * 640 + 2 * 2560
+        gdn_width = 2 * 16 * 128 + 48 * 128
+        gdn_fixed = (2 * gdn_width + 3 * 48 * 128 +
+                     2 * 48 + 2 * 48 * 128)
+        ple_fixed = 2560 + 5 * 4 * 2560 + 2560
+        qsa_fixed = 4 * 128 + 128 + 2048 + 4 - 1 + max(
+            2 * (32 // 4), 256 + 2048 + 4 - 1)
+        expected_workspace = (32 * max(gated_residual_row, qsa_row, ple_row) +
+                              max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+        self.assertEqual(geometry.workspace_bytes, expected_workspace)
+
+        family = resolved.descriptor
+        invalid = {
+            "ngram_size": 2,
+            "indexer_kv_heads": 2,
+            "indexer_budget": 2047,
+            "hc_count": 17,
+            "ple_embed_dim": 2561,
+            "linear_num_value_heads": 47,
+            "num_attention_heads": 25,
+        }
+        for key, value in invalid.items():
+            broken = json.loads(json.dumps(config["text_config"]))
+            broken[key] = value
+            bad = type("R", (), {"descriptor": family, "family_config": broken,
+                                   "model_dir": "."})()
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                planner_geometry(bad, 32)
+        short = json.loads(json.dumps(config["text_config"]))
+        short["max_position_embeddings"] = 16
+        bad = type("R", (), {"descriptor": family, "family_config": short,
+                               "model_dir": "."})()
+        with self.assertRaisesRegex(ValueError, "max_position_embeddings"):
+            planner_geometry(bad, 32)
+
+    def test_qwen38_inventory_aggregates_per_expert_and_fused_tensor_sizes(self):
+        family = next(family for family in FAMILIES if family.id == "qwen38")
+        resolved = type("R", (), {"descriptor": family,
+                                   "family_config": {"num_experts": 512,
+                                                     "hidden_size": 32,
+                                                     "moe_intermediate_size": 8},
+                                   "model_dir": "."})()
+        prefix = "model.language_model.layers.7.mlp.experts.23"
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".gate_proj.weight", 256), ((7, 23, 1024),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".up_proj.weight", 512), ((7, 23, 1024),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".down_proj.weight", 1024), ((7, 23, 1024),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".down_proj.weight_scale_inv", 16), ((7, 23, 0),))
+        fused = "model.layers.7.mlp.experts.gate_up_proj"
+        contributions = expert_contributions(resolved, fused, 512 * 2 * 32 * 8 * 2)
+        self.assertEqual(len(contributions), 512)
+        self.assertEqual(contributions[23], (7, 23, 2048))
+
+        self.assertEqual(resident_contribution(
+            resolved, "model.language_model.layers.0.self_attn.q_proj.weight", 100), 200)
+        self.assertEqual(resident_contribution(
+            resolved, "model.visual.blocks.0.attn.qkv.weight", 100), 0)
+        self.assertEqual(resident_contribution(
+            resolved, "mtp.layers.0.mlp.gate.weight", 100), 0)
+        self.assertEqual(resident_contribution(
+            resolved,
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_7.weight",
+            100), 0)
+        self.assertEqual(resident_contribution(
+            resolved,
+            "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
+            24), 0)
 
     def test_minimax_fixture_can_share_colibri_without_becoming_glm(self):
         config = {
@@ -842,6 +964,11 @@ class FamilyRegistryTest(unittest.TestCase):
             # there lands on an EOS special (measured gen=0).
             "qwen36": "<|im_start|>user\nhello {world}<|im_end|>\n"
                       "<|im_start|>assistant\n<think>\n",
+            "qwen38": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully "
+                      "through the task, validate key assumptions, consider plausible alternatives, "
+                      "and prioritize correctness, consistency, and clarity in the final answer."
+                      "<|im_end|>\n<|im_start|>user\nhello {world}<|im_end|>\n"
+                      "<|im_start|>assistant\n<think>\n",
             "deepseek_v4": "hello {world}",
         }
         self.assertEqual(
@@ -853,6 +980,10 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertFalse(QWEN36_FIXTURE.has_cli_adapter)
         self.assertFalse(QWEN36_FIXTURE.has_gateway_adapter)
         self.assertEqual(tuning_replay_prompt(QWEN36_FIXTURE, "hello"), "hello")
+
+        with self.assertRaises(RegistryError):
+            _build_registry((replace(QWEN36_FIXTURE,
+                                     resident_inventory="not callable"),))
 
         for template in ("static", "{unknown}", "{prompt", "{prompt[foo]}"):
             with self.subTest(template=template), self.assertRaises(RegistryError):
