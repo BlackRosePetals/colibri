@@ -69,6 +69,11 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#include "compat.h"
+#include <time.h>
+#ifndef _WIN32
+#include <sys/resource.h>
+#endif
 #include "hyper_connections.h"   /* mHC, condiviso con deepseek_v4.c */
 
 /* ---------- config ----------
@@ -613,6 +618,31 @@ typedef struct {
     Mat *eg, *eu, *ed;                    /* esperti routed */
 } GLayer;
 
+/* Quello che una conversazione si porta dietro fra un token e il successivo.
+ *
+ * Senza, generare il token n costa un passaggio su tutti gli n precedenti, e
+ * siccome ogni token attraversa 8 esperti per layer, il conto e' n volte il
+ * lavoro che serve. Con la cache il passo costa un token.
+ *
+ * I layer KDA hanno una ricorrenza: lo stato e la finestra della convoluzione
+ * sono gia' tutto quello che serve, e non crescono col contesto. I layer DSA
+ * invece devono ricordare chiavi e valori di ogni posizione, piu' le chiavi e i
+ * gate dell'indexer, perche' una query nuova puo' guardare ovunque dietro di
+ * se'. */
+typedef struct {
+    float *kda_state;                     /* [teste * k * v] */
+    float *kda_window;                    /* [3 * proiezione * kernel] */
+    float *keys, *values;                 /* [cap][teste][qk], [cap][teste][v] */
+    float *ikeys, *igates;                /* [cap][dim indexer] */
+} GLayerState;
+
+typedef struct {
+    GLayerState *layer;
+    float *kda_scratch;
+    int filled;                           /* posizioni gia' in cache */
+    int cap;
+} GSession;
+
 typedef struct {
     Cfg c;
     shards S;
@@ -878,23 +908,26 @@ static void kda_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
 }
 
 /* ---------- MLA + indexer con k-pool ---------- */
-static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens, float *out) {
+static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
+                      float *out, GLayerState *st, int base) {
     const int H = c->n_heads, QK = c->qk_nope, V = c->v_head;
     const int IH = c->index_nh, ID = c->index_hd;
+    const int seen = base + tokens;
     float *qa = malloc((size_t)tokens * c->q_lora * sizeof(float));
     float *queries = malloc((size_t)tokens * H * QK * sizeof(float));
-    float *keys = malloc((size_t)tokens * H * QK * sizeof(float));
-    float *values = malloc((size_t)tokens * H * V * sizeof(float));
+    float *keys = st->keys;               /* tutto il prefisso, non solo i nuovi */
+    float *values = st->values;
     float *latent = malloc((size_t)c->kv_lora * sizeof(float));
     float *expanded = malloc((size_t)H * (QK + V) * sizeof(float));
     float *iq = malloc((size_t)tokens * IH * ID * sizeof(float));
-    float *ik = malloc((size_t)tokens * ID * sizeof(float));
-    float *gates = malloc((size_t)tokens * ID * sizeof(float));
+    float *ik = st->ikeys;
+    float *gates = st->igates;
     float *head_w = malloc((size_t)tokens * IH * sizeof(float));
-    unsigned char *valid = malloc((size_t)tokens);
-    memset(valid, 1, (size_t)tokens);
+    unsigned char *valid = malloc((size_t)seen);
+    memset(valid, 1, (size_t)seen);
 
     for (int t = 0; t < tokens; t++) {
+        const int at = base + t;          /* posizione assoluta nella cache */
         const float *row = x + (size_t)t * c->hidden;
         float *qn = qa + (size_t)t * c->q_lora;
         mv(qn, &l->qa, row);
@@ -905,47 +938,46 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(expanded, &l->kvb, latent);
         for (int h = 0; h < H; h++) {
             const float *src = expanded + (size_t)h * (QK + V);
-            memcpy(keys + ((size_t)t * H + h) * QK, src, (size_t)QK * sizeof(float));
-            memcpy(values + ((size_t)t * H + h) * V, src + QK, (size_t)V * sizeof(float));
+            memcpy(keys + ((size_t)at * H + h) * QK, src, (size_t)QK * sizeof(float));
+            memcpy(values + ((size_t)at * H + h) * V, src + QK, (size_t)V * sizeof(float));
         }
         /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
          * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
         mv(iq + (size_t)t * IH * ID, &l->iwq, qn);
-        float *kraw = ik + (size_t)t * ID;
+        float *kraw = ik + (size_t)at * ID;
         mv(kraw, &l->iwk, row);
         layer_norm(kraw, kraw, l->ik_nw, l->ik_nb, ID, 1e-5f);
-        mv(gates + (size_t)t * ID, &l->ikpg, row);
+        mv(gates + (size_t)at * ID, &l->ikpg, row);
         mv(head_w + (size_t)t * IH, &l->iwp, row);
         for (int h = 0; h < IH; h++) head_w[(size_t)t * IH + h] /= sqrtf((float)IH);
     }
 
     const int width = coli_sparse_index_width(c->index_topk, c->index_kpool, c->index_kpool_tail);
     int *selected = malloc((size_t)tokens * width * sizeof(int));
-    if (coli_sparse_index_select(selected, iq, ik, gates, head_w, l->ikpa, valid,
-                                 tokens, IH, ID, c->index_kpool, c->index_topk,
-                                 c->index_kpool_tail)) {
+    if (coli_sparse_index_select_range(selected, iq, ik, gates, head_w, l->ikpa, valid,
+                                       seen, IH, ID, c->index_kpool, c->index_topk,
+                                       c->index_kpool_tail, base, seen)) {
         fprintf(stderr, "selezione indexer fallita\n"); exit(1);
     }
     /* GLM53_DUMP_INDEX=1 stampa le righe scelte dall'indexer: e' il primo
      * posto da guardare quando il motore diverge solo su certe lunghezze. */
     if (getenv("GLM53_DUMP_INDEX")) {
         for (int t = 0; t < tokens; t++) {
-            fprintf(stderr, "index q=%d ->", t);
+            fprintf(stderr, "index q=%d ->", base + t);
             for (int i = 0; i < width; i++) fprintf(stderr, " %d", selected[(size_t)t * width + i]);
             fprintf(stderr, "\n");
         }
     }
     float *context = malloc((size_t)tokens * H * V * sizeof(float));
-    if (coli_sparse_attention(context, queries, keys, values, selected,
-                              tokens, width, H, QK, V)) {
+    if (coli_sparse_attention_range(context, queries, keys, values, selected,
+                                    seen, width, H, QK, V, base, seen)) {
         fprintf(stderr, "attenzione sparsa fallita\n"); exit(1);
     }
     for (int t = 0; t < tokens; t++)
         mv(out + (size_t)t * c->hidden, &l->o, context + (size_t)t * H * V);
 
-    free(context); free(selected); free(valid); free(head_w); free(gates);
-    free(ik); free(iq); free(expanded); free(latent);
-    free(values); free(keys); free(queries); free(qa);
+    free(context); free(selected); free(valid); free(head_w);
+    free(iq); free(expanded); free(latent); free(queries); free(qa);
 }
 
 /* ---------- FFN: denso oppure MoE ---------- */
@@ -1402,6 +1434,51 @@ static float *vision_encode(GModel *m, const float *patches,
     return out;
 }
 
+/* ---------- sessione ---------- */
+static GSession *session_open(const GModel *m, int cap) {
+    const Cfg *c = &m->c;
+    GSession *s = calloc(1, sizeof(*s));
+    if (!s) { fprintf(stderr, "OOM sulla sessione\n"); exit(1); }
+    s->cap = cap;
+    s->layer = calloc((size_t)c->n_layers, sizeof(*s->layer));
+    if (!s->layer) { fprintf(stderr, "OOM sugli stati di layer\n"); exit(1); }
+    if (c->kda_proj)
+        s->kda_scratch = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd,
+                                                                c->kda_hd) * sizeof(float));
+    for (int i = 0; i < c->n_layers; i++) {
+        GLayerState *st = &s->layer[i];
+        if (c->is_full[i]) {
+            st->keys = malloc((size_t)cap * c->n_heads * c->qk_nope * sizeof(float));
+            st->values = malloc((size_t)cap * c->n_heads * c->v_head * sizeof(float));
+            st->ikeys = malloc((size_t)cap * c->index_hd * sizeof(float));
+            st->igates = malloc((size_t)cap * c->index_hd * sizeof(float));
+            if (!st->keys || !st->values || !st->ikeys || !st->igates) {
+                fprintf(stderr, "OOM sulla cache del layer %d\n", i); exit(1);
+            }
+        } else if (c->kda_proj) {
+            st->kda_state = calloc((size_t)c->kda_heads * c->kda_hd * c->kda_hd,
+                                   sizeof(float));
+            st->kda_window = calloc((size_t)3 * c->kda_proj * c->conv_k, sizeof(float));
+            if (!st->kda_state || !st->kda_window) {
+                fprintf(stderr, "OOM sullo stato KDA del layer %d\n", i); exit(1);
+            }
+        }
+    }
+    return s;
+}
+
+static void session_close(const GModel *m, GSession *s) {
+    if (!s) return;
+    for (int i = 0; i < m->c.n_layers; i++) {
+        GLayerState *st = &s->layer[i];
+        free(st->keys); free(st->values); free(st->ikeys); free(st->igates);
+        free(st->kda_state); free(st->kda_window);
+    }
+    free(s->kda_scratch);
+    free(s->layer);
+    free(s);
+}
+
 /* ---------- il passaggio completo ----------
  *
  * `vision` sono gli embedding usciti dalla torre, `n_vision` quanti sono: uno
@@ -1410,9 +1487,14 @@ static float *vision_encode(GModel *m, const float *patches,
  * `image_token_id`, quindi qui non c'e' nulla da inserire: si sostituisce la
  * riga dell'embedding testuale con quella della torre e le posizioni restano
  * quelle che sono. Prompt di solo testo passano vision=NULL, n_vision=0. */
-static float *forward(GModel *m, const int *tokens, int n,
-                      const float *vision, int n_vision) {
+static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
+                           const float *vision, int n_vision) {
     const Cfg *c = &m->c;
+    const int start = s->filled;   /* NON 'base': nel ciclo dei layer e' gia' preso */
+    if (start + n > s->cap) {
+        fprintf(stderr, "contesto esaurito: %d posizioni su %d\n", start + n, s->cap);
+        exit(1);
+    }
     const int H = c->hc_mult, D = c->hidden;
     float *streams = malloc((size_t)n * H * D * sizeof(float));
     float *next = malloc((size_t)n * H * D * sizeof(float));
@@ -1426,6 +1508,13 @@ static float *forward(GModel *m, const int *tokens, int n,
     int consumed = 0;
     for (int t = 0; t < n; t++) {
         const float *row;
+        /* Un id fuori dal vocabolario legge oltre la tabella degli embedding.
+         * Da CLI sarebbe un errore di battitura; da server e' input di rete. */
+        if (tokens[t] < 0 || tokens[t] >= c->vocab) {
+            fprintf(stderr, "token %d fuori dal vocabolario (0..%d)\n",
+                    tokens[t], c->vocab - 1);
+            exit(1);
+        }
         if (vision && c->image_token >= 0 && tokens[t] == c->image_token) {
             if (consumed >= n_vision) {
                 fprintf(stderr, "il prompt ha piu' token immagine (%d+) degli "
@@ -1448,14 +1537,6 @@ static float *forward(GModel *m, const int *tokens, int n,
         exit(1);
     }
 
-    float *state = NULL, *window = NULL, *scratch = NULL;
-    if (c->kda_proj) {
-        state = malloc((size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
-        window = malloc((size_t)3 * c->kda_proj * c->conv_k * sizeof(float));
-        scratch = malloc((size_t)coli_kda_scratch_floats(c->kda_heads, c->kda_hd, c->kda_hd)
-                         * sizeof(float));
-    }
-
     for (int i = 0; i < c->n_layers; i++) {
         GLayer *l = &m->layer[i];
         for (int site = 0; site < 2; site++) {
@@ -1470,12 +1551,13 @@ static float *forward(GModel *m, const int *tokens, int n,
                 rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
                     site ? l->post_ln : l->in_ln, D, c->eps);
             if (!site) {
-                if (c->is_full[i]) mla_layer(c, l, normed, n, branch);
-                else {
-                    memset(state, 0, (size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float));
-                    memset(window, 0, (size_t)3 * c->kda_proj * c->conv_k * sizeof(float));
-                    kda_layer(c, l, normed, n, branch, state, window, scratch);
-                }
+                GLayerState *st = &s->layer[i];
+                /* Lo stato non si azzera piu' a ogni chiamata: e' della
+                 * conversazione, e azzerarlo qui vorrebbe dire ricominciare
+                 * la ricorrenza a ogni token generato. */
+                if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
+                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
+                               s->kda_scratch);
             } else {
                 ffn_layer(m, l, i, normed, n, branch);
             }
@@ -1500,9 +1582,19 @@ static float *forward(GModel *m, const int *tokens, int n,
     for (int t = 0; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
 
-    free(scratch); free(window); free(state);
     free(comb); free(post); free(branch); free(normed); free(collapsed);
     free(next); free(streams);
+    s->filled = start + n;
+    return logits;
+}
+
+/* Il passaggio senza sessione: apre, macina tutto, chiude. E' quello che usano
+ * gli oracoli, dove il punto e' il risultato e non il tempo. */
+static float *forward(GModel *m, const int *tokens, int n,
+                      const float *vision, int n_vision) {
+    GSession *s = session_open(m, n);
+    float *logits = forward_span(m, s, tokens, n, vision, n_vision);
+    session_close(m, s);
     return logits;
 }
 
@@ -1546,6 +1638,242 @@ static int load_stops(const char *dir, int *out, int max) {
     return found;
 }
 
+/* ================= protocollo serve =================
+ *
+ * Due protocolli sulla stessa pipa, come gli altri motori (docs/serve_protocol.md):
+ * il mux con SERVE_BATCH=1, che e' quello che parlano openai_server.py e
+ * `coli web`, e quello interattivo con SERVE=1 da solo, che usa `coli chat`.
+ * Le righe escono una per write con fflush, e su Windows i due capi vanno messi
+ * in binario prima di tutto: la traduzione CRLF del CRT rovina i sentinelli e
+ * blocca le letture a byte contati (#195).
+ *
+ * Le richieste portano un indice di slot KV. Qui viene accettato e non usato:
+ * questo motore riprefilla ogni volta invece di riprendere la conversazione da
+ * dove era. E' piu' lento e non e' sbagliato, e il giorno che ci sara' una
+ * cache il protocollo non cambia. */
+static double now_s(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+static double rss_gb(void) {
+    struct rusage r; getrusage(RUSAGE_SELF, &r);
+    return r.ru_maxrss / 1e6;             /* ru_maxrss e' in KB anche su Windows */
+}
+
+static float g_temp = 0.0f, g_topp = 1.0f;
+
+/* Confronto per qsort. Una funzione annidata sarebbe piu' comoda ma e'
+ * un'estensione GCC, e questo file deve compilare anche con MSVC. */
+static const float *g_sort_key = NULL;
+static int compare_by_probability(const void *a, const void *b) {
+    const int x = *(const int *)a, y = *(const int *)b;
+    if (g_sort_key[x] < g_sort_key[y]) return 1;
+    if (g_sort_key[x] > g_sort_key[y]) return -1;
+    return 0;
+}
+
+/* Temperatura piu' nucleus. Con temperatura nulla e' argmax e basta. */
+static int sample_token(const float *logits, int vocab) {
+    if (g_temp <= 1e-4f) return argmax(logits, vocab);
+    static float *probability = NULL;
+    static int *order = NULL;
+    static int room = 0;
+    if (room < vocab) {
+        probability = realloc(probability, (size_t)vocab * sizeof(float));
+        order = realloc(order, (size_t)vocab * sizeof(int));
+        room = vocab;
+        if (!probability || !order) { fprintf(stderr, "OOM nel campionamento\n"); exit(1); }
+    }
+    float top = -INFINITY;
+    for (int i = 0; i < vocab; i++) if (logits[i] > top) top = logits[i];
+    double total = 0.0;
+    const float inverse = 1.0f / g_temp;
+    for (int i = 0; i < vocab; i++) {
+        probability[i] = expf((logits[i] - top) * inverse);
+        total += probability[i];
+        order[i] = i;
+    }
+    for (int i = 0; i < vocab; i++) probability[i] = (float)(probability[i] / total);
+
+    /* nucleus: si ordina per probabilita' e si taglia dove la somma supera
+     * top_p. Con vocab 154880 l'ordinamento pieno costa, ma succede una volta
+     * per token e il token costa incomparabilmente di piu'. */
+    g_sort_key = probability;
+    qsort(order, (size_t)vocab, sizeof(int), compare_by_probability);
+    double cumulative = 0.0;
+    int keep = vocab;
+    for (int i = 0; i < vocab; i++) {
+        cumulative += probability[order[i]];
+        if (cumulative >= g_topp) { keep = i + 1; break; }
+    }
+    double pick = ((double)rand() / ((double)RAND_MAX + 1.0)) * cumulative;
+    double walk = 0.0;
+    for (int i = 0; i < keep; i++) {
+        walk += probability[order[i]];
+        if (walk >= pick) return order[i];
+    }
+    return order[0];
+}
+
+typedef struct {
+    unsigned long long id;
+    int slot, max_tokens;
+    float temp, top_p;
+    char *payload;
+    int plen;
+} ServeReq;
+
+static int g_stop[16], g_nstop = 0;
+
+/* Gli stop, con la regola che gli altri motori hanno imparato a caro prezzo.
+ *
+ * In modalita' batch resta solo il vero fine testo. I marcatori di ruolo sono
+ * un confine che possiede il server Python, e tenerli come stop duri taglia la
+ * generazione nel momento in cui il modello apre un blocco strumenti, perche'
+ * il rumore dell'argmax a int4 preferisce l'id di uno stop al '<' giusto
+ * (#401). Con SERVE=1 e basta, invece, `coli chat` non ha nessun filtro a
+ * valle e gli stop gli servono tutti. */
+static void arm_stops(const char *dir, Tok *tokenizer, int batched) {
+    g_nstop = load_stops(dir, g_stop, 16);
+    if (!batched && tokenizer)
+        for (int id = 0; id < tokenizer->n_ids && g_nstop < 16; id++) {
+            if (!tokenizer->id_special[id]) continue;
+            int seen = 0;
+            for (int i = 0; i < g_nstop; i++) if (g_stop[i] == id) seen = 1;
+            if (!seen) g_stop[g_nstop++] = id;
+        }
+    fprintf(stderr, "[stop] %d token di stop:", g_nstop);
+    for (int i = 0; i < g_nstop; i++) fprintf(stderr, " %d", g_stop[i]);
+    fprintf(stderr, "%s\n", batched ? " (modalita' batch: solo fine testo)" : "");
+}
+
+static int is_stop(int token) {
+    for (int i = 0; i < g_nstop; i++) if (token == g_stop[i]) return 1;
+    return 0;
+}
+
+static void serve_line(const char *format, ...) {
+    va_list args; va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+    fflush(stdout);
+}
+
+/* Un token decodificato verso il server, con la sua lunghezza in byte. */
+static void serve_data(unsigned long long id, const char *text, int n) {
+    printf("DATA %llu %d\n", id, n);
+    fwrite(text, 1, (size_t)n, stdout);
+    putchar('\n');
+    fflush(stdout);
+}
+
+/* Una richiesta intera, o 0 su EOF. Il payload si legge a byte contati, non a
+ * righe: puo' contenerne. */
+static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
+    char header[512];
+    if (!fgets(header, sizeof(header), stdin)) return 0;
+    memset(q, 0, sizeof(*q));
+    if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
+    if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
+        sscanf(header, "%*s %llu", &q->id);
+        return 1;
+    }
+    if (strcmp(verb, "SUBMIT")) return 1;
+    if (sscanf(header, "SUBMIT %llu %d %d %d %f %f", &q->id, &q->slot, &q->plen,
+               &q->max_tokens, &q->temp, &q->top_p) != 6) {
+        strcpy(verb, "BAD_FRAME");
+        return 1;
+    }
+    if (q->plen < 0 || q->plen > (1 << 24)) { strcpy(verb, "BAD_FRAME"); return 1; }
+    q->payload = malloc((size_t)q->plen + 1);
+    if (!q->payload) { strcpy(verb, "BAD_FRAME"); return 1; }
+    if (q->plen && fread(q->payload, 1, (size_t)q->plen, stdin) != (size_t)q->plen) {
+        free(q->payload); q->payload = NULL;
+        strcpy(verb, "BAD_FRAME");
+        return 1;
+    }
+    q->payload[q->plen] = 0;
+    int trailing = fgetc(stdin);
+    (void)trailing;                        /* il '\n' di chiusura del frame */
+    return 1;
+}
+
+/* Genera per una richiesta e chiude col suo DONE. */
+static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
+    if (!q->plen) { serve_line("ERROR %llu EMPTY_PROMPT\n", q->id); return; }
+    g_temp = q->temp; g_topp = q->top_p > 0.0f ? q->top_p : 1.0f;
+
+    const int room = 1 << 16;
+    int *sequence = malloc((size_t)room * sizeof(int));
+    if (!sequence) { serve_line("ERROR %llu BAD_REQUEST\n", q->id); return; }
+    int total = tok_encode(tokenizer, q->payload, q->plen, sequence, room);
+    const int prompt_tokens = total;
+    if (!total) {
+        free(sequence);
+        serve_line("ERROR %llu EMPTY_PROMPT\n", q->id);
+        return;
+    }
+
+    const double started = now_s();
+    int emitted = 0, limited = 0;
+    const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
+
+    /* Il prompt si prefilla una volta; ogni token dopo costa un token. Lo slot
+     * KV della richiesta e' accettato e ignorato: la sessione vive quanto la
+     * richiesta, quindi due turni della stessa conversazione riprefillano.
+     * E' lavoro sprecato, non un errore, e il giorno che gli slot esistono
+     * davvero il protocollo qui non cambia. */
+    GSession *session = session_open(m, total + budget + 1);
+    float *logits = forward_span(m, session, sequence, total, NULL, 0);
+    int rows = total;
+    for (int step = 0; step < budget; step++) {
+        if (total >= room) { limited = 1; break; }
+        int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
+        free(logits);
+        logits = NULL;
+        if (is_stop(next)) break;
+        sequence[total++] = next;
+        emitted++;
+        char piece[512];
+        int written = tok_decode(tokenizer, &next, 1, piece, sizeof(piece) - 1);
+        serve_data(q->id, piece, written);
+        if (step + 1 == budget) { limited = 1; break; }
+        logits = forward_span(m, session, &next, 1, NULL, 0);
+        rows = 1;
+    }
+    free(logits);
+    session_close(m, session);
+    const double elapsed = now_s() - started;
+    serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
+               elapsed > 0 ? emitted / elapsed : 0.0,
+               m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
+               rss_gb(), prompt_tokens, limited);
+    free(sequence);
+}
+
+static void serve_loop(GModel *m, Tok *tokenizer) {
+    coli_serve_binary_mode();
+    setvbuf(stdin, NULL, _IONBF, 0);
+    serve_line("\x01\x01READY\x01\x01\n");
+    serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
+    for (;;) {
+        ServeReq q; char verb[16];
+        if (!serve_read_req(&q, verb, sizeof(verb))) break;   /* EOF: si esce */
+        if (!strcmp(verb, "SUBMIT")) {
+            serve_one(m, tokenizer, &q);
+            free(q.payload);
+        } else if (!strcmp(verb, "BAD_FRAME")) {
+            serve_line("ERROR %llu BAD_FRAME\n", q.id);
+        } else if (!strcmp(verb, "CANCEL")) {
+            /* Le richieste qui si servono una per volta e a fine giro, quindi
+             * un CANCEL arriva sempre per una che non e' piu' in volo. */
+            serve_line("ERROR %llu NOT_FOUND\n", q.id);
+        }
+        /* STOP e le righe che non riconosciamo si ignorano: la regola di
+         * compatibilita' del protocollo vale in tutte e due le direzioni. */
+    }
+}
+
 int main(int argc, char **argv) {
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
@@ -1560,6 +1888,26 @@ int main(int argc, char **argv) {
                  sscanf(argv[++i], "%dx%d", &grid_h, &grid_w) == 2) continue;
         else { fprintf(stderr, "argomento sconosciuto: %s\n", argv[i]); return 2; }
     }
+    /* SERVE=1 e SNAP=<dir>: il motore non e' piu' una CLI ma il capo di una
+     * pipa, e il modello arriva dall'ambiente perche' e' cosi' che lo lancia
+     * openai_server.py. */
+    if (getenv("SERVE")) {
+        const char *snap = getenv("SNAP");
+        if (!snap) { fprintf(stderr, "SERVE senza SNAP: non so quale modello aprire\n"); return 2; }
+        GModel served;
+        memset(&served, 0, sizeof(served));
+        model_load(&served, snap);
+        Tok serve_tok;
+        char tokenizer_path[1024];
+        snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json", snap);
+        tok_load(&serve_tok, tokenizer_path);
+        const char *batch = getenv("SERVE_BATCH");
+        arm_stops(snap, &serve_tok, batch && atoi(batch));
+        serve_loop(&served, &serve_tok);
+        tok_free(&serve_tok);
+        return 0;
+    }
+
     if (!dir || (!ids && !prompt_text)) {
         fprintf(stderr, "uso: %s --model DIR (--prompt TESTO | --ids a,b,c)\n"
                         "         [--greedy N] [--logits] [--patches FILE.f32 --grid HxW]\n",
@@ -1632,7 +1980,10 @@ int main(int argc, char **argv) {
         printf("vision_tokens %d\n", n_vision);
     }
 
-    float *logits = forward(&model, tokens, count, vision, n_vision);
+    /* Una sola sessione per tutta la generazione: il prompt si prefilla una
+     * volta e ogni token dopo costa un token, non tutto il prefisso. */
+    GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
+    float *logits = forward_span(&model, session, tokens, count, vision, n_vision);
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)
         printf(" %d", argmax(logits + (size_t)t * model.c.vocab, model.c.vocab));
@@ -1646,20 +1997,18 @@ int main(int argc, char **argv) {
     if (greedy > 0) {
         int stops[8];
         const int n_stops = has_tokenizer ? load_stops(dir, stops, 8) : 0;
-        int total = count;
-        int *sequence = malloc((size_t)(count + greedy) * sizeof(int));
-        memcpy(sequence, tokens, (size_t)count * sizeof(int));
+        /* `rows` dice quante righe ha l'ultimo blocco di logit: il prefill ne
+         * restituisce una per posizione, un passo incrementale una sola. In
+         * entrambi i casi quella che serve e' l'ultima. */
+        int rows = count;
         if (!has_tokenizer) printf("greedy");
         for (int step = 0; step < greedy; step++) {
+            int next = argmax(logits + (size_t)(rows - 1) * model.c.vocab, model.c.vocab);
             free(logits);
-            /* i token immagine restano nel prefisso a ogni passo, quindi la
-             * torre si rifornisce identica: non si riesegue e non si sposta */
-            logits = forward(&model, sequence, total, vision, n_vision);
-            int next = argmax(logits + (size_t)(total - 1) * model.c.vocab, model.c.vocab);
+            logits = NULL;
             int done = 0;
             for (int i = 0; i < n_stops; i++) if (next == stops[i]) done = 1;
             if (done) break;
-            sequence[total++] = next;
             if (has_tokenizer) {
                 char piece[512];
                 int written = tok_decode(&tokenizer, &next, 1, piece, sizeof(piece) - 1);
@@ -1668,9 +2017,12 @@ int main(int argc, char **argv) {
             } else {
                 printf(" %d", next);
             }
+            /* Il token nuovo non e' mai un segnaposto immagine: la torre ha
+             * gia' dato i suoi embedding durante il prefill. */
+            logits = forward_span(&model, session, &next, 1, NULL, 0);
+            rows = 1;
         }
         printf("\n");
-        free(sequence);
     }
     if (has_tokenizer) tok_free(&tokenizer);
     /* Contatori della cache esperti: servono a un test per accorgersi se lo
@@ -1679,6 +2031,7 @@ int main(int argc, char **argv) {
         printf("experts hits %ld miss %ld bytes %llu\n",
                model.hits, model.miss, (unsigned long long)model.ebytes);
     free(logits);
+    session_close(&model, session);
     free(vision);
     free(tokens);
     return 0;

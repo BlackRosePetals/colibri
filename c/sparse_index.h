@@ -41,6 +41,13 @@ static inline int coli_sparse_index_width(int topk, int pool, int with_tail) {
 
 /* Select the key blocks each query may attend.
  *
+ * In the range form, `keys`, `gates` and `valid` cover the whole sequence,
+ * because a query may attend anywhere behind it. `queries`, `head_w` and `out`
+ * cover only [q_from, q_to) and are indexed from zero: during decode the whole
+ * prefix is already in the cache and only the new token has a query, so making
+ * the caller allocate prefix-length query arrays would be asking it to build
+ * what it deliberately no longer computes.
+ *
  *   out       [sequence * width]  token indices, -1 where unused
  *   queries   [sequence * heads * dim]
  *   keys      [sequence * dim]     one indexer key per token (shared by heads)
@@ -50,13 +57,15 @@ static inline int coli_sparse_index_width(int topk, int pool, int with_tail) {
  *   valid     [sequence]           0 marks padding
  *
  * Returns 0, or -1 on bad arguments or allocation failure. */
-static inline int coli_sparse_index_select(int *out, const float *queries,
-                                           const float *keys, const float *gates,
-                                           const float *head_w, const float *ape,
-                                           const unsigned char *valid,
-                                           int sequence, int heads, int dim,
-                                           int pool, int topk, int with_tail) {
+static inline int coli_sparse_index_select_range(int *out, const float *queries,
+                                                 const float *keys, const float *gates,
+                                                 const float *head_w, const float *ape,
+                                                 const unsigned char *valid,
+                                                 int sequence, int heads, int dim,
+                                                 int pool, int topk, int with_tail,
+                                                 int q_from, int q_to) {
     if (!out || !queries || !keys || !gates || !head_w || !ape || !valid ||
+        q_from < 0 || q_to > sequence || q_from > q_to ||
         sequence < 1 || heads < 1 || dim < 1 || pool < 1 || topk < pool || topk % pool)
         return -1;
 
@@ -106,8 +115,8 @@ static inline int coli_sparse_index_select(int *out, const float *queries,
     }
 
     const float scale = 1.0f / sqrtf((float)dim);
-    for (int q = 0; q < sequence; q++) {
-        int *row = out + (size_t)q * width;
+    for (int q = q_from; q < q_to; q++) {
+        int *row = out + (size_t)(q - q_from) * width;
         for (int i = 0; i < width; i++) row[i] = -1;
         if (!valid[q]) continue;
 
@@ -116,11 +125,11 @@ static inline int coli_sparse_index_select(int *out, const float *queries,
             if (!complete[p] || last > q) { scores[p] = -FLT_MAX; continue; }
             float score = 0.0f;
             for (int h = 0; h < heads; h++) {
-                const float *query = queries + ((size_t)q * heads + h) * dim;
+                const float *query = queries + ((size_t)(q - q_from) * heads + h) * dim;
                 float dot = 0.0f;
                 for (int d = 0; d < dim; d++) dot += query[d] * pooled[(size_t)p * dim + d];
                 if (dot > 0.0f)                                  /* ReLU */
-                    score += head_w[(size_t)q * heads + h] * dot * scale;
+                    score += head_w[(size_t)(q - q_from) * heads + h] * dot * scale;
             }
             scores[p] = score;
         }
@@ -154,25 +163,39 @@ static inline int coli_sparse_index_select(int *out, const float *queries,
     return 0;
 }
 
+/* Tutte le query, che e' il caso del prefill. */
+static inline int coli_sparse_index_select(int *out, const float *queries,
+                                           const float *keys, const float *gates,
+                                           const float *head_w, const float *ape,
+                                           const unsigned char *valid,
+                                           int sequence, int heads, int dim,
+                                           int pool, int topk, int with_tail) {
+    return coli_sparse_index_select_range(out, queries, keys, gates, head_w, ape,
+                                          valid, sequence, heads, dim, pool, topk,
+                                          with_tail, 0, sequence);
+}
+
 /* Softmax attention restricted to the selected indices.
  *
  *   out      [sequence * heads * value_dim]
  *   indices  [sequence * width], -1 entries skipped
  *
  * Queries, keys and values are laid out [position][head][dim]. */
-static inline int coli_sparse_attention(float *out, const float *queries,
-                                        const float *keys, const float *values,
-                                        const int *indices, int sequence, int width,
-                                        int heads, int key_dim, int value_dim) {
+static inline int coli_sparse_attention_range(float *out, const float *queries,
+                                             const float *keys, const float *values,
+                                             const int *indices, int sequence, int width,
+                                             int heads, int key_dim, int value_dim,
+                                             int q_from, int q_to) {
     if (!out || !queries || !keys || !values || !indices || sequence < 1 ||
-        width < 1 || heads < 1 || key_dim < 1 || value_dim < 1) return -1;
+        width < 1 || heads < 1 || key_dim < 1 || value_dim < 1 ||
+        q_from < 0 || q_to > sequence || q_from > q_to) return -1;
     float *scores = malloc((size_t)width * sizeof(*scores));
     if (!scores) return -1;
     const float scale = 1.0f / sqrtf((float)key_dim);
-    for (int q = 0; q < sequence; q++) {
-        const int *selected = indices + (size_t)q * width;
+    for (int q = q_from; q < q_to; q++) {
+        const int *selected = indices + (size_t)(q - q_from) * width;
         for (int h = 0; h < heads; h++) {
-            const float *query = queries + ((size_t)q * heads + h) * key_dim;
+            const float *query = queries + ((size_t)(q - q_from) * heads + h) * key_dim;
             float maximum = -FLT_MAX;
             int used = 0;
             for (int slot = 0; slot < width; slot++) {
@@ -185,7 +208,7 @@ static inline int coli_sparse_attention(float *out, const float *queries,
                 if (scores[used] > maximum) maximum = scores[used];
                 used++;
             }
-            float *result = out + ((size_t)q * heads + h) * value_dim;
+            float *result = out + ((size_t)(q - q_from) * heads + h) * value_dim;
             memset(result, 0, (size_t)value_dim * sizeof(*result));
             if (!used) continue;
             float total = 0.0f;
@@ -205,6 +228,15 @@ static inline int coli_sparse_attention(float *out, const float *queries,
     }
     free(scores);
     return 0;
+}
+
+/* Tutte le query, che e' il caso del prefill. */
+static inline int coli_sparse_attention(float *out, const float *queries,
+                                        const float *keys, const float *values,
+                                        const int *indices, int sequence, int width,
+                                        int heads, int key_dim, int value_dim) {
+    return coli_sparse_attention_range(out, queries, keys, values, indices, sequence,
+                                       width, heads, key_dim, value_dim, 0, sequence);
 }
 
 #endif /* COLIBRI_SPARSE_INDEX_H */
