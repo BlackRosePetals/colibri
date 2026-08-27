@@ -16,6 +16,13 @@ a real model without loading every transformer layer locally.
 The ABI is additive. Ordinary Colibri CLIs do not link or register Edge
 adapters and keep their existing initialization and inference paths.
 
+External consumers can build the complete CPU-baseline runtime with
+`make -C c segment-edge-library`. The resulting
+`c/build/segment/libcolibri_segment_edge.a` contains both public runtimes and
+all six built-in adapters. Consumers link it after their own objects and call
+the explicit registration functions below; ordinary Colibri executables do
+not link this archive.
+
 ## Lifecycle and compatibility
 
 1. Explicitly register the required adapters during process initialization.

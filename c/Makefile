@@ -1293,7 +1293,7 @@ include Makefile.deepseek-v4.units
 # is advertised only after an adapter has a real backend implementation.
 SEGMENT_BUILD_DIR = build/segment
 SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
-	-DCOLI_VULKAN,$(CFLAGS)) -D_GNU_SOURCE -include pthread.h \
+	-DCOLI_VULKAN,$(CFLAGS)) -include pthread.h \
 	-DCOLI_SEGMENT_ADAPTER -DCOLI_EDGE_ADAPTER
 SEGMENT_ENGINE_OBJS = \
 	$(SEGMENT_BUILD_DIR)/glm.o \
@@ -1307,6 +1307,10 @@ SEGMENT_V4_OBJS = $(addprefix $(SEGMENT_BUILD_DIR)/,$(addsuffix .o,$(SEGMENT_V4_
 SEGMENT_V4_REGISTRY_OBJ = $(SEGMENT_BUILD_DIR)/expert_store_registry.o
 SEGMENT_ALL_OBJS = $(SEGMENT_ENGINE_OBJS) $(SEGMENT_V4_OBJS) \
 	$(SEGMENT_V4_REGISTRY_OBJ)
+SEGMENT_RUNTIME_OBJS = \
+	$(SEGMENT_BUILD_DIR)/segment_runtime.o \
+	$(SEGMENT_BUILD_DIR)/edge_runtime.o
+SEGMENT_RUNTIME_LIB = $(SEGMENT_BUILD_DIR)/libcolibri_segment_edge.a
 
 $(SEGMENT_BUILD_DIR):
 	mkdir -p $@
@@ -1345,6 +1349,18 @@ $(SEGMENT_V4_OBJS): $(SEGMENT_BUILD_DIR)/%.o: deepseek_v4.c deepseek_v4.h \
 $(SEGMENT_V4_REGISTRY_OBJ): expert_store_registry.c expert_store_registry.h \
 		expert_store.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -c expert_store_registry.c -o $@
+
+$(SEGMENT_BUILD_DIR)/segment_runtime.o: segment_runtime.c segment_runtime.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c segment_runtime.c -o $@
+
+$(SEGMENT_BUILD_DIR)/edge_runtime.o: edge_runtime.c edge_runtime.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -c edge_runtime.c -o $@
+
+$(SEGMENT_RUNTIME_LIB): $(SEGMENT_RUNTIME_OBJS) $(SEGMENT_ALL_OBJS)
+	$(AR) rcs $@ $^
+
+.PHONY: segment-edge-library
+segment-edge-library: $(SEGMENT_RUNTIME_LIB)
 
 tests/test_segment_adapters_registration$(EXE): \
 		tests/test_segment_adapters_registration.c segment_runtime.c \
