@@ -49,7 +49,7 @@ def minimax_geometry(config, context, _model_dir):
     return PlannerGeometry(state, 0, 0, config["num_local_experts"])
 
 
-TEST_INVENTORY = lambda _name, _size, _config: ()
+TEST_INVENTORY = lambda _name, _size, _config, _dtype=None: ()
 QWEN36_FIXTURE = FamilyDescriptor(
     id="qwen36",
     model_types=("qwen3_5_moe_text",),
@@ -246,20 +246,40 @@ class FamilyRegistryTest(unittest.TestCase):
                                    "model_dir": "."})()
         prefix = "model.language_model.layers.7.mlp.experts.23"
         self.assertEqual(expert_contributions(
-            resolved, prefix + ".gate_proj.weight", 256), ((7, 23, 1024),))
+            resolved, prefix + ".gate_proj.weight", 256, "F8_E4M3"),
+            ((7, 23, 256),))
         self.assertEqual(expert_contributions(
-            resolved, prefix + ".up_proj.weight", 512), ((7, 23, 1024),))
+            resolved, prefix + ".up_proj.weight", 512, "BF16"),
+            ((7, 23, 512),))
         self.assertEqual(expert_contributions(
-            resolved, prefix + ".down_proj.weight", 1024), ((7, 23, 1024),))
+            resolved, prefix + ".down_proj.weight", 1024, "F32"),
+            ((7, 23, 1024),))
         self.assertEqual(expert_contributions(
-            resolved, prefix + ".down_proj.weight_scale_inv", 16), ((7, 23, 0),))
+            resolved, prefix + ".down_proj.weight", 512, "F16"),
+            ((7, 23, 1024),))
+        self.assertEqual(expert_contributions(
+            resolved, prefix + ".down_proj.weight_scale_inv", 4, "F32"),
+            ((7, 23, 4),))
+        with self.assertRaisesRegex(ValueError, "unsupported dtype/size"):
+            expert_contributions(
+                resolved, prefix + ".down_proj.weight_scale_inv", 16, "F32")
         fused = "model.layers.7.mlp.experts.gate_up_proj"
-        contributions = expert_contributions(resolved, fused, 512 * 2 * 32 * 8 * 2)
+        fused_size = 512 * 2 * 32 * 8 * 2
+        contributions = expert_contributions(resolved, fused, fused_size, "BF16")
         self.assertEqual(len(contributions), 512)
+        self.assertEqual(contributions[23], (7, 23, 1024))
+        contributions = expert_contributions(resolved, fused, fused_size, "F16")
         self.assertEqual(contributions[23], (7, 23, 2048))
 
         self.assertEqual(resident_contribution(
-            resolved, "model.language_model.layers.0.self_attn.q_proj.weight", 100), 200)
+            resolved, "model.language_model.layers.0.self_attn.q_proj.weight",
+            100, "BF16"), 100)
+        self.assertEqual(resident_contribution(
+            resolved, "model.language_model.layers.0.self_attn.q_proj.weight",
+            100, "F16"), 200)
+        self.assertEqual(resident_contribution(
+            resolved, "model.language_model.layers.0.self_attn.q_norm.weight",
+            100, "BF16"), 200)
         self.assertEqual(resident_contribution(
             resolved, "model.visual.blocks.0.attn.qkv.weight", 100), 0)
         self.assertEqual(resident_contribution(

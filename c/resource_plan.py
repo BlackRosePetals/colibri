@@ -24,7 +24,7 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 3
+_ANALYSIS_CACHE_VERSION = 6
 
 
 def _analysis_signature(shards, config_path):
@@ -53,7 +53,10 @@ def _tensor_sizes(path):
         start, end = meta["data_offsets"]
         if not 0 <= start <= end <= file_size - 8 - length:
             raise ValueError(f"invalid tensor offsets for {name}: {path}")
-        yield name, end - start
+        dtype = meta.get("dtype")
+        if not isinstance(dtype, str):
+            raise ValueError(f"invalid tensor dtype for {name}: {path}")
+        yield name, end - start, dtype
 
 
 def analyze_model(model):
@@ -111,20 +114,25 @@ def analyze_model(model):
             # storage, all of them is the mount.
             raise OSError(error.errno,
                           f"{error.strerror or error}: {shard}") from error
-        for name, size in sizes:
+        for name, size, dtype in sizes:
             tensor_names.add(name)
-            contributions = expert_contributions(resolved, name, size)
+            contributions = expert_contributions(resolved, name, size, dtype)
             if contributions:
                 for layer, expert, byte_count in contributions:
                     key = (layer, expert)
                     expert_groups[key] = expert_groups.get(key, 0) + byte_count
             else:
-                dense_bytes += resident_contribution(resolved, name, size)
+                dense_bytes += resident_contribution(resolved, name, size, dtype)
 
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
         layer_sizes.setdefault(layer, []).append(size)
-    per_layer = {layer: int(statistics.median(sizes)) for layer, sizes in layer_sizes.items()}
+    # Most families ship uniform experts and retain the historical median to
+    # tolerate container padding. Qwen3.8 explicitly accepts heterogeneous
+    # source dtypes; one LRU slot may hold any expert, so each layer must be
+    # priced at its largest retained representation just like the C runtime.
+    reducer = max if resolved.descriptor.id == "qwen38" else statistics.median
+    per_layer = {layer: int(reducer(sizes)) for layer, sizes in layer_sizes.items()}
     per_cap_bytes = sum(per_layer.values())
     typical_expert_bytes = int(statistics.median(per_layer.values())) if per_layer else 0
     max_expert_bytes = max(per_layer.values(), default=0)
@@ -1025,6 +1033,14 @@ def environment_for_plan(plan, env=None, cuda_enabled=True):
              isinstance(planned_cap, bool) or planned_cap < 1)):
         raise ValueError(
             "Qwen3.8 RAM budget cannot hold one expert slot per loaded layer")
+    if plan.get("model", {}).get("family_id") == "qwen38":
+        disabled = [name for name in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16")
+                    if result.get(name) == "0"]
+        if disabled:
+            raise ValueError(
+                "Qwen3.8 auto-tier requires native expert storage; unset " +
+                ", ".join(disabled) +
+                " or disable auto-tier and choose an explicit cache cap")
     if (isinstance(planned_cap, int) and not isinstance(planned_cap, bool) and
             planned_cap >= 1):
         # Private bridge for engines whose expert capacity is an argv value.

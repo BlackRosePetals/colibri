@@ -7,7 +7,7 @@
  *
  * Resident tensors are loaded from the official multimodal checkpoint's text
  * namespace.  Vision and MTP tensors are indexed but never read.  Official
- * block-FP8 experts are decoded into a bounded per-layer LRU; the 51B-parameter
+ * block-FP8 experts remain native in a bounded per-layer LRU; the 51B-parameter
  * PLE table remains on disk and only its sixteen 160-byte rows/token are read.
  *
  * Runtime: SNAP=<dir>, optional Q38_MAXT, and argv
@@ -558,6 +558,7 @@ cleanup:
     if(result)free_tokenizer();
     return result;
 }
+
 /* Decode token ids to text using g_tok, writing to stdout. Handles Qwen's
  * byte-representation markers (Ġ=space, Ċ=newline, ▁=space) and <0xXX> byte
  * fallback. Only active when a tokenizer was loaded. */
@@ -579,6 +580,8 @@ static int q38_completion_nonce(double monotonic_seconds){
     double within_ten=fmod(monotonic_seconds,10.0);
     return (int)(within_ten*1000.0)%10000;
 }
+/* Decode throughput is reciprocal TPOT: prefill produces token one, so N
+ * completion tokens contain exactly N-1 measured decode intervals. */
 static double q38_decode_rate(int generated,double decode_seconds){
     return generated>1&&isfinite(decode_seconds)&&decode_seconds>1e-6?
            (double)(generated-1)/decode_seconds:0.0;
@@ -1196,6 +1199,29 @@ static int serve_eos_ids(int *ids,int cap,int config_eos,int vocab){
     return n;
 }
 
+static double q38_cache_hit_percent(uint64_t hits,uint64_t misses){
+    double total=(double)hits+(double)misses;
+    return total?100.0*(double)hits/total:0.0;
+}
+
+static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_tokens,
+                            int completion_tokens,const Q38Timers *timers){
+    double expert_read=timers->seconds[Q38_TM_EXPERT_READ];
+    double fp8_expand=timers->seconds[Q38_TM_FP8_EXPAND];
+    double expert_compute=timers->seconds[Q38_TM_ROUTED_EXPERT]+
+                          timers->seconds[Q38_TM_SHARED_EXPERT];
+    double attention=timers->seconds[Q38_TM_DELTANET]+
+                     timers->seconds[Q38_TM_QSA_INDEX]+
+                     timers->seconds[Q38_TM_QSA_ATTENTION];
+    int count=snprintf(out,capacity,
+        "PROF %.3f %d %d %.3f %.3f %.3f %.3f %.3f %llu\n",
+        wall_s,prompt_tokens,completion_tokens,expert_read,
+        expert_read+fp8_expand,expert_compute,attention,
+        timers->seconds[Q38_TM_LM_HEAD],
+        (unsigned long long)timers->forwards);
+    return count>=0&&(size_t)count<capacity?count:-1;
+}
+
 static int serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
@@ -1206,12 +1232,15 @@ static int serve_one(Model *m, ServeReq *q){
         fflush(stdout); free(ids); return 0;
     }
     printf("ACCEPT %s %d\n",q->id,np); fflush(stdout);
+    double request_started=now_s();
+    uint64_t hits_before=m->hits, misses_before=m->miss;
+    Q38Timers timers_before=m->timers;
     m->max_t = np + q->max_tok;
     reset_recurrent(m); ensure_kv(m); m->kv_len = 0;
     float *lo = step(m, ids, np, 0);
     int gen=0, limited=1, cancelled=0, stopped=0, input_eof=0;
     int eos_ids[4];int n_eos=serve_eos_ids(eos_ids,4,m->c.eos_id,m->c.vocab);
-    double decode_t0=0.0;
+    double first_token_at=0.0,last_token_at=0.0;
     unsigned char sbuf[16]; int sbn=0;
     for(int s=0;s<q->max_tok;s++){
         while(!input_eof&&coli_stdin_readable()){
@@ -1225,7 +1254,9 @@ static int serve_one(Model *m, ServeReq *q){
         free(lo); lo=NULL;
         int is_eos=0; for(int e=0;e<n_eos;e++) if(tk==eos_ids[e]) is_eos=1;
         if(is_eos){ limited=0; break; }
-        if(!gen)decode_t0=now_s();
+        double token_at=now_s();
+        if(!gen)first_token_at=token_at;
+        last_token_at=token_at;
         unsigned char *token=NULL;int token_n=0;
         if(decode_id_alloc(tk,&token,&token_n)){fprintf(stderr,"[decode] out of memory\n");exit(1);}
         if(token_n>(INT_MAX-3)/3){free(token);fprintf(stderr,"[decode] token is too large\n");exit(1);}
@@ -1258,10 +1289,21 @@ static int serve_one(Model *m, ServeReq *q){
         fprintf(stderr,"[decode] invalid UTF-8 finalization\n");exit(1);
     }
     if(tail_n)serve_data(q->id,(char*)tail,tail_n);
-    double dt=gen>1?now_s()-decode_t0:0.0;
-    printf("DONE %s STAT %d %.3f %.1f %.2f %d %d\n",q->id,gen,
-           q38_decode_rate(gen,dt),0.0,rss_gb(),np,limited);
+    double wall_s=now_s()-request_started;
+    double decode_s=gen>1?last_token_at-first_token_at:0.0;
+    uint64_t hits=m->hits-hits_before,misses=m->miss-misses_before;
+    Q38Timers timers=q38_tm_delta(&m->timers,&timers_before);
+    ColiServeDone done={gen,q38_decode_rate(gen,decode_s),
+                        q38_cache_hit_percent(hits,misses),rss_gb(),np,limited};
+    coli_serve_write_done(stdout,q->id,&done);
+    /* Stable dashboard contract.  Disk service and synchronous miss wait
+     * intentionally overlap; all finer Qwen phases remain available through
+     * COLI_TIMERS=1 without widening the shared frame. */
+    char profile[256];int profile_bytes=q38_format_prof(profile,sizeof profile,wall_s,np,gen,&timers);
+    if(profile_bytes>0)fwrite(profile,1,(size_t)profile_bytes,stdout);
+    else fprintf(stderr,"[qwen38] internal error: PROF frame overflow\n");
     fflush(stdout);
+    q38_tm_report_bank(&timers,"request");
     return input_eof?-1:0;
 }
 
@@ -1333,6 +1375,7 @@ int main(int argc, char **argv) {
                 "[enc] a complete tokenizer.json is required (put it in SNAP or set TOK)\n");
         free_tokenizer();return 1;
     }
+
     if (serve_mode) {
         /* no argv prompt to load */
     } else if (is_ref) {
@@ -1489,7 +1532,7 @@ int main(int argc, char **argv) {
     }
     double tot = m.hits + m.miss;
     if (g_ttft >= 0) fprintf(stderr, "TTFT: %.2f s (time to first token)\n", g_ttft);
-    tm_report();
+    tm_report(&m);
     fprintf(stderr, "\nPEAK RSS: %.2f GB\n", rss_gb());
     fprintf(stderr, "Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n", tot?100.0*m.hits/tot:0.0,
            (unsigned long long)m.hits, (unsigned long long)m.miss);
@@ -1515,19 +1558,167 @@ static int q38_u64_add(uint64_t *total,uint64_t value){
     if(!total||*total>UINT64_MAX-value)return -1;*total+=value;return 0;
 }
 
-static int q38_segment_cache_capacity(const Cfg *c,uint32_t range_layers,
-                                      uint64_t memory_limit,int *capacity,
-                                      uint64_t *slot_bytes){
-    uint64_t cells,bytes;
-    if(!c||!range_layers||!capacity||q38_u64_mul((uint64_t)c->hidden,
-       (uint64_t)c->inter,&cells)||q38_u64_mul(cells,3u,&cells)||
-       q38_u64_mul(cells,sizeof(float),&bytes))return -1;
-    if(slot_bytes)*slot_bytes=bytes;
+enum {
+    Q38_EXPERT_FP8_BLOCK = 1u << 0,
+    Q38_EXPERT_FP8_EXPANDED = 1u << 1,
+    Q38_EXPERT_BF16 = 1u << 2,
+    Q38_EXPERT_F16 = 1u << 3,
+    Q38_EXPERT_F32 = 1u << 4
+};
+
+/* Return the bytes retained by one cache matrix after loading.  The source
+ * dtype alone is not enough: native FP8 retains its F32 block scales, native
+ * BF16 retains two-byte elements, and both opt-out modes retain expanded F32.
+ * Keeping this calculation beside the loader's representation choices makes
+ * Segment's memory contract describe the allocation it actually performs. */
+static int q38_segment_matrix_bytes(Model *m,const char *weight_name,
+                                    int rows,int cols,uint64_t *bytes,
+                                    unsigned *numeric_kinds){
+    st_tensor *weight=st_find(&m->S,weight_name);uint64_t elements;
+    if(!weight||weight->rank!=2||weight->shape[0]!=rows||
+       weight->shape[1]!=cols||weight->numel!=(int64_t)rows*cols||
+       q38_u64_mul((uint64_t)rows,(uint64_t)cols,&elements))return -1;
+    if(weight->dtype==4){
+        char scale_name[340];
+        int length=snprintf(scale_name,sizeof scale_name,"%s_scale_inv",weight_name);
+        int64_t block_rows=fp8_nblk(rows),block_cols=fp8_nblk(cols);
+        st_tensor *scale=length>0&&(size_t)length<sizeof scale_name?
+                         st_find(&m->S,scale_name):NULL;
+        if(!scale||scale->dtype<0||scale->dtype>2||scale->rank!=2||
+           scale->shape[0]!=block_rows||scale->shape[1]!=block_cols||
+           scale->numel!=block_rows*block_cols)return -1;
+        if(m->native_fp8){
+            uint64_t scale_bytes;
+            if(q38_u64_mul((uint64_t)scale->numel,sizeof(float),&scale_bytes)||
+               q38_u64_add(&elements,scale_bytes))return -1;
+            *bytes=elements;*numeric_kinds|=Q38_EXPERT_FP8_BLOCK;
+        }else{
+            if(q38_u64_mul(elements,sizeof(float),bytes))return -1;
+            *numeric_kinds|=Q38_EXPERT_FP8_EXPANDED;
+        }
+        return 0;
+    }
+    if(weight->dtype<0||weight->dtype>2)return -1;
+    uint64_t element_bytes=weight->dtype==0&&m->native_bf16?
+                           sizeof(uint16_t):sizeof(float);
+    if(q38_u64_mul(elements,element_bytes,bytes))return -1;
+    *numeric_kinds|=weight->dtype==0?Q38_EXPERT_BF16:
+                    weight->dtype==1?Q38_EXPERT_F16:Q38_EXPERT_F32;
+    return 0;
+}
+
+static int q38_segment_fused_matrix_bytes(Model *m,const st_tensor *tensor,
+                                          int64_t elements,uint64_t *bytes,
+                                          unsigned *numeric_kinds){
+    if(!tensor||tensor->dtype<0||tensor->dtype>2||elements<1)return -1;
+    uint64_t element_bytes=tensor->dtype==0&&m->native_bf16?
+                           sizeof(uint16_t):sizeof(float);
+    if(q38_u64_mul((uint64_t)elements,element_bytes,bytes))return -1;
+    *numeric_kinds|=tensor->dtype==0?Q38_EXPERT_BF16:
+                    tensor->dtype==1?Q38_EXPERT_F16:Q38_EXPERT_F32;
+    return 0;
+}
+
+/* Sum the maximum possible resident expert slot for every layer in the loaded
+ * range.  Individual-expert containers are allowed to be heterogeneous, so a
+ * layer is priced at its largest expert rather than assuming expert zero is
+ * representative.  Fused containers have one dtype/geometry for every expert. */
+static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
+                                     uint64_t *bytes_per_capacity,
+                                     unsigned *numeric_kinds){
+    if(!m||!bytes_per_capacity||!numeric_kinds||begin>=end||
+       end>(uint32_t)m->c.layers)return -1;
+    Cfg *c=&m->c;uint64_t range_bytes=0;unsigned kinds=0;
+    for(uint32_t layer=begin;layer<end;layer++){
+        char name[320];q38_name(m,name,sizeof name,(int)layer,
+                                "mlp.experts.gate_up_proj");
+        st_tensor *gate_up=st_find(&m->S,name);uint64_t layer_bytes=0;
+        if(gate_up){
+            if(gate_up->rank!=3||gate_up->shape[0]!=c->experts||
+               gate_up->shape[1]!=(int64_t)2*c->inter||
+               gate_up->shape[2]!=c->hidden)return -1;
+            uint64_t part;
+            if(q38_segment_fused_matrix_bytes(m,gate_up,
+                 (int64_t)2*c->inter*c->hidden,&part,&kinds)||
+               q38_u64_add(&layer_bytes,part))return -1;
+            q38_name(m,name,sizeof name,(int)layer,"mlp.experts.down_proj");
+            st_tensor *down=st_find(&m->S,name);
+            if(!down||down->rank!=3||down->shape[0]!=c->experts||
+               down->shape[1]!=c->hidden||down->shape[2]!=c->inter||
+               q38_segment_fused_matrix_bytes(m,down,
+                    (int64_t)c->hidden*c->inter,&part,&kinds)||
+               q38_u64_add(&layer_bytes,part))return -1;
+        }else{
+            const char *projection[3]={"gate_proj","up_proj","down_proj"};
+            int rows[3]={c->inter,c->inter,c->hidden};
+            int cols[3]={c->hidden,c->hidden,c->inter};
+            for(int expert=0;expert<c->experts;expert++){
+                uint64_t expert_bytes=0;
+                for(int projection_index=0;projection_index<3;projection_index++){
+                    char suffix[192];
+                    int length=snprintf(suffix,sizeof suffix,
+                        "mlp.experts.%d.%s.weight",expert,
+                        projection[projection_index]);
+                    if(length<0||(size_t)length>=sizeof suffix)return -1;
+                    q38_name(m,name,sizeof name,(int)layer,suffix);
+                    uint64_t part;
+                    if(q38_segment_matrix_bytes(m,name,rows[projection_index],
+                         cols[projection_index],&part,&kinds)||
+                       q38_u64_add(&expert_bytes,part))return -1;
+                }
+                if(expert_bytes>layer_bytes)layer_bytes=expert_bytes;
+            }
+        }
+        if(!layer_bytes||q38_u64_add(&range_bytes,layer_bytes))return -1;
+    }
+    *bytes_per_capacity=range_bytes;*numeric_kinds=kinds;return 0;
+}
+
+static int q38_segment_cache_capacity(uint64_t bytes_per_capacity,int experts,
+                                      uint64_t memory_limit,int *capacity){
+    if(!bytes_per_capacity||experts<1||!capacity)return -1;
     if(!memory_limit){*capacity=1;return 0;}
-    uint64_t slots=memory_limit/bytes/range_layers;
+    uint64_t slots=memory_limit/bytes_per_capacity;
     if(!slots)return -1;
-    if(slots>(uint64_t)c->experts)slots=(uint64_t)c->experts;
+    if(slots>(uint64_t)experts)slots=(uint64_t)experts;
     *capacity=(int)slots;return 0;
+}
+
+static void q38_segment_numeric_class(char *out,size_t capacity,
+                                      unsigned numeric_kinds){
+    const char *known=NULL;
+    switch(numeric_kinds){
+        case Q38_EXPERT_FP8_BLOCK:
+            known="qwen38/fp8-block-f32dot-f64blocksum/cpu-v1";break;
+        case Q38_EXPERT_FP8_EXPANDED:
+            known="qwen38/fp8-expanded-f32dot/cpu-v1";break;
+        case Q38_EXPERT_BF16:
+            known="qwen38/bf16-values-f32dot/cpu-v1";break;
+        case Q38_EXPERT_F16:
+            known="qwen38/f16-expanded-f32dot/cpu-v1";break;
+        case Q38_EXPERT_F32:
+            known="qwen38/f32dot/cpu-v1";break;
+        default:
+            /* The bitset is part of this opaque compatibility identifier. In
+             * particular, FP8_BLOCK and FP8_EXPANDED are different bits, so a
+             * heterogeneous range cannot silently change its reduction rules
+             * while continuing to claim snapshot/numeric compatibility. */
+            snprintf(out,capacity,"qwen38/mixed-expert-arithmetic-%02x/cpu-v1",
+                     numeric_kinds);return;
+    }
+    snprintf(out,capacity,"%s",known);
+}
+
+static int q38_segment_cache_resize(Model *m,int capacity){
+    if(!m||capacity<1)return -1;
+    for(int layer=m->range_begin;layer<m->range_end;layer++){
+        LCache *cache=&m->cache[layer];
+        if(cache->n)return -1;
+        Slot *slots=(Slot*)calloc((size_t)capacity,sizeof(*slots));
+        if(!slots)return -1;
+        free(cache->slots);cache->slots=slots;cache->cap=capacity;
+    }
+    return 0;
 }
 
 static int q38_segment_session_state_bytes(const Cfg *c,uint32_t begin,
@@ -1607,19 +1798,35 @@ static int qwen38_segment_engine_open(
     if (!options->context_tokens || options->context_tokens>(uint32_t)maxctx || options->context_tokens>INT_MAX){free(probe.is_attn);
         return coli_segment_adapter_error(error,error_size,"Qwen3.8 Segment context exceeds model limit");
     }
-    int cap=1;uint64_t slot_bytes=0;
-    if(q38_segment_cache_capacity(&probe,end-options->layer_begin,
-                                  options->memory_limit_bytes,&cap,&slot_bytes)){
-        free(probe.is_attn);
-        return coli_segment_adapter_error(error,error_size,
-            "Qwen3.8 Segment memory limit cannot hold one expert per loaded layer");
-    }
     free(probe.is_attn);
     Qwen38SegmentEngine *e=(Qwen38SegmentEngine*)calloc(1,sizeof(*e));
     if(!e) return coli_segment_adapter_error(error,error_size,"out of memory opening Qwen3.8 Segment");
     e->layer_begin=options->layer_begin; e->layer_end=end; e->context_tokens=options->context_tokens;
     if(pthread_mutex_init(&e->run_lock,NULL)){free(e);return coli_segment_adapter_error(error,error_size,"cannot initialize Qwen3.8 Segment lock");}
-    model_init_range(&e->model,options->model_dir,cap,8,(int)e->layer_begin,(int)e->layer_end,0,0);
+    /* Open with a single empty cache slot so tensor metadata and the effective
+     * native-storage switches are available before honoring the caller's
+     * budget. No expert is loaded during model_init_range, so resizing here
+     * cannot discard data or perturb LRU state. */
+    model_init_range(&e->model,options->model_dir,1,8,
+                     (int)e->layer_begin,(int)e->layer_end,0,0);
+    uint64_t bytes_per_capacity=0;unsigned numeric_kinds=0;int cap=1;
+    if(q38_segment_expert_layout(&e->model,e->layer_begin,e->layer_end,
+                                 &bytes_per_capacity,&numeric_kinds)){
+        q38_model_free(&e->model);pthread_mutex_destroy(&e->run_lock);free(e);
+        return coli_segment_adapter_error(error,error_size,
+            "Qwen3.8 Segment checkpoint has an unsupported expert layout");
+    }
+    if(q38_segment_cache_capacity(bytes_per_capacity,e->model.c.experts,
+                                  options->memory_limit_bytes,&cap)){
+        q38_model_free(&e->model);pthread_mutex_destroy(&e->run_lock);free(e);
+        return coli_segment_adapter_error(error,error_size,
+            "Qwen3.8 Segment memory limit cannot hold one expert per loaded layer");
+    }
+    if(cap!=1&&q38_segment_cache_resize(&e->model,cap)){
+        q38_model_free(&e->model);pthread_mutex_destroy(&e->run_lock);free(e);
+        return coli_segment_adapter_error(error,error_size,
+            "out of memory sizing Qwen3.8 Segment expert cache");
+    }
     e->model.max_t=(int)e->context_tokens; e->model.kv_cap=(int)e->context_tokens;
     memset(capabilities,0,sizeof(*capabilities)); capabilities->struct_size=sizeof(*capabilities);
     capabilities->abi_version=COLI_SEGMENT_ABI_VERSION;
@@ -1627,7 +1834,8 @@ static int qwen38_segment_engine_open(
                         COLI_SEGMENT_CAP_MULTI_SESSION|COLI_SEGMENT_CAP_CPU;
     coli_segment_capability_string(capabilities->engine_id,sizeof(capabilities->engine_id),"qwen38");
     coli_segment_capability_string(capabilities->state_schema,sizeof(capabilities->state_schema),"qwen38/hyper-kv-deltanet-ple-f32-v1");
-    snprintf(capabilities->numeric_class,sizeof(capabilities->numeric_class),"qwen38/f32-fp8experts/cpu-v1");
+    q38_segment_numeric_class(capabilities->numeric_class,
+                              sizeof(capabilities->numeric_class),numeric_kinds);
     capabilities->state_dtype=COLI_SEGMENT_DTYPE_F32; capabilities->state_width=(uint32_t)e->model.c.hc_width;
     capabilities->max_batch_rows=128; capabilities->max_context_tokens=(uint32_t)maxctx; capabilities->num_layers=(uint32_t)layers;
     *engine_impl=e; return 0;

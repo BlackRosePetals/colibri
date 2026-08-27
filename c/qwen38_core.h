@@ -27,27 +27,71 @@ typedef struct {
     uint8_t *is_attn;
 } Cfg;
 
-typedef struct { float *norm, *down, *up, *inject; } GatedResidual;
+typedef enum {
+    Q38_WEIGHT_NONE = 0,
+    Q38_WEIGHT_F32,
+    Q38_WEIGHT_BF16,
+    Q38_WEIGHT_FP8
+} Q38WeightKind;
+
+typedef struct {
+    void *data;
+    float *scales;                 /* block-FP8 only */
+    int rows, cols;
+    int64_t elements, scale_count;
+    Q38WeightKind kind;
+} Q38Weight;
+
+typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
+
+/* Persistent wall-clock counters.  They live on Model rather than in process
+ * globals so Segment sessions and future multi-model serving cannot leak phase
+ * time into one another.  Some categories intentionally overlap: architecture
+ * phases (DeltaNet/QSA/PLE) contain resident matmuls, while the matmul counter
+ * answers the orthogonal question "how much time is in dense kernels?". */
+typedef enum {
+    Q38_TM_EXPERT_READ = 0,
+    Q38_TM_FP8_EXPAND,
+    Q38_TM_ROUTED_EXPERT,
+    Q38_TM_SHARED_EXPERT,
+    Q38_TM_DENSE_MATMUL,
+    Q38_TM_DELTANET,
+    Q38_TM_QSA_INDEX,
+    Q38_TM_QSA_ATTENTION,
+    Q38_TM_PLE,
+    Q38_TM_LM_HEAD,
+    Q38_TM_COUNT
+} Q38Timer;
+
+typedef struct {
+    double seconds[Q38_TM_COUNT];
+    uint64_t forwards;
+} Q38Timers;
 
 typedef struct {
     GatedResidual attn_gr, mlp_gr;
-    float *router, *sh_g, *sh_u, *sh_d, *sh_gate;
-    float *q, *k, *v, *o, *qn, *kn;
-    float *idx_qk, *idx_qn, *idx_kn;
-    float *dn_qkv, *dn_z, *dn_b, *dn_a, *dn_conv;
-    float *dn_dtbias, *dn_alog, *dn_norm, *dn_out;
-    float *ple_key, *ple_value, *ple_norm_key, *ple_norm_query;
+    Q38Weight router, sh_g, sh_u, sh_d;
+    float *sh_gate;
+    Q38Weight q, k, v, o;
+    float *qn, *kn;
+    Q38Weight idx_qk;
+    float *idx_qn, *idx_kn;
+    Q38Weight dn_qkv, dn_z, dn_b, dn_a, dn_out;
+    float *dn_conv;
+    float *dn_dtbias, *dn_alog, *dn_norm;
+    Q38Weight ple_key, ple_value;
+    float *ple_norm_key, *ple_norm_query;
     float *ple_norm_conv, *ple_conv;
 } Layer;
 
-typedef struct { int eid; float *gate, *up, *down; uint64_t used; } Slot;
+typedef struct { int eid; Q38Weight gate, up, down; uint64_t used; } Slot;
 typedef struct { Slot *slots; int *by_expert, n, cap; } LCache;
 
 typedef struct {
     Cfg c;
     shards S;
     char prefix[32];
-    float *embed, *lm_head;
+    Q38Weight embed, lm_head;
     GatedResidual final_gr;
     Layer *L;
     LCache *cache;
@@ -65,7 +109,10 @@ typedef struct {
     float *PLE_conv_state;
     int ple_history_len;
     int range_begin, range_end;
+    int native_fp8, native_bf16;
+    uint64_t resident_weight_bytes;
     double dense_load_s;
+    Q38Timers timers;
 } Model;
 
 static float *g_last_logit;
@@ -75,6 +122,18 @@ static double now_s(void) {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return (double)t.tv_sec + (double)t.tv_nsec * 1e-9;
+}
+
+static inline void q38_tm_add(Model *m,Q38Timer timer,double started) {
+    m->timers.seconds[timer] += now_s() - started;
+}
+
+static Q38Timers q38_tm_delta(const Q38Timers *after,const Q38Timers *before) {
+    Q38Timers delta={0};
+    for(int i=0;i<Q38_TM_COUNT;i++)
+        delta.seconds[i]=after->seconds[i]-before->seconds[i];
+    delta.forwards=after->forwards-before->forwards;
+    return delta;
 }
 
 #if defined(__APPLE__)
@@ -104,6 +163,97 @@ static void q38_matmul(float *y, const float *x, const float *W, int S, int I, i
             y[(int64_t)s * O + o] = a;
         }
     }
+}
+
+static void q38_weight_free(Q38Weight *weight) {
+    if(!weight)return;
+    free(weight->data);free(weight->scales);memset(weight,0,sizeof(*weight));
+}
+
+static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int cols) {
+    if(rows<=0||cols<=0||(int64_t)rows>INT64_MAX/cols){
+        fprintf(stderr,"invalid weight geometry [%d,%d]\n",rows,cols);exit(1);
+    }
+    int64_t elements=(int64_t)rows*cols;
+    int64_t scales=kind==Q38_WEIGHT_FP8?fp8_nblk(rows)*fp8_nblk(cols):0;
+    if(weight->kind==kind&&weight->rows==rows&&weight->cols==cols&&
+       weight->data&&(!scales||weight->scales))return;
+    q38_weight_free(weight);
+    size_t element_size=kind==Q38_WEIGHT_F32?sizeof(float):
+                        kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
+                        kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
+    if(!element_size||(uint64_t)elements>SIZE_MAX/element_size||
+       (scales&&(uint64_t)scales>SIZE_MAX/sizeof(float))){
+        fprintf(stderr,"unsupported or oversized weight geometry [%d,%d] kind=%d\n",
+                rows,cols,(int)kind);exit(1);
+    }
+    weight->data=malloc((size_t)elements*element_size);
+    if(scales)weight->scales=(float*)malloc((size_t)scales*sizeof(float));
+    if(!weight->data||(scales&&!weight->scales)){
+        fprintf(stderr,"OOM allocating weight [%d,%d] kind=%d\n",rows,cols,(int)kind);exit(1);
+    }
+    weight->rows=rows;weight->cols=cols;weight->elements=elements;
+    weight->scale_count=scales;weight->kind=kind;
+}
+
+static uint64_t q38_weight_bytes(const Q38Weight *weight) {
+    uint64_t element_size=weight->kind==Q38_WEIGHT_F32?sizeof(float):
+                          weight->kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
+                          weight->kind==Q38_WEIGHT_FP8?sizeof(uint8_t):0;
+    return (uint64_t)weight->elements*element_size+
+           (uint64_t)weight->scale_count*sizeof(float);
+}
+
+/* Native BF16 storage with FP32 activations and accumulation.  This deliberately
+ * does not round activations to BF16 or use BF16 dot-product instructions: it is
+ * the storage-equivalent form of the existing st_read_f32 reference. */
+static void q38_matmul_bf16(float *y,const float *x,const uint16_t *W,
+                            int S,int I,int O) {
+    #pragma omp parallel for schedule(static)
+    for(int o=0;o<O;o++){
+        const uint16_t *w=W+(int64_t)o*I;
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I;float a=0.f;
+            for(int i=0;i<I;i++)a+=xs[i]*bf16_to_f32(w[i]);
+            y[(int64_t)s*O+o]=a;
+        }
+    }
+}
+
+static void q38_weight_matmul(float *y,const float *x,const Q38Weight *weight,
+                              int S,int I,int O) {
+    if(!weight||weight->rows!=O||weight->cols!=I||!weight->data){
+        fprintf(stderr,"invalid matmul weight: have [%d,%d] kind=%d, need [%d,%d]\n",
+                weight?weight->rows:0,weight?weight->cols:0,
+                weight?(int)weight->kind:0,O,I);exit(1);
+    }
+    if(weight->kind==Q38_WEIGHT_F32)
+        q38_matmul(y,x,(const float*)weight->data,S,I,O);
+    else if(weight->kind==Q38_WEIGHT_BF16)
+        q38_matmul_bf16(y,x,(const uint16_t*)weight->data,S,I,O);
+    else if(weight->kind==Q38_WEIGHT_FP8&&weight->scales)
+        matmul_fp8(y,x,(const uint8_t*)weight->data,weight->scales,S,I,O);
+    else {fprintf(stderr,"unsupported matmul weight kind %d\n",(int)weight->kind);exit(1);}
+}
+
+static void q38_weight_row(const Q38Weight *weight,int row,float *out) {
+    if(!weight||row<0||row>=weight->rows||!weight->data){
+        fprintf(stderr,"invalid weight row %d\n",row);exit(1);
+    }
+    if(weight->kind==Q38_WEIGHT_F32)
+        memcpy(out,(const float*)weight->data+(int64_t)row*weight->cols,
+               (size_t)weight->cols*sizeof(float));
+    else if(weight->kind==Q38_WEIGHT_BF16){
+        const uint16_t *src=(const uint16_t*)weight->data+(int64_t)row*weight->cols;
+        for(int i=0;i<weight->cols;i++)out[i]=bf16_to_f32(src[i]);
+    } else {fprintf(stderr,"weight kind %d has no dense row view\n",(int)weight->kind);exit(1);}
+}
+
+static void q38_dense_matmul(Model *m,float *y,const float *x,const Q38Weight *weight,
+                             int S,int I,int O) {
+    double started=now_s();
+    q38_weight_matmul(y,x,weight,S,I,O);
+    q38_tm_add(m,Q38_TM_DENSE_MATMUL,started);
 }
 
 static inline float q38_sigmoid(float x) {
@@ -353,6 +503,37 @@ static float *q38_load_tensor(Model *m,const char *name,int64_t want) {
     float *p=falloc(want); st_read_f32(&m->S,name,p,1); return p;
 }
 
+static int q38_env_bool(const char *name,int default_value) {
+    const char *value=getenv(name);if(!value||!*value)return default_value;
+    if(value[0]=='0'&&!value[1])return 0;
+    if(value[0]=='1'&&!value[1])return 1;
+    fprintf(stderr,"%s must be exactly 0 or 1\n",name);exit(1);
+}
+
+static Q38Weight q38_load_weight(Model *m,const char *name,int rows,int cols) {
+    st_tensor *tensor=st_find(&m->S,name);Q38Weight weight={0};
+    if(!tensor){fprintf(stderr,"missing %s\n",name);exit(1);}
+    if(tensor->rank!=2||tensor->shape[0]!=rows||tensor->shape[1]!=cols||
+       tensor->numel!=(int64_t)rows*cols){
+        fprintf(stderr,"%s: invalid matrix shape, expected [%d,%d]\n",name,rows,cols);exit(1);
+    }
+    if(tensor->dtype==0&&m->native_bf16){
+        q38_weight_reserve(&weight,Q38_WEIGHT_BF16,rows,cols);
+        if(tensor->nbytes!=weight.elements*(int64_t)sizeof(uint16_t)){
+            fprintf(stderr,"%s: invalid BF16 byte count\n",name);exit(1);
+        }
+        st_read_raw_cap(&m->S,name,weight.data,tensor->nbytes,1);
+    } else {
+        if(tensor->dtype<0||tensor->dtype>2){
+            fprintf(stderr,"%s: unsupported resident dtype %s\n",name,st_dtype_name(tensor->dtype));exit(1);
+        }
+        q38_weight_reserve(&weight,Q38_WEIGHT_F32,rows,cols);
+        st_read_f32(&m->S,name,(float*)weight.data,1);
+    }
+    m->resident_weight_bytes+=q38_weight_bytes(&weight);
+    return weight;
+}
+
 static void q38_name(Model *m,char *out,size_t cap,int layer,const char *suffix) {
     snprintf(out,cap,"%s.layers.%d.%s",m->prefix,layer,suffix);
 }
@@ -361,20 +542,18 @@ static void q38_load_gr(Model *m,GatedResidual *g,int layer,const char *kind,int
     Cfg *c=&m->c; char nm[320],base[180];
     if(layer>=0) snprintf(base,sizeof base,"layers.%d.%s",layer,kind); else snprintf(base,sizeof base,"hyper_connection_mixer");
     snprintf(nm,sizeof nm,"%s.%s.hc_norm.weight",m->prefix,base); g->norm=q38_load_tensor(m,nm,c->hc_width);
-    snprintf(nm,sizeof nm,"%s.%s.input_mix_weight_down.weight",m->prefix,base); g->down=q38_load_tensor(m,nm,(int64_t)c->hc_rank*c->hc_width);
-    snprintf(nm,sizeof nm,"%s.%s.input_mix_weight_up.weight",m->prefix,base); g->up=q38_load_tensor(m,nm,(int64_t)c->hc_width*c->hc_rank);
-    if(inject){snprintf(nm,sizeof nm,"%s.%s.block_inject_weight.weight",m->prefix,base);g->inject=q38_load_tensor(m,nm,(int64_t)c->hc_count*c->hc_width);}
+    snprintf(nm,sizeof nm,"%s.%s.input_mix_weight_down.weight",m->prefix,base); g->down=q38_load_weight(m,nm,c->hc_rank,c->hc_width);
+    snprintf(nm,sizeof nm,"%s.%s.input_mix_weight_up.weight",m->prefix,base); g->up=q38_load_weight(m,nm,c->hc_width,c->hc_rank);
+    if(inject){snprintf(nm,sizeof nm,"%s.%s.block_inject_weight.weight",m->prefix,base);g->inject=q38_load_weight(m,nm,c->hc_count,c->hc_width);}
 }
 
 static void q38_load_ple(Model *m,Layer *l) {
     Cfg *c=&m->c; int i=c->ple_layer; char nm[320];
+    q38_name(m,nm,sizeof nm,i,"ple.key_proj.weight");l->ple_key=q38_load_weight(m,nm,c->hc_width,c->ple_dim);
+    q38_name(m,nm,sizeof nm,i,"ple.value_proj.weight");l->ple_value=q38_load_weight(m,nm,c->hidden,c->ple_dim);
     #define PL(field,suf,n) q38_name(m,nm,sizeof nm,i,"ple." suf); l->field=q38_load_tensor(m,nm,(n))
-    PL(ple_key,"key_proj.weight",(int64_t)c->hc_width*c->ple_dim);
-    PL(ple_value,"value_proj.weight",(int64_t)c->hidden*c->ple_dim);
-    PL(ple_norm_key,"norm_key.weight",c->hc_width);
-    PL(ple_norm_query,"norm_query.weight",c->hc_width);
-    PL(ple_norm_conv,"norm_conv.weight",c->hc_width);
-    PL(ple_conv,"conv1d.weight",(int64_t)c->hc_width*c->ple_convk);
+    PL(ple_norm_key,"norm_key.weight",c->hc_width);PL(ple_norm_query,"norm_query.weight",c->hc_width);
+    PL(ple_norm_conv,"norm_conv.weight",c->hc_width);PL(ple_conv,"conv1d.weight",(int64_t)c->hc_width*c->ple_convk);
     #undef PL
     const char *bufs[]={"layer_multipliers","ngram_heads_vocab_sizes","ngram_heads_offsets"};
     int64_t *dsts[]={m->ple_multipliers,m->ple_head_vocab,m->ple_head_offset};
@@ -442,6 +621,8 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
                              int layer_begin,int layer_end,int load_boundaries,
                              int allocate_state) {
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
+    m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
+    m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c); st_init(&m->S,snap);
     Cfg *c=&m->c; char nm[320];
     if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
@@ -451,8 +632,8 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     if(layer_begin<0||layer_begin>=layer_end||layer_end>c->layers){fprintf(stderr,"invalid Qwen3.8 layer range [%d,%d)\n",layer_begin,layer_end);exit(1);}
     m->range_begin=layer_begin; m->range_end=layer_end;
     if(load_boundaries){
-        snprintf(nm,sizeof nm,"%s.embed_tokens.weight",m->prefix); m->embed=q38_load_tensor(m,nm,(int64_t)c->vocab*c->hidden);
-        m->lm_head=q38_load_tensor(m,"lm_head.weight",(int64_t)c->vocab*c->hidden);
+        snprintf(nm,sizeof nm,"%s.embed_tokens.weight",m->prefix); m->embed=q38_load_weight(m,nm,c->vocab,c->hidden);
+        m->lm_head=q38_load_weight(m,"lm_head.weight",c->vocab,c->hidden);
         q38_load_gr(m,&m->final_gr,-1,NULL,0);
     }
     m->L=(Layer*)calloc((size_t)c->layers,sizeof(Layer));
@@ -460,64 +641,71 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     if(!m->L||!m->cache){fprintf(stderr,"OOM model metadata\n");exit(1);}
     for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i]; q38_load_gr(m,&l->attn_gr,i,"attn_hyper_connection",1); q38_load_gr(m,&l->mlp_gr,i,"mlp_hyper_connection",1);
-        #define LD(field,suf,n) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_tensor(m,nm,(n))
-        LD(router,"mlp.gate.weight",(int64_t)c->experts*c->hidden);
-        LD(sh_g,"mlp.shared_expert.gate_proj.weight",(int64_t)c->shared_inter*c->hidden);
-        LD(sh_u,"mlp.shared_expert.up_proj.weight",(int64_t)c->shared_inter*c->hidden);
-        LD(sh_d,"mlp.shared_expert.down_proj.weight",(int64_t)c->hidden*c->shared_inter);
-        LD(sh_gate,"mlp.shared_expert_gate.weight",c->hidden);
+        #define WLD(field,suf,o,in) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_weight(m,nm,(o),(in))
+        #define VLD(field,suf,n) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_tensor(m,nm,(n))
+        WLD(router,"mlp.gate.weight",c->experts,c->hidden);
+        WLD(sh_g,"mlp.shared_expert.gate_proj.weight",c->shared_inter,c->hidden);
+        WLD(sh_u,"mlp.shared_expert.up_proj.weight",c->shared_inter,c->hidden);
+        WLD(sh_d,"mlp.shared_expert.down_proj.weight",c->hidden,c->shared_inter);
+        VLD(sh_gate,"mlp.shared_expert_gate.weight",c->hidden);
         if(c->is_attn[i]){
-            LD(q,"self_attn.q_proj.weight",(int64_t)c->q_heads*c->head_dim*2*c->hidden);
-            LD(k,"self_attn.k_proj.weight",(int64_t)c->kv_heads*c->head_dim*c->hidden);
-            LD(v,"self_attn.v_proj.weight",(int64_t)c->kv_heads*c->head_dim*c->hidden);
-            LD(o,"self_attn.o_proj.weight",(int64_t)c->hidden*c->q_heads*c->head_dim);
-            LD(qn,"self_attn.q_norm.weight",c->head_dim);
-            LD(kn,"self_attn.k_norm.weight",c->head_dim);
-            LD(idx_qk,"self_attn.indexer.index_qk_proj.weight",(int64_t)(c->idx_qheads+c->idx_kheads)*c->idx_dim*c->hidden);
-            LD(idx_qn,"self_attn.indexer.q_layernorm.weight",c->idx_dim);
-            LD(idx_kn,"self_attn.indexer.k_layernorm.weight",c->idx_dim);
+            WLD(q,"self_attn.q_proj.weight",c->q_heads*c->head_dim*2,c->hidden);
+            WLD(k,"self_attn.k_proj.weight",c->kv_heads*c->head_dim,c->hidden);
+            WLD(v,"self_attn.v_proj.weight",c->kv_heads*c->head_dim,c->hidden);
+            WLD(o,"self_attn.o_proj.weight",c->hidden,c->q_heads*c->head_dim);
+            VLD(qn,"self_attn.q_norm.weight",c->head_dim);VLD(kn,"self_attn.k_norm.weight",c->head_dim);
+            WLD(idx_qk,"self_attn.indexer.index_qk_proj.weight",(c->idx_qheads+c->idx_kheads)*c->idx_dim,c->hidden);
+            VLD(idx_qn,"self_attn.indexer.q_layernorm.weight",c->idx_dim);VLD(idx_kn,"self_attn.indexer.k_layernorm.weight",c->idx_dim);
         } else {
             int vd=c->dn_vheads*c->dn_vdim;
-            LD(dn_qkv,"linear_attn.in_proj_qkv.weight",(int64_t)c->dn_conv_dim*c->hidden);
-            LD(dn_z,"linear_attn.in_proj_z.weight",(int64_t)vd*c->hidden);
-            LD(dn_b,"linear_attn.in_proj_b.weight",(int64_t)c->dn_vheads*c->hidden);
-            LD(dn_a,"linear_attn.in_proj_a.weight",(int64_t)c->dn_vheads*c->hidden);
-            LD(dn_conv,"linear_attn.conv1d.weight",(int64_t)c->dn_conv_dim*c->dn_convk);
-            LD(dn_dtbias,"linear_attn.dt_bias",c->dn_vheads);
-            LD(dn_alog,"linear_attn.A_log",c->dn_vheads);
-            LD(dn_norm,"linear_attn.norm.weight",c->dn_vdim);
-            LD(dn_out,"linear_attn.out_proj.weight",(int64_t)c->hidden*vd);
+            WLD(dn_qkv,"linear_attn.in_proj_qkv.weight",c->dn_conv_dim,c->hidden);
+            WLD(dn_z,"linear_attn.in_proj_z.weight",vd,c->hidden);
+            WLD(dn_b,"linear_attn.in_proj_b.weight",c->dn_vheads,c->hidden);
+            WLD(dn_a,"linear_attn.in_proj_a.weight",c->dn_vheads,c->hidden);
+            VLD(dn_conv,"linear_attn.conv1d.weight",(int64_t)c->dn_conv_dim*c->dn_convk);
+            VLD(dn_dtbias,"linear_attn.dt_bias",c->dn_vheads);VLD(dn_alog,"linear_attn.A_log",c->dn_vheads);
+            VLD(dn_norm,"linear_attn.norm.weight",c->dn_vdim);
+            WLD(dn_out,"linear_attn.out_proj.weight",c->hidden,vd);
         }
-        #undef LD
+        #undef WLD
+        #undef VLD
         LCache *lc=&m->cache[i]; lc->cap=cap; lc->slots=(Slot*)calloc((size_t)cap,sizeof(Slot)); lc->by_expert=(int*)malloc((size_t)c->experts*sizeof(int));
         if(!lc->slots||!lc->by_expert){fprintf(stderr,"OOM expert cache\n");exit(1);} for(int e=0;e<c->experts;e++)lc->by_expert[e]=-1;
     }
     if(c->ple_layer>=layer_begin&&c->ple_layer<layer_end) q38_load_ple(m,&m->L[c->ple_layer]);
     if(allocate_state) q38_alloc_state(m);
     m->dense_load_s=now_s()-t0;
-    fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer\n",m->prefix,c->layers,c->ple_layer,cap);
+    fprintf(stderr,"[qwen38] native text weights: prefix=%s, %d layers, PLE=%d, cache=%d/layer, "
+                   "FP8=%s, BF16=%s (resident matrices %.2f GiB)\n",m->prefix,c->layers,c->ple_layer,cap,
+                   m->native_fp8?"native":"expanded-f32",m->native_bf16?"native":"expanded-f32",
+                   m->resident_weight_bytes/1073741824.0);
 }
 
 static void model_init(Model *m,const char *snap,int cap,int bits) {
     model_init_range(m,snap,cap,bits,0,0,1,1);
 }
 
-static void q38_gr_read(const Cfg *c,const GatedResidual *g,const float *hyper,
+static void q38_gr_read(Model *m,const GatedResidual *g,const float *hyper,
                         int S,float *mixed,float *inject) {
+    const Cfg *c=&m->c;
     int H=c->hidden,W=c->hc_width,C=c->hc_count,R=c->hc_rank;
+    if(C<=0||H<=0||W!=C*H){fprintf(stderr,"invalid gated-residual width\n");exit(1);}
     float *norm=falloc((int64_t)S*W),*low=falloc((int64_t)S*R),*mix=falloc((int64_t)S*W);
+    /* Makes the initialized-input invariant visible to aggressive interprocedural
+     * warning analysis; every element is overwritten by q38_rms0 below. */
+    memset(norm,0,(size_t)S*W*sizeof(float));
     for(int s=0;s<S;s++) for(int b=0;b<C;b++)
         q38_rms0(norm+(int64_t)s*W+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,g->norm+(int64_t)b*H,H,c->eps);
-    q38_matmul(low,norm,g->down,S,W,R);
+    q38_dense_matmul(m,low,norm,&g->down,S,W,R);
     for(int64_t z=0;z<(int64_t)S*R;z++) low[z]=q38_silu(low[z]/C);
-    q38_matmul(mix,low,g->up,S,R,W);
+    q38_dense_matmul(m,mix,low,&g->up,S,R,W);
     for(int s=0;s<S;s++) for(int d=0;d<H;d++){
         float v=0.f;
         for(int b=0;b<C;b++) v+=q38_sigmoid(mix[(int64_t)s*W+(int64_t)b*H+d])*norm[(int64_t)s*W+(int64_t)b*H+d];
         mixed[(int64_t)s*H+d]=v/C;
     }
     if(inject){
-        q38_matmul(inject,norm,g->inject,S,W,C);
+        q38_dense_matmul(m,inject,norm,&g->inject,S,W,C);
         for(int64_t z=0;z<(int64_t)S*C;z++) inject[z]=2.f*q38_sigmoid(inject[z]/C);
     }
     free(norm);free(low);free(mix);
@@ -531,46 +719,91 @@ static void q38_gr_apply(const Cfg *c,float *hyper,const float *block,const floa
     }
 }
 
-static void q38_decode_fp8(Model *m,const char *wn,const char *sn,float *out,int O,int I) {
+static void q38_load_fp8_expert_weight(Model *m,const char *wn,const char *sn,
+                                        Q38Weight *out,int O,int I) {
     st_tensor *w=st_find(&m->S,wn),*sc=st_find(&m->S,sn);
     int nb_o=(O+127)/128,nb_i=(I+127)/128;
     if(!w||w->dtype!=4||w->rank!=2||w->shape[0]!=O||w->shape[1]!=I||
-       !sc||sc->rank!=2||sc->shape[0]!=nb_o||sc->shape[1]!=nb_i){
+       w->nbytes!=(int64_t)O*I||!sc||sc->dtype<0||sc->dtype>2||
+       sc->rank!=2||sc->shape[0]!=nb_o||sc->shape[1]!=nb_i||
+       sc->numel!=(int64_t)nb_o*nb_i){
         fprintf(stderr,"invalid block-FP8 expert matrix %s / %s\n",wn,sn);exit(1);
     }
-    uint8_t *raw=(uint8_t*)malloc((size_t)O*I); float *scale=falloc((int64_t)nb_o*nb_i);
-    if(!raw){fprintf(stderr,"OOM FP8 expert read\n");exit(1);}
-    st_read_raw_cap(&m->S,wn,raw,(int64_t)O*I,1); st_read_f32(&m->S,sn,scale,1);
+    if(m->native_fp8){
+        q38_weight_reserve(out,Q38_WEIGHT_FP8,O,I);
+        double started=now_s();
+        st_read_raw_cap(&m->S,wn,out->data,w->nbytes,1);
+        st_read_f32(&m->S,sn,out->scales,1);
+        q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+        return;
+    }
+    q38_weight_reserve(out,Q38_WEIGHT_F32,O,I);
+    uint8_t *raw=(uint8_t*)malloc((size_t)w->nbytes);float *scale=falloc(sc->numel);
+    if(!raw){fprintf(stderr,"OOM FP8 expert staging\n");exit(1);}
+    double started=now_s();
+    st_read_raw_cap(&m->S,wn,raw,w->nbytes,1);st_read_f32(&m->S,sn,scale,1);
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started); started=now_s();
+    float *decoded=(float*)out->data;
     #pragma omp parallel for schedule(static)
-    for(int o=0;o<O;o++) for(int i=0;i<I;i++) out[(int64_t)o*I+i]=e4m3_decode(raw[(int64_t)o*I+i])*scale[(o/128)*nb_i+i/128];
+    for(int o=0;o<O;o++)for(int i=0;i<I;i++)
+        decoded[(int64_t)o*I+i]=e4m3_decode(raw[(int64_t)o*I+i])*
+                                  scale[(o/128)*nb_i+i/128];
+    q38_tm_add(m,Q38_TM_FP8_EXPAND,started);
     free(raw);free(scale);
+}
+
+static void q38_load_expert_weight(Model *m,const char *name,Q38Weight *out,
+                                    int O,int I) {
+    st_tensor *tensor=st_find(&m->S,name);
+    if(!tensor||tensor->rank!=2||tensor->shape[0]!=O||tensor->shape[1]!=I||
+       tensor->numel!=(int64_t)O*I||tensor->dtype<0||tensor->dtype>2){
+        fprintf(stderr,"invalid expert matrix %s\n",name);exit(1);
+    }
+    Q38WeightKind kind=m->native_bf16&&tensor->dtype==0?Q38_WEIGHT_BF16:Q38_WEIGHT_F32;
+    q38_weight_reserve(out,kind,O,I);double started=now_s();
+    if(kind==Q38_WEIGHT_BF16)
+        st_read_raw_cap(&m->S,name,out->data,tensor->nbytes,1);
+    else st_read_f32(&m->S,name,(float*)out->data,1);
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+}
+
+static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *tensor,
+                                   int64_t element_offset,Q38Weight *out,int O,int I) {
+    if(!tensor||tensor->dtype<0||tensor->dtype>2||element_offset<0||
+       element_offset>tensor->numel-(int64_t)O*I){
+        fprintf(stderr,"invalid expert slice %s\n",name);exit(1);
+    }
+    Q38WeightKind kind=m->native_bf16&&tensor->dtype==0?Q38_WEIGHT_BF16:Q38_WEIGHT_F32;
+    q38_weight_reserve(out,kind,O,I);double started=now_s();
+    if(kind==Q38_WEIGHT_BF16){
+        int64_t bytes=(int64_t)O*I*(int64_t)sizeof(uint16_t);
+        st_read_slice_raw_cap(&m->S,name,element_offset*(int64_t)sizeof(uint16_t),
+                              bytes,out->data,bytes,1);
+    } else st_read_slice_f32(&m->S,name,element_offset,(int64_t)O*I,(float*)out->data,1);
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);
 }
 
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
     Cfg *c=&m->c; int H=c->hidden,I=c->inter; char nm[320],sn[340];
-    if(!s->gate){
-        float *all=falloc((int64_t)3*I*H); s->gate=all;s->up=all+(int64_t)I*H;s->down=all+(int64_t)2*I*H;
-    }
     q38_name(m,nm,sizeof nm,layer,"mlp.experts.gate_up_proj");
     if(st_has(&m->S,nm)){
         st_tensor *t=st_find(&m->S,nm);
         if(t->rank!=3||t->shape[0]!=c->experts||t->shape[1]!=2*I||t->shape[2]!=H){fprintf(stderr,"invalid %s\n",nm);exit(1);}
-        st_read_slice_f32(&m->S,nm,(int64_t)eid*2*I*H,(int64_t)2*I*H,s->gate,1);
+        int64_t base=(int64_t)eid*2*I*H;
+        q38_load_expert_slice(m,nm,t,base,&s->gate,I,H);
+        q38_load_expert_slice(m,nm,t,base+(int64_t)I*H,&s->up,I,H);
         q38_name(m,nm,sizeof nm,layer,"mlp.experts.down_proj"); t=st_find(&m->S,nm);
         if(!t||t->rank!=3||t->shape[0]!=c->experts||t->shape[1]!=H||t->shape[2]!=I){fprintf(stderr,"invalid %s\n",nm);exit(1);}
-        st_read_slice_f32(&m->S,nm,(int64_t)eid*H*I,(int64_t)H*I,s->down,1);
+        q38_load_expert_slice(m,nm,t,(int64_t)eid*H*I,&s->down,H,I);
         return;
     }
-    const char *kind[3]={"gate_proj","up_proj","down_proj"}; float *dst[3]={s->gate,s->up,s->down};
+    const char *kind[3]={"gate_proj","up_proj","down_proj"};Q38Weight *dst[3]={&s->gate,&s->up,&s->down};
     int os[3]={I,I,H},is[3]={H,H,I};
     for(int k=0;k<3;k++){
         char suf[192]; snprintf(suf,sizeof suf,"mlp.experts.%d.%s.weight",eid,kind[k]);q38_name(m,nm,sizeof nm,layer,suf);
         st_tensor *t=st_find(&m->S,nm); if(!t){fprintf(stderr,"missing %s\n",nm);exit(1);}
-        if(t->dtype==4){snprintf(sn,sizeof sn,"%s_scale_inv",nm);q38_decode_fp8(m,nm,sn,dst[k],os[k],is[k]);}
-        else {
-            if(t->rank!=2||t->shape[0]!=os[k]||t->shape[1]!=is[k]){fprintf(stderr,"invalid %s\n",nm);exit(1);}
-            st_read_f32(&m->S,nm,dst[k],1);
-        }
+        if(t->dtype==4){snprintf(sn,sizeof sn,"%s_scale_inv",nm);q38_load_fp8_expert_weight(m,nm,sn,dst[k],os[k],is[k]);}
+        else q38_load_expert_weight(m,nm,dst[k],os[k],is[k]);
     }
 }
 
@@ -609,6 +842,7 @@ static int64_t q38_hash_row(Model *m,int head,int ngram,int64_t cur,int64_t p1,i
 }
 
 static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out) {
+    double phase_started=now_s();
     Cfg *c=&m->c; Layer *l=&m->L[c->ple_layer]; int H=c->hidden,C=c->hc_count,W=c->hc_width,E=c->ple_dim;
     float *emb=falloc(E),*keys=falloc(W),*value=falloc(H),*kn=falloc(W),*qn=falloc(W),*gated=falloc(W),*norm=falloc(W);
     int state_len=(c->ple_convk-1)*c->ngram_size; float *ring=m->PLE_conv_state;
@@ -619,7 +853,7 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
             int ng=h<c->heads_per_ngram?2:3; int64_t row=q38_hash_row(m,h,ng,ids[s],p1,p2);
             q38_ple_row(m,row,emb+(int64_t)h*c->ngram_head_dim);
         }
-        q38_matmul(keys,emb,l->ple_key,1,E,W);q38_matmul(value,emb,l->ple_value,1,E,H);
+        q38_dense_matmul(m,keys,emb,&l->ple_key,1,E,W);q38_dense_matmul(m,value,emb,&l->ple_value,1,E,H);
         for(int b=0;b<C;b++){
             q38_rms0(kn+(int64_t)b*H,keys+(int64_t)b*H,l->ple_norm_key+(int64_t)b*H,H,c->eps);
             q38_rms0(qn+(int64_t)b*H,hyper+(int64_t)s*W+(int64_t)b*H,l->ple_norm_query+(int64_t)b*H,H,c->eps);
@@ -640,9 +874,11 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
         else {m->ple_history[0]=m->ple_history[1];m->ple_history[1]=ids[s];}
     }
     free(emb);free(keys);free(value);free(kn);free(qn);free(gated);free(norm);
+    q38_tm_add(m,Q38_TM_PLE,phase_started);
 }
 
 static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+    double phase_started=now_s();
     Cfg *c=&m->c; int H=c->hidden,VH=c->dn_vheads,KH=c->dn_kheads,KD=c->dn_kdim,VD=c->dn_vdim;
     int CD=c->dn_conv_dim,CK=c->dn_convk,V=VH*VD,K=KH*KD,rep=VH/KH;
     float *qkv=falloc(CD),*z=falloc(V),*bb=falloc(VH),*aa=falloc(VH),*conv=falloc(CD);
@@ -650,8 +886,8 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,float 
     float *rec=m->DN_rec[layer],*ring=m->DN_conv[layer];
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;
-        q38_matmul(qkv,xs,l->dn_qkv,1,H,CD);q38_matmul(z,xs,l->dn_z,1,H,V);
-        q38_matmul(bb,xs,l->dn_b,1,H,VH);q38_matmul(aa,xs,l->dn_a,1,H,VH);
+        q38_dense_matmul(m,qkv,xs,&l->dn_qkv,1,H,CD);q38_dense_matmul(m,z,xs,&l->dn_z,1,H,V);
+        q38_dense_matmul(m,bb,xs,&l->dn_b,1,H,VH);q38_dense_matmul(m,aa,xs,&l->dn_a,1,H,VH);
         for(int d=0;d<CD;d++){
             float a=l->dn_conv[(int64_t)d*CK+CK-1]*qkv[d];float *r=ring+(int64_t)d*(CK-1);
             for(int j=0;j<CK-1;j++)a+=l->dn_conv[(int64_t)d*CK+j]*r[j];conv[d]=q38_silu(a);
@@ -677,9 +913,10 @@ static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,float 
             for(int v0=0;v0<VD;v0++){float a=0.f;for(int d=0;d<KD;d++)a+=qh[d]*state[(int64_t)d*VD+v0];core[(int64_t)h*VD+v0]=a;}
         }
         for(int h=0;h<VH;h++)q38_rmsg(norm+(int64_t)h*VD,core+(int64_t)h*VD,z+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
-        q38_matmul(out+(int64_t)s*H,norm,l->dn_out,1,V,H);
+        q38_dense_matmul(m,out+(int64_t)s*H,norm,&l->dn_out,1,V,H);
     }
     free(qkv);free(z);free(bb);free(aa);free(conv);free(q);free(k);free(core);free(norm);
+    q38_tm_add(m,Q38_TM_DELTANET,phase_started);
 }
 
 typedef struct { float score; int block; } Q38Block;
@@ -693,8 +930,8 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     int IQ=c->idx_qheads,ID=c->idx_dim,R=c->idx_ratio,maxsel=c->idx_budget+R-1;
     float *qp=falloc((int64_t)S*QH*2*D),*kp=falloc((int64_t)S*KVH*D),*vp=falloc((int64_t)S*KVH*D);
     float *ip=falloc((int64_t)S*(IQ+c->idx_kheads)*ID);
-    q38_matmul(qp,x,l->q,S,H,QH*2*D);q38_matmul(kp,x,l->k,S,H,KVH*D);q38_matmul(vp,x,l->v,S,H,KVH*D);
-    q38_matmul(ip,x,l->idx_qk,S,H,(IQ+c->idx_kheads)*ID);
+    q38_dense_matmul(m,qp,x,&l->q,S,H,QH*2*D);q38_dense_matmul(m,kp,x,&l->k,S,H,KVH*D);q38_dense_matmul(m,vp,x,&l->v,S,H,KVH*D);
+    q38_dense_matmul(m,ip,x,&l->idx_qk,S,H,(IQ+c->idx_kheads)*ID);
     for(int s=0;s<S;s++){
         int pos=pos_base+s;
         for(int h=0;h<KVH;h++){
@@ -709,6 +946,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     if(!selected){fprintf(stderr,"OOM QSA selection\n");exit(1);}
     for(int s=0;s<S;s++){
         int pos=pos_base+s,visible=pos+1,blocks=visible/R,tail=blocks*R;
+        double phase_started=now_s();
         for(int h=0;h<IQ;h++){float *qh=qidx+(int64_t)h*ID;memcpy(qh,ip+(int64_t)s*(IQ+1)*ID+(int64_t)h*ID,(size_t)ID*sizeof(float));q38_rms0(qh,qh,l->idx_qn,ID,c->eps);q38_rope(qh,ID,c->rotary_dim,pos,c->theta);}
         int take=blocks<c->idx_budget/R?blocks:c->idx_budget/R,nsel=0;
         Q38Block *rank=blocks?(Q38Block*)malloc((size_t)blocks*sizeof(Q38Block)):NULL;
@@ -721,6 +959,7 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
         if(blocks)qsort(rank,(size_t)blocks,sizeof(Q38Block),q38_block_desc);
         for(int z=0;z<take;z++)for(int r=0;r<R;r++)selected[nsel++]=rank[z].block*R+r;
         for(int t=tail;t<visible;t++)selected[nsel++]=t;free(rank);
+        q38_tm_add(m,Q38_TM_QSA_INDEX,phase_started); phase_started=now_s();
         for(int h=0;h<QH;h++){
             float *qraw=qp+(int64_t)s*QH*2*D+(int64_t)h*2*D;
             float *qh=falloc(D);memcpy(qh,qraw,(size_t)D*sizeof(float));q38_rms0(qh,qh,l->qn,D,c->eps);q38_rope(qh,D,c->rotary_dim,pos,c->theta);
@@ -731,8 +970,9 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
             for(int j=0;j<nsel;j++){float a=score[j]/den;const float *vh=m->V[layer]+((int64_t)khidx*m->kv_cap+selected[j])*D;for(int d=0;d<D;d++)oh[d]+=a*vh[d];}
             for(int d=0;d<D;d++)oh[d]*=q38_sigmoid(qraw[D+d]);free(qh);free(score);
         }
+        q38_tm_add(m,Q38_TM_QSA_ATTENTION,phase_started);
     }
-    q38_matmul(out,heads,l->o,S,QH*D,H);
+    q38_dense_matmul(m,out,heads,&l->o,S,QH*D,H);
     free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
 }
 
@@ -742,7 +982,7 @@ static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out)
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
     for(int s=0;s<S;s++){
         const float *xs=x+(int64_t)s*H;float *ys=out+(int64_t)s*H;memset(ys,0,(size_t)H*sizeof(float));
-        q38_matmul(logits,xs,l->router,1,H,E);float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
+        q38_dense_matmul(m,logits,xs,&l->router,1,H,E);float mx=logits[0];for(int e=1;e<E;e++)if(logits[e]>mx)mx=logits[e];
         double all=0;for(int e=0;e<E;e++){logits[e]=expf(logits[e]-mx);all+=logits[e];}
         int idx[Q38_MAX_TOPK];float val[Q38_MAX_TOPK];
         for(int z=0;z<K;z++){int best=-1;float bv=-1.f;for(int e=0;e<E;e++){int used=0;for(int j=0;j<z;j++)if(idx[j]==e)used=1;if(!used&&logits[e]>bv){bv=logits[e];best=e;}}idx[z]=rt_router_pick(best,z,E,layer);val[z]=logits[idx[z]];}
@@ -751,14 +991,18 @@ static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out)
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
         for(int z=0;z<K;z++){
-            Slot *ex=q38_expert_get(m,layer,idx[z]);q38_matmul(eg,xs,ex->gate,1,H,I);q38_matmul(eu,xs,ex->up,1,H,I);
-            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_matmul(eo,eh,ex->down,1,I,H);
+            Slot *ex=q38_expert_get(m,layer,idx[z]); double phase_started=now_s();
+            q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
+            for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
+            q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
         }
-        q38_matmul(sg,xs,l->sh_g,1,H,SI);q38_matmul(su,xs,l->sh_u,1,H,SI);
-        for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_matmul(shared,sh,l->sh_d,1,SI,H);
+        double phase_started=now_s();
+        q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
+        for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
         float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
+        q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
     }
     rt_trace_end();
     free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);
@@ -798,11 +1042,11 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
             for(int64_t z=0;z<(int64_t)S*W;z++) hyper[z]+=ple[z];
             free(ple);
         }
-        q38_gr_read(c,&l->attn_gr,hyper,S,mixed,inject);
+        q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
         if(c->is_attn[i]) q38_attention(m,l,i,mixed,S,pos_base,block);
         else q38_deltanet(m,l,i,mixed,S,block);
         q38_gr_apply(c,hyper,block,inject,S);
-        q38_gr_read(c,&l->mlp_gr,hyper,S,mixed,inject);
+        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);
         q38_moe(m,l,i,mixed,S,block);
         q38_gr_apply(c,hyper,block,inject,S);
     }
@@ -811,37 +1055,64 @@ static void q38_layers_forward_range(Model *m,float *hyper,const int *ids,
 
 static float *step(Model *m,const int *ids,int S,int pos_base) {
     Cfg *c=&m->c;int H=c->hidden,W=c->hc_width,C=c->hc_count;
+    m->timers.forwards++;
     float *hyper=falloc((int64_t)S*W);
     for(int s=0;s<S;s++){
         if(ids[s]<0||ids[s]>=c->vocab){fprintf(stderr,"token id %d outside vocabulary\n",ids[s]);exit(1);}
-        const float *e=m->embed+(int64_t)ids[s]*H;for(int b=0;b<C;b++)memcpy(hyper+(int64_t)s*W+(int64_t)b*H,e,(size_t)H*sizeof(float));
+        float *e=hyper+(int64_t)s*W;q38_weight_row(&m->embed,ids[s],e);
+        for(int b=1;b<C;b++)memcpy(e+(int64_t)b*H,e,(size_t)H*sizeof(float));
     }
     float *mixed=falloc((int64_t)S*H),*inject=falloc((int64_t)S*C),*block=falloc((int64_t)S*H);
     for(int i=0;i<c->layers;i++){
         Layer *l=&m->L[i];
         if(i==c->ple_layer){float *ple=falloc((int64_t)S*W);q38_ple(m,ids,S,hyper,ple);for(int64_t z=0;z<(int64_t)S*W;z++)hyper[z]+=ple[z];free(ple);}
-        q38_gr_read(c,&l->attn_gr,hyper,S,mixed,inject);
+        q38_gr_read(m,&l->attn_gr,hyper,S,mixed,inject);
         if(c->is_attn[i])q38_attention(m,l,i,mixed,S,pos_base,block);else q38_deltanet(m,l,i,mixed,S,block);
         q38_gr_apply(c,hyper,block,inject,S);
-        q38_gr_read(c,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(c,hyper,block,inject,S);
+        q38_gr_read(m,&l->mlp_gr,hyper,S,mixed,inject);q38_moe(m,l,i,mixed,S,block);q38_gr_apply(c,hyper,block,inject,S);
     }
-    q38_gr_read(c,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
-    float *logit=falloc(c->vocab);q38_matmul(logit,mixed+(int64_t)(S-1)*H,m->lm_head,1,H,c->vocab);
+    q38_gr_read(m,&m->final_gr,hyper,S,mixed,NULL);m->kv_len=pos_base+S;
+    float *logit=falloc(c->vocab);double phase_started=now_s();
+    q38_weight_matmul(logit,mixed+(int64_t)(S-1)*H,&m->lm_head,1,H,c->vocab);
+    q38_tm_add(m,Q38_TM_LM_HEAD,phase_started);
     free(hyper);free(mixed);free(inject);free(block);return logit;
 }
 
-static void tm_report(void) {}
+static int q38_tm_enabled(void) {
+    const char *enabled=getenv("COLI_TIMERS");
+    return enabled&&enabled[0]=='1'&&enabled[1]=='\0';
+}
+
+static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
+    if(!q38_tm_enabled())return;
+    static const char *names[Q38_TM_COUNT]={
+        "expert-read","fp8-expand","routed-expert","shared-expert",
+        "resident-mm","deltanet","qsa-index","qsa-attn","ple","lm-head"
+    };
+    double per=timers->forwards?1000.0/timers->forwards:0.0;
+    fprintf(stderr,"[qwen38 timers] %s: %llu forwards\n",scope,
+            (unsigned long long)timers->forwards);
+    for(int i=0;i<Q38_TM_COUNT;i++)
+        fprintf(stderr,"[qwen38 timers]   %-14s %9.3f s  %9.3f ms/forward\n",
+                names[i],timers->seconds[i],timers->seconds[i]*per);
+    fprintf(stderr,"[qwen38 timers] architecture phases overlap resident-mm; "
+                   "expert-read is disk service and fp8-expand is synchronous miss work\n");
+}
+
+static void tm_report(const Model *m) {
+    q38_tm_report_bank(&m->timers,"total");
+}
 
 static void q38_layer_free(Layer *l) {
     if(!l) return;
-    free(l->attn_gr.norm); free(l->attn_gr.down); free(l->attn_gr.up); free(l->attn_gr.inject);
-    free(l->mlp_gr.norm); free(l->mlp_gr.down); free(l->mlp_gr.up); free(l->mlp_gr.inject);
-    free(l->router); free(l->sh_g); free(l->sh_u); free(l->sh_d); free(l->sh_gate);
-    free(l->q); free(l->k); free(l->v); free(l->o); free(l->qn); free(l->kn);
-    free(l->idx_qk); free(l->idx_qn); free(l->idx_kn);
-    free(l->dn_qkv); free(l->dn_z); free(l->dn_b); free(l->dn_a); free(l->dn_conv);
-    free(l->dn_dtbias); free(l->dn_alog); free(l->dn_norm); free(l->dn_out);
-    free(l->ple_key); free(l->ple_value); free(l->ple_norm_key); free(l->ple_norm_query);
+    free(l->attn_gr.norm);q38_weight_free(&l->attn_gr.down);q38_weight_free(&l->attn_gr.up);q38_weight_free(&l->attn_gr.inject);
+    free(l->mlp_gr.norm);q38_weight_free(&l->mlp_gr.down);q38_weight_free(&l->mlp_gr.up);q38_weight_free(&l->mlp_gr.inject);
+    q38_weight_free(&l->router);q38_weight_free(&l->sh_g);q38_weight_free(&l->sh_u);q38_weight_free(&l->sh_d);free(l->sh_gate);
+    q38_weight_free(&l->q);q38_weight_free(&l->k);q38_weight_free(&l->v);q38_weight_free(&l->o);free(l->qn);free(l->kn);
+    q38_weight_free(&l->idx_qk);free(l->idx_qn);free(l->idx_kn);
+    q38_weight_free(&l->dn_qkv);q38_weight_free(&l->dn_z);q38_weight_free(&l->dn_b);q38_weight_free(&l->dn_a);free(l->dn_conv);
+    free(l->dn_dtbias);free(l->dn_alog);free(l->dn_norm);q38_weight_free(&l->dn_out);
+    q38_weight_free(&l->ple_key);q38_weight_free(&l->ple_value);free(l->ple_norm_key);free(l->ple_norm_query);
     free(l->ple_norm_conv); free(l->ple_conv);
     memset(l,0,sizeof(*l));
 }
@@ -851,16 +1122,19 @@ static void q38_model_free(Model *m) {
     for(int i=0;i<m->c.layers;i++) {
         q38_layer_free(&m->L[i]);
         if(m->cache) {
-            /* gate/up/down share one contiguous allocation in each slot. */
-            for(int s=0;s<m->cache[i].n;s++) free(m->cache[i].slots[s].gate);
+            for(int s=0;s<m->cache[i].n;s++){
+                q38_weight_free(&m->cache[i].slots[s].gate);
+                q38_weight_free(&m->cache[i].slots[s].up);
+                q38_weight_free(&m->cache[i].slots[s].down);
+            }
             free(m->cache[i].slots); free(m->cache[i].by_expert);
         }
         free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);
         free(m->K ? m->K[i] : NULL); free(m->V ? m->V[i] : NULL); free(m->IK ? m->IK[i] : NULL);
     }
     free(m->L); free(m->cache); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
-    free(m->embed); free(m->lm_head);
-    free(m->final_gr.norm); free(m->final_gr.down); free(m->final_gr.up); free(m->final_gr.inject);
+    q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
+    free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);
     memset(m,0,sizeof(*m));
 }

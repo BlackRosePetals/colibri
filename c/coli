@@ -523,18 +523,21 @@ def env_for_engine(a, arch, plan=None):
         # code path, so #1196 could measure and save a perfectly valid Kimi,
         # Inkling, OLMoE, Qwen or V4 profile that chat/serve never loaded.
         from resource_plan import build_plan, environment_for_plan
-        if plan is None:
-            ram,ctx,devices,vram=resource_request(a,env)
-            plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
-                            kv_slots=requested_kv_slots(a,env))
-        # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
-        # selects a capable build above. Merely asking for auto-tier must not
-        # turn a CPU-only sibling binary into an attempted CUDA launch.
-        plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
-                                  and (arch == "deepseek_v4"
-                                       or env.get("COLI_NO_OMP_TUNE")))
-        env=environment_for_plan(plan,env,
-                                 cuda_enabled=env.get("COLI_CUDA") == "1")
+        try:
+            if plan is None:
+                ram,ctx,devices,vram=resource_request(a,env)
+                plan=build_plan(a.model,ram,ctx,devices,vram,policy=a.policy,
+                                kv_slots=requested_kv_slots(a,env))
+            # Preserve the existing non-GLM GPU contract: explicit --gpu/--vram
+            # selects a capable build above. Merely asking for auto-tier must not
+            # turn a CPU-only sibling binary into an attempted CUDA launch.
+            plan_must_not_choose_omp=("OMP_NUM_THREADS" not in env
+                                      and (arch == "deepseek_v4"
+                                           or env.get("COLI_NO_OMP_TUNE")))
+            env=environment_for_plan(plan,env,
+                                     cuda_enabled=env.get("COLI_CUDA") == "1")
+        except (OSError,ValueError,json.JSONDecodeError) as error:
+            sys.exit(f"{C.yel}invalid resource plan:{C.r} {error}")
         if plan_must_not_choose_omp:
             # environment_for_plan supplies the physical-core default used by
             # the other engines. V4 deliberately computes logical CPUs minus

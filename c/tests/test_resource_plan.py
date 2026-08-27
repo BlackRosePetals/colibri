@@ -27,8 +27,11 @@ def write_shard(path, tensors):
     offset = 0
     header = {}
     payload = b""
-    for name, size in tensors:
-        header[name] = {"dtype": "U8", "shape": [size], "data_offsets": [offset, offset + size]}
+    for tensor in tensors:
+        name, size, *metadata = tensor
+        dtype = metadata[0] if metadata else "U8"
+        header[name] = {"dtype": dtype, "shape": [size],
+                        "data_offsets": [offset, offset + size]}
         payload += b"\0" * size
         offset += size
     raw = json.dumps(header).encode()
@@ -638,7 +641,7 @@ memInfo.free:                     23.50 GB (97%)
         self.assertEqual(plan["tiers"]["vram"]["devices"], [])
         self.assertIn("not detected", plan["warnings"][0])
 
-    def test_qwen38_cpu_only_plan_ignores_inventory_and_exports_cache_cap(self):
+    def test_qwen38_cpu_only_plan_prices_heterogeneous_cache_and_exports_cap(self):
         config = {
             "model_type": "qwen4_exp",
             "text_config": {
@@ -663,13 +666,22 @@ memInfo.free:                     23.50 GB (97%)
             },
         }
         (self.model / "config.json").write_text(json.dumps(config))
-        tensors = [("model.embed_tokens.weight", 128)]
-        for expert in range(2):
-            for projection in ("gate_proj", "up_proj", "down_proj"):
-                tensors.append((
-                    f"model.layers.0.mlp.experts.{expert}.{projection}.weight", 32
-                ))
+        tensors = [("model.embed_tokens.weight", 256, "BF16")]
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            prefix = f"model.layers.0.mlp.experts.0.{projection}"
+            tensors.append((prefix + ".weight", 32, "F8_E4M3"))
+            tensors.append((prefix + ".weight_scale_inv", 4, "F32"))
+            tensors.append((
+                f"model.layers.0.mlp.experts.1.{projection}.weight", 128, "F32"
+            ))
         write_shard(self.model / "model.safetensors", tensors)
+        analysis = analyze_model(self.model)
+        self.assertEqual(analysis["dense_bytes"], 256)
+        self.assertEqual(analysis["expert_bytes"], 492)
+        # A slot can receive either expert. It must use the larger retained
+        # representation, not the median of unlike source dtypes.
+        self.assertEqual(analysis["expert_bytes_by_layer"], {0: 384})
+        self.assertEqual(analysis["per_cap_bytes"], 384)
         gpu = {"index": 0, "name": "unrelated", "total_bytes": 16 * GB,
                "free_bytes": 14 * GB, "unified_memory": True}
         plan = build_plan(self.model, context=64, available_memory=16 * GB,
@@ -680,6 +692,10 @@ memInfo.free:                     23.50 GB (97%)
         cap = plan["tiers"]["ram"]["cache_slots_per_layer"]
         self.assertGreaterEqual(cap, 1)
         self.assertEqual(environment_for_plan(plan)["COLI_PLAN_CAP"], str(cap))
+        for variable in ("Q38_NATIVE_FP8", "Q38_NATIVE_BF16"):
+            with self.subTest(variable=variable), self.assertRaisesRegex(
+                    ValueError, "requires native expert storage"):
+                environment_for_plan(plan, {variable: "0"})
         plan["tiers"]["ram"]["cache_slots_per_layer"] = 0
         with self.assertRaisesRegex(ValueError, "one expert slot"):
             environment_for_plan(plan)

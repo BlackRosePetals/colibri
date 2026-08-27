@@ -159,10 +159,10 @@ int main(void) {
 
     uint8_t layer_kinds[2]={0,1};Cfg cfg={0};cfg.layers=2;cfg.is_attn=layer_kinds;
     cfg.hidden=10;cfg.inter=2;cfg.experts=9;
-    int cache_capacity=0;uint64_t slot_bytes=0;
-    CHECK(q38_segment_cache_capacity(&cfg,2,960,&cache_capacity,&slot_bytes)==0);
-    CHECK(slot_bytes==240&&cache_capacity==2);
-    CHECK(q38_segment_cache_capacity(&cfg,2,479,&cache_capacity,&slot_bytes)<0);
+    int cache_capacity=0;
+    CHECK(q38_segment_cache_capacity(480,cfg.experts,960,&cache_capacity)==0);
+    CHECK(cache_capacity==2);
+    CHECK(q38_segment_cache_capacity(480,cfg.experts,479,&cache_capacity)<0);
     cfg.dn_vheads=2;cfg.dn_kdim=3;cfg.dn_vdim=4;cfg.dn_conv_dim=5;cfg.dn_convk=3;
     cfg.kv_heads=2;cfg.head_dim=4;cfg.idx_dim=3;
     cfg.ple_layer=0;cfg.hc_width=8;cfg.ple_convk=3;cfg.ngram_size=3;

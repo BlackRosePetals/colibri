@@ -3,9 +3,9 @@
 
 This is intended for the text-only fixture produced by ``make_qwen38_tiny.py``
 and records both a cache prefill and a one-token cached decode.  It also emits
-greedy generated IDs and SHA-256 digests of logits/hidden states, which avoids
-putting large floating-point arrays in JSON while still detecting numerical
-or tensor-layout changes.
+greedy generated IDs, SHA-256 digests of logits/hidden states, and the final
+prediction logits used by the C numeric gate. Earlier intermediate tensors stay
+as digests so the JSON remains compact while still detecting layout changes.
 
 The released Qwen3.8 checkpoint is multimodal and includes vision/MTP tensors;
 this script intentionally refuses a multimodal config rather than silently

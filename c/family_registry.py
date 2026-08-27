@@ -532,7 +532,7 @@ _QWEN38_EXPERT = re.compile(
 )
 _QWEN38_EXPERT_SCALE = re.compile(
     r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
-    r"(\d+)\.(?:gate_proj|up_proj|down_proj)\.weight_scale_inv$"
+    r"(\d+)\.(gate_proj|up_proj|down_proj)\.weight_scale_inv$"
 )
 _QWEN38_FUSED_EXPERT = re.compile(
     r"^(?:model\.)?(?:language_model\.)?layers\.(\d+)\.mlp\.experts\."
@@ -541,7 +541,7 @@ _QWEN38_FUSED_EXPERT = re.compile(
 
 
 def _individual_expert_inventory(pattern):
-    def inventory(name, size, _config):
+    def inventory(name, size, _config, _dtype=None):
         match = pattern.search(name)
         if match is None:
             return ()
@@ -549,7 +549,7 @@ def _individual_expert_inventory(pattern):
     return inventory
 
 
-def _inkling_expert_inventory(name, size, config):
+def _inkling_expert_inventory(name, size, config, _dtype=None):
     match = _INKLING_EXPERT.fullmatch(name)
     if match is None:
         return ()
@@ -562,7 +562,7 @@ def _inkling_expert_inventory(name, size, config):
     return tuple((layer, expert, per_expert) for expert in range(experts))
 
 
-def _qwen38_expert_inventory(name, size, config):
+def _qwen38_expert_inventory(name, size, config, dtype=None):
     """Index both per-expert FP8 and fused BF16 expert tensor layouts.
 
     Resource planning calls this once per tensor; summing the returned byte
@@ -576,12 +576,42 @@ def _qwen38_expert_inventory(name, size, config):
         elements = hidden * intermediate
         if size not in (elements, elements * 2, elements * 4):
             raise ValueError(f"qwen38: expert tensor {name!r} has unexpected size {size}")
-        # All supported source dtypes are decoded to f32 in q38_load_expert().
-        return ((int(match.group(1)), int(match.group(2)), elements * 4),)
+        inferred = {elements: "F8_E4M3", elements * 2: "BF16",
+                    elements * 4: "F32"}[size]
+        dtype = inferred if dtype is None else dtype
+        expected = {"F8_E4M3": elements, "F8_E4M3FN": elements,
+                    "float8_e4m3fn": elements, "BF16": elements * 2,
+                    "F16": elements * 2, "F32": elements * 4}.get(dtype)
+        if expected != size:
+            raise ValueError(f"qwen38: expert tensor {name!r} has unsupported "
+                             f"dtype/size {dtype}/{size}")
+        # Native FP8/BF16 retain their source representation. F16 is accepted
+        # by the engine but expands to F32, so its two-byte file size is not a
+        # safe cache budget.
+        retained = size if dtype not in ("F16",) else elements * 4
+        return ((int(match.group(1)), int(match.group(2)), retained),)
     match = _QWEN38_EXPERT_SCALE.fullmatch(name)
     if match:
-        # The scale sidecar is streamed with its expert, never dense-resident.
-        return ((int(match.group(1)), int(match.group(2)), 0),)
+        # Slots normalize every supported source scale dtype to F32.  Derive
+        # the retained grid rather than charging the source byte count (the
+        # official sidecars happen to be BF16).
+        hidden = _required_int(config, "hidden_size", "qwen38")
+        intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+        projection = match.group(3)
+        rows = intermediate if projection != "down_proj" else hidden
+        cols = hidden if projection != "down_proj" else intermediate
+        scale_count = math.ceil(rows / 128) * math.ceil(cols / 128)
+        if dtype is None:
+            if size == scale_count * 4:
+                dtype = "F32"
+            elif size == scale_count * 2:
+                dtype = "BF16"
+        source_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+        if source_bytes is None or size != scale_count * source_bytes:
+            raise ValueError(f"qwen38: expert scale {name!r} has unsupported "
+                             f"dtype/size {dtype}/{size}")
+        scale_bytes = scale_count * 4
+        return ((int(match.group(1)), int(match.group(2)), scale_bytes),)
     match = _QWEN38_FUSED_EXPERT.fullmatch(name)
     if not match:
         return ()
@@ -592,13 +622,49 @@ def _qwen38_expert_inventory(name, size, config):
     elements = experts * matrices * hidden * intermediate
     if size not in (elements * 2, elements * 4):
         raise ValueError(f"qwen38: fused expert tensor {name!r} has unexpected size {size}")
-    per_expert = matrices * hidden * intermediate * 4
+    inferred = "BF16" if size == elements * 2 else "F32"
+    dtype = inferred if dtype is None else dtype
+    expected = {"BF16": elements * 2, "F16": elements * 2,
+                "F32": elements * 4}.get(dtype)
+    if expected != size:
+        raise ValueError(f"qwen38: fused expert tensor {name!r} has unsupported "
+                         f"dtype/size {dtype}/{size}")
+    per_expert = (elements * 4 if dtype == "F16" else size) // experts
     layer = int(match.group(1))
     return tuple((layer, expert, per_expert) for expert in range(experts))
 
 
-def _qwen38_resident_inventory(name, size, _config):
-    """Resident f32 bytes for tensors the native text engine actually loads."""
+_QWEN38_NATIVE_MATRIX_SUFFIXES = (
+    "embed_tokens.weight",
+    "input_mix_weight_down.weight",
+    "input_mix_weight_up.weight",
+    "block_inject_weight.weight",
+    "mlp.gate.weight",
+    "mlp.shared_expert.gate_proj.weight",
+    "mlp.shared_expert.up_proj.weight",
+    "mlp.shared_expert.down_proj.weight",
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.indexer.index_qk_proj.weight",
+    "linear_attn.in_proj_qkv.weight",
+    "linear_attn.in_proj_z.weight",
+    "linear_attn.in_proj_b.weight",
+    "linear_attn.in_proj_a.weight",
+    "linear_attn.out_proj.weight",
+    "ple.key_proj.weight",
+    "ple.value_proj.weight",
+)
+
+
+def _qwen38_resident_inventory(name, size, _config, dtype=None):
+    """Resident bytes for tensors the native text engine actually loads.
+
+    The official checkpoints store non-quantized text tensors as BF16.  Major
+    rank-two matrices stay in that two-byte representation; the comparatively
+    small norms, gates and convolution vectors still expand through st_read_f32.
+    """
     if name.startswith("mtp.") or name.startswith("model.visual."):
         return 0
     if ".ple.ple_embedding.ngram_embedding." in name and name.endswith(".weight"):
@@ -614,7 +680,21 @@ def _qwen38_resident_inventory(name, size, _config):
                    name.startswith("model.language_model.") or
                    (name.startswith("model.") and
                     not name.startswith("model.visual.")))
-    return size * 2 if text_tensor else 0  # supported checkpoints store BF16.
+    if not text_tensor:
+        return 0
+    # Direct registry tests predate dtype-bearing planner entries and use BF16
+    # sizes; real scans always supply the safetensors dtype.
+    dtype = "BF16" if dtype is None else dtype
+    element_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+    if not element_bytes:
+        raise ValueError(f"qwen38: resident tensor {name!r} has unsupported dtype {dtype}")
+    elements = size // element_bytes
+    if elements * element_bytes != size:
+        raise ValueError(f"qwen38: resident tensor {name!r} has invalid byte size {size}")
+    if (name == "lm_head.weight" or
+            name.endswith(_QWEN38_NATIVE_MATRIX_SUFFIXES)) and dtype == "BF16":
+        return size
+    return elements * 4
 
 
 COMMON_CAP = FamilyCapabilities(False, False, False, True)
@@ -935,23 +1015,27 @@ def planner_geometry(resolved, context):
     return geometry
 
 
-def expert_contributions(resolved, name, size):
+def expert_contributions(resolved, name, size, dtype=None):
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise ValueError("tensor size must be a non-negative integer")
+    if dtype is not None and not isinstance(dtype, str):
+        raise ValueError("tensor dtype must be a string")
     contributions = resolved.descriptor.expert_inventory(
-        name, size, resolved.family_config)
+        name, size, resolved.family_config, dtype)
     for layer, expert, byte_count in contributions:
         if layer < 0 or expert < 0 or byte_count < 0:
             raise RegistryError(f"invalid expert inventory for {resolved.descriptor.id}")
     return contributions
 
 
-def resident_contribution(resolved, name, size):
+def resident_contribution(resolved, name, size, dtype=None):
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise ValueError("tensor size must be a non-negative integer")
     inventory = resolved.descriptor.resident_inventory
+    if dtype is not None and not isinstance(dtype, str):
+        raise ValueError("tensor dtype must be a string")
     contribution = size if inventory is None else inventory(
-        name, size, resolved.family_config)
+        name, size, resolved.family_config, dtype)
     if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
         raise RegistryError(f"invalid resident inventory for {resolved.descriptor.id}")
     return contribution

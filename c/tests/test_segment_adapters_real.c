@@ -206,6 +206,13 @@ int main(int argc, char **argv) {
         snprintf(error, sizeof(error), "incompatible real-adapter capabilities");
         goto cleanup;
     }
+    if(!strcmp(family,"qwen38")&&
+       (strcmp(full_caps.numeric_class,"qwen38/bf16-values-f32dot/cpu-v1")||
+        strcmp(full_caps.numeric_class,left_caps.numeric_class)||
+        strcmp(full_caps.numeric_class,right_caps.numeric_class))){
+        snprintf(error,sizeof(error),"Qwen3.8 reported an inaccurate numeric class: %s",
+                 full_caps.numeric_class);goto cleanup;
+    }
     if (create_session(full_engine, context, &full, error, sizeof(error)) ||
         create_session(full_engine, context, &restored, error, sizeof(error)) ||
         create_session(left_engine, context, &left, error, sizeof(error)) ||
