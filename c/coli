@@ -455,8 +455,21 @@ def env_for_engine(a, arch, plan=None):
     # #855; before that `grep -c RAM_GB c/kimi_k3.c` returned 0, so `coli chat
     # --ram 242` on Kimi K3 set an environment variable nobody looked at and the
     # user's session ran itself out of memory with the flag apparently set.
-    if arch in ("deepseek_v4", "kimi"):
+    if arch in ("deepseek_v4", "kimi", "glm53"):
         if a.ram: env["RAM_GB"] = str(a.ram)
+    if arch == "glm53":
+        # I densi vanno a int4 di default: sono 9,7 B parametri su 321, e in
+        # BF16 sono 19 GB che nessuno recupera. Chi vuole la precisione piena
+        # mette GLM53_BITS=32, e questo setdefault gli lascia la scelta.
+        env.setdefault("GLM53_BITS", "4")
+        # Budget della cache degli esperti. Se l'utente ha dato --ram, si lascia
+        # spazio a densi, stato e sistema invece di prendersi tutto.
+        if a.ram:
+            try:
+                spare = max(2.0, float(a.ram) - 8.0)
+                env.setdefault("GLM53_EXPERT_GB", f"{spare:.1f}")
+            except (TypeError, ValueError):
+                pass
     if a.ctx:
         env[family_by_id(arch).limits.context_env] = str(a.ctx)
     if arch == "deepseek_v4":
@@ -1208,6 +1221,11 @@ def cmd_run(a):
                 try: os.unlink(prompt_path)
                 except OSError: pass
         sys.exit(result)
+    if arch=="glm53":
+        e=env_for_engine(a,arch)
+        cmd=[engine,"--model",os.path.abspath(a.model),"--prompt",prompt,
+             "--greedy",str(ngen_for(a,interactive=True,family=family))]
+        sys.exit(subprocess.call(cmd,env=e))
     if arch=="olmoe":
         # olmoe.c now speaks the gateway's SERVE protocol too (`coli chat`/
         # `coli web`/`coli serve` use it), but `coli run` predates that and

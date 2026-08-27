@@ -1713,6 +1713,73 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     return logits;
 }
 
+/* Prefill a pezzi.
+ *
+ * Un prefill in un colpo solo tiene in memoria i temporanei di tutto il
+ * prompt: due banchi di flussi residui per hc_mult, piu' le proiezioni di
+ * ogni layer. Su GLM-5.3-Flash sono quasi quattro GB per ottomila token, che
+ * e' assurdo per un motore che esiste per stare stretto. A pezzi il lavoro e'
+ * lo stesso e i temporanei costano quanto il pezzo.
+ *
+ * Il pezzo resta grande abbastanza da non buttare via il vantaggio del
+ * prefill: gli esperti si leggono da disco una volta per pezzo e per layer,
+ * quindi pezzi minuscoli li rileggerebbero in continuazione.
+ *
+ * Con `keep_all` si tengono i logit di ogni posizione, che serve solo al
+ * confronto con l'oracolo; altrimenti si tiene l'ultima riga, che e' l'unica
+ * che decide il token successivo. */
+static float *forward_prefill(GModel *m, GSession *s, const int *tokens, int n,
+                              const float *vision, int n_vision, int keep_all) {
+    const Cfg *c = &m->c;
+    const char *setting = getenv("GLM53_PREFILL_CHUNK");
+    int chunk = setting ? atoi(setting) : 128;
+    if (chunk < 1) chunk = 1;
+    if (chunk > n) chunk = n;
+
+    float *all = keep_all ? malloc((size_t)n * c->vocab * sizeof(float)) : NULL;
+    if (keep_all && !all) { fprintf(stderr, "OOM sui logit del prefill\n"); exit(1); }
+    float *last = NULL;
+    int used_vision = 0;
+
+    for (int at = 0; at < n; at += chunk) {
+        const int here = at + chunk <= n ? chunk : n - at;
+        /* Gli embedding dell'immagine vanno divisi come i token: a ogni pezzo
+         * quelli dei segnaposto che contiene, altrimenti il conto non torna e
+         * il motore si ferma -- che e' quello che deve fare. */
+        int mine = 0;
+        if (vision && c->image_token >= 0)
+            for (int i = 0; i < here; i++)
+                if (tokens[at + i] == c->image_token) mine++;
+        float *part = forward_span(m, s, tokens + at, here,
+                                   vision ? vision + (size_t)used_vision * c->hidden : NULL,
+                                   mine);
+        used_vision += mine;
+        if (keep_all) {
+            memcpy(all + (size_t)at * c->vocab, part,
+                   (size_t)here * c->vocab * sizeof(float));
+            free(part);
+        } else {
+            free(last);
+            last = part;
+            if (here > 1) {
+                /* si tiene solo l'ultima riga */
+                float *tail = malloc((size_t)c->vocab * sizeof(float));
+                if (!tail) { fprintf(stderr, "OOM sui logit\n"); exit(1); }
+                memcpy(tail, last + (size_t)(here - 1) * c->vocab,
+                       (size_t)c->vocab * sizeof(float));
+                free(last);
+                last = tail;
+            }
+        }
+    }
+    if (vision && used_vision != n_vision) {
+        fprintf(stderr, "%d embedding vision forniti ma %d segnaposto nel prompt\n",
+                n_vision, used_vision);
+        exit(1);
+    }
+    return keep_all ? all : last;
+}
+
 /* Il passaggio senza sessione: apre, macina tutto, chiude. E' quello che usano
  * gli oracoli, dove il punto e' il risultato e non il tempo. */
 static float *forward(GModel *m, const int *tokens, int n,
@@ -1949,8 +2016,8 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * E' lavoro sprecato, non un errore, e il giorno che gli slot esistono
      * davvero il protocollo qui non cambia. */
     GSession *session = session_open(m, total + budget + 1);
-    float *logits = forward_span(m, session, sequence, total, NULL, 0);
-    int rows = total;
+    float *logits = forward_prefill(m, session, sequence, total, NULL, 0, 0);
+    int rows = 1;
     for (int step = 0; step < budget; step++) {
         if (total >= room) { limited = 1; break; }
         int next = sample_token(logits + (size_t)(rows - 1) * m->c.vocab, m->c.vocab);
@@ -2108,7 +2175,7 @@ int main(int argc, char **argv) {
     /* Una sola sessione per tutta la generazione: il prompt si prefilla una
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
-    float *logits = forward_span(&model, session, tokens, count, vision, n_vision);
+    float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)
         printf(" %d", argmax(logits + (size_t)t * model.c.vocab, model.c.vocab));

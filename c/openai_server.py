@@ -1365,13 +1365,74 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
+                      tool_choice=None):
+    """Render the text-only subset of the official GLM-5.3-Flash chat template.
+
+    Not a variant of the GLM-5.2 renderer above, and the differences are not
+    cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
+    template defaults the effort to Max rather than leaving it unset; it accepts
+    only low, high and max, not the six-level ladder; and its generation prompt
+    OPENS the reasoning block with a bare `<think>` where 5.2 closed it
+    immediately with `<think></think>`. A past assistant turn still closes it.
+
+    Tools are refused rather than rendered. GLM-5.3 declares them inside a
+    `<tool_response><tools>` wrapper with its own JSON serialization, which is
+    not the block 5.2 uses, and emitting 5.2's shape here would put a prompt in
+    front of the model that it was never trained on -- an answer that looks
+    fine and is quietly wrong is worse than an error that says what is missing.
+    """
+    if not isinstance(messages, list) or not messages:
+        raise APIError(400, "`messages` must be a non-empty array.", "messages")
+    if tools and tool_choice != "none":
+        raise APIError(400, "Tool calling is not wired for GLM-5.3-Flash yet; "
+                            "its declaration block differs from GLM-5.2's.", "tools")
+
+    # low/high passano, tutto il resto e' Max: e' la scala del template, non la
+    # nostra. `none` non arriva qui, spegne il ragionamento a monte.
+    effort = {"minimal": "Low", "low": "Low", "medium": "High",
+              "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
+    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+
+    for message in messages:
+        if not isinstance(message, dict):
+            raise APIError(400, "each message must be an object.", "messages")
+        role = message.get("role")
+        content = message.get("content")
+        if isinstance(content, list):                 # parti multimodali: solo il testo
+            content = "".join(part.get("text", "") for part in content
+                              if isinstance(part, dict) and part.get("type") == "text")
+        content = content or ""
+        if role == "user":
+            prompt.append(f"<|user|>{content}")
+        elif role == "system":
+            prompt.append(f"<|system|>{content}")
+        elif role == "assistant":
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str) and "</think>" in content:
+                reasoning = content.split("</think>")[0].split("<think>")[-1]
+                content = content.split("</think>")[-1]
+            opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
+            prompt.append(f"<|assistant|>{opened}{content.strip()}")
+        elif role == "tool":
+            raise APIError(400, "Tool results are not wired for GLM-5.3-Flash yet.",
+                           "messages")
+        else:
+            raise APIError(400, f"unsupported message role {role!r}.", "messages")
+
+    # Il prompt di generazione APRE il blocco di ragionamento e non lo chiude.
+    prompt.append("<|assistant|><think>")
+    return "".join(prompt)
+
+
 def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                          tool_choice=None, audio_out=None):
     """Render a chat request with the active engine's native prompt contract."""
     if ARCH == "inkling":
         return render_chat_inkling(messages, enable_thinking, reasoning_effort, tools,
                                     tool_choice, audio_out=audio_out)
-    renderer = (render_chat_kimi if ARCH == "kimi" else
+    renderer = (render_chat_glm53 if ARCH == "glm53" else
+                render_chat_kimi if ARCH == "kimi" else
                 render_chat_qwen if ARCH == "qwen36" else
                 render_chat_v4 if ARCH == "deepseek_v4" else
                 render_chat_olmoe if ARCH == "olmoe" else render_chat)
