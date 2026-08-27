@@ -609,7 +609,7 @@ typedef struct {
     Mat kq, kk, kv, ko, kga, kgb, kfa, kfb, kb;
     const float *conv, *dt, *alog, *onorm;
     /* MLA + indexer */
-    Mat qa, qb, kva, kvb, o, iwq, iwk, iwp, ikpg;
+    Mat qa, qb, kva, kvb_kt, kvb_v, o, iwq, iwk, iwp, ikpg;
     const float *qa_ln, *kva_ln, *ik_nw, *ik_nb, *ikpa;
     /* FFN */
     Mat dg, du, dd;                       /* denso */
@@ -632,7 +632,7 @@ typedef struct {
 typedef struct {
     float *kda_state;                     /* [teste * k * v] */
     float *kda_window;                    /* [3 * proiezione * kernel] */
-    float *keys, *values;                 /* [cap][teste][qk], [cap][teste][v] */
+    float *latent;                        /* [cap][kv_lora]: MLA assorbita */
     float *ikeys, *igates;                /* [cap][dim indexer] */
 } GLayerState;
 
@@ -724,6 +724,85 @@ static void quantize_i4_grouped(const float *w, uint8_t *q4, float *scale,
     }
 }
 
+/* Un blocco f32 gia' in memoria, portato alla precisione chiesta. Possiede il
+ * buffer: o lo tiene com'e' o lo libera dopo averlo quantizzato. */
+static Mat quantize_loaded(float *buffer, int rows, int columns) {
+    Mat mat; memset(&mat, 0, sizeof(mat));
+    mat.rows = rows; mat.columns = columns;
+    const int bits = glm53_dense_bits();
+    if (bits == 32) { mat.fmt = 0; mat.f = buffer; return mat; }
+    if (bits == 4 && columns % 64 == 0) {
+        const int groups = columns / 64;
+        uint8_t *packed = malloc((size_t)rows * ((columns + 1) / 2));
+        float *step = malloc((size_t)rows * groups * sizeof(float));
+        if (!packed || !step) { fprintf(stderr, "OOM quantizzando %dx%d\n", rows, columns); exit(1); }
+        quantize_i4_grouped(buffer, packed, step, rows, columns, 64);
+        free(buffer);
+        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
+        return mat;
+    }
+    /* int8 per riga: e' anche il ripiego quando le colonne non sono multiple
+     * di 64, che capita sulle proiezioni piccole dell'indexer. */
+    int8_t *level = malloc((size_t)rows * columns);
+    float *step = malloc((size_t)rows * sizeof(float));
+    if (!level || !step) { fprintf(stderr, "OOM quantizzando %dx%d\n", rows, columns); exit(1); }
+    quantize_rows(buffer, level, step, rows, columns, 8);
+    free(buffer);
+    mat.fmt = 1; mat.q8 = level; mat.s = step;
+    return mat;
+}
+
+/* Le due forme assorbite di kv_b_proj.
+ *
+ * MLA comprime chiavi e valori in un latente da kv_lora (512 qui) e li
+ * riespande con kv_b_proj. Tenere in cache le chiavi espanse costa
+ * teste*qk_nope*2 float per posizione, cioe' 1,39 MB a token su questo
+ * modello, undici GB a ottomila token: piu' della macchina.
+ *
+ * Il latente invece costa 512 float, quarantatre volte meno, e non serve
+ * riespanderlo se si piegano le proiezioni nei due estremi. Per una testa h,
+ * con W_k e W_v le due meta' del blocco di kv_b_proj:
+ *
+ *     punteggio_j = q . (W_k c_j) = (W_k^T q) . c_j
+ *     uscita      = somma_j a_j (W_v c_j) = W_v (somma_j a_j c_j)
+ *
+ * A sinistra si moltiplica per ogni posizione in cache, a destra una volta per
+ * query. E' un'uguaglianza, non un'approssimazione: cambia solo l'ordine dei
+ * prodotti, e con esso quanta memoria serve.
+ *
+ * Le due matrici si costruiscono qui, da kv_b_proj in f32, e poi passano dallo
+ * stesso quantizzatore di tutto il resto. */
+static void absorb_kvb(GModel *m, GLayer *l, const char *name) {
+    const Cfg *c = &m->c;
+    const int H = c->n_heads, QK = c->qk_nope, V = c->v_head, L = c->kv_lora;
+    st_tensor *t = st_find(&m->S, name);
+    if (!t) { fprintf(stderr, "manca %s\n", name); exit(1); }
+    if (t->numel != (int64_t)H * (QK + V) * L) {
+        fprintf(stderr, "%s: %lld valori, attesi %lld per %d teste\n", name,
+                (long long)t->numel, (long long)H * (QK + V) * L, H);
+        exit(1);
+    }
+    float *whole = malloc((size_t)t->numel * sizeof(float));
+    float *kt = malloc((size_t)H * L * QK * sizeof(float));
+    float *vv = malloc((size_t)H * V * L * sizeof(float));
+    if (!whole || !kt || !vv) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+    st_read_f32_cap(&m->S, name, whole, t->numel, 1);
+
+    for (int h = 0; h < H; h++) {
+        const float *block = whole + (size_t)h * (QK + V) * L;
+        /* W_k^T: [L, QK], da W_k che e' [QK, L] */
+        for (int d = 0; d < L; d++)
+            for (int i = 0; i < QK; i++)
+                kt[((size_t)h * L + d) * QK + i] = block[(size_t)i * L + d];
+        /* W_v: [V, L], gia' nel verso giusto, e' una copia di righe */
+        memcpy(vv + (size_t)h * V * L, block + (size_t)QK * L,
+               (size_t)V * L * sizeof(float));
+    }
+    free(whole);
+    l->kvb_kt = quantize_loaded(kt, H * L, QK);
+    l->kvb_v = quantize_loaded(vv, H * V, L);
+}
+
 static Mat load_mat(GModel *m, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
@@ -786,27 +865,28 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
     mat.rows = (int)t->shape[0];
     mat.columns = (int)t->shape[1];
 
-    const int bits = glm53_dense_bits();
-    if (bits == 32) { mat.fmt = 0; mat.f = buffer; return mat; }
-    if (bits == 4 && mat.columns % 64 == 0) {
-        const int groups = mat.columns / 64;
-        uint8_t *packed = malloc((size_t)mat.rows * ((mat.columns + 1) / 2));
-        float *step = malloc((size_t)mat.rows * groups * sizeof(float));
-        if (!packed || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
-        quantize_i4_grouped(buffer, packed, step, mat.rows, mat.columns, 64);
-        free(buffer);
-        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
-        return mat;
-    }
-    /* int8 per riga: e' anche il ripiego quando le colonne non sono multiple
-     * di 64, che capita sulle proiezioni piccole dell'indexer. */
-    int8_t *level = malloc((size_t)mat.rows * mat.columns);
-    float *step = malloc((size_t)mat.rows * sizeof(float));
-    if (!level || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
-    quantize_rows(buffer, level, step, mat.rows, mat.columns, 8);
-    free(buffer);
-    mat.fmt = 1; mat.q8 = level; mat.s = step;
+    mat = quantize_loaded(buffer, mat.rows, mat.columns);
     return mat;
+}
+
+/* Come mv ma su un blocco di righe contigue: serve alle matrici che tengono
+ * una testa dopo l'altra in un unico tensore. */
+static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows) {
+    switch (w->fmt) {
+    case 4: {
+        const int packed = (w->columns + 1) / 2, groups = w->columns / w->gs;
+        matmul_i4_grouped(out, x, w->q4 + (size_t)row0 * packed,
+                          w->s + (size_t)row0 * groups, 1, w->columns, rows, w->gs);
+        break;
+    }
+    case 1:
+        matmul_q(out, x, w->q8 + (size_t)row0 * w->columns, w->s + row0,
+                 1, w->columns, rows);
+        break;
+    default:
+        matmul(out, x, w->f + (size_t)row0 * w->columns, 1, w->columns, rows);
+        break;
+    }
 }
 
 /* out[rows] = W x, con W in layout [rows, columns] come transformers. */
@@ -914,11 +994,10 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
     const int IH = c->index_nh, ID = c->index_hd;
     const int seen = base + tokens;
     float *qa = malloc((size_t)tokens * c->q_lora * sizeof(float));
+    const int L = c->kv_lora;
     float *queries = malloc((size_t)tokens * H * QK * sizeof(float));
-    float *keys = st->keys;               /* tutto il prefisso, non solo i nuovi */
-    float *values = st->values;
-    float *latent = malloc((size_t)c->kv_lora * sizeof(float));
-    float *expanded = malloc((size_t)H * (QK + V) * sizeof(float));
+    float *absorbed = malloc((size_t)tokens * H * L * sizeof(float));
+    float *latent = st->latent;           /* tutto il prefisso, non solo i nuovi */
     float *iq = malloc((size_t)tokens * IH * ID * sizeof(float));
     float *ik = st->ikeys;
     float *gates = st->igates;
@@ -933,14 +1012,14 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
         mv(qn, &l->qa, row);
         rms(qn, qn, l->qa_ln, c->q_lora, c->eps);
         mv(queries + (size_t)t * H * QK, &l->qb, qn);
-        mv(latent, &l->kva, row);
-        rms(latent, latent, l->kva_ln, c->kv_lora, c->eps);
-        mv(expanded, &l->kvb, latent);
-        for (int h = 0; h < H; h++) {
-            const float *src = expanded + (size_t)h * (QK + V);
-            memcpy(keys + ((size_t)at * H + h) * QK, src, (size_t)QK * sizeof(float));
-            memcpy(values + ((size_t)at * H + h) * V, src + QK, (size_t)V * sizeof(float));
-        }
+        float *here = latent + (size_t)at * L;
+        mv(here, &l->kva, row);
+        rms(here, here, l->kva_ln, L, c->eps);
+        /* la query entra nello spazio del latente una volta per testa, invece
+         * che il latente nello spazio della query una volta per posizione */
+        for (int h = 0; h < H; h++)
+            mv_rows(absorbed + ((size_t)t * H + h) * L, &l->kvb_kt,
+                    queries + ((size_t)t * H + h) * QK, h * L, L);
         /* indexer: le query vengono dal q_a normalizzato, le chiavi dall'hidden
          * con LayerNorm (con bias), e i pesi per testa sono scalati da IH^-0.5 */
         mv(iq + (size_t)t * IH * ID, &l->iwq, qn);
@@ -968,16 +1047,50 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
             fprintf(stderr, "\n");
         }
     }
-    float *context = malloc((size_t)tokens * H * V * sizeof(float));
-    if (coli_sparse_attention_range(context, queries, keys, values, selected,
-                                    seen, width, H, QK, V, base, seen)) {
-        fprintf(stderr, "attenzione sparsa fallita\n"); exit(1);
+    /* Attenzione nello spazio del latente. La scala resta 1/sqrt(qk_nope):
+     * il prodotto e' lo stesso numero di prima, calcolato in un altro ordine. */
+    float *context = malloc((size_t)H * V * sizeof(float));
+    float *pooled = malloc((size_t)L * sizeof(float));
+    float *score = malloc((size_t)width * sizeof(float));
+    const float scale = 1.0f / sqrtf((float)QK);
+    for (int t = 0; t < tokens; t++) {
+        const int *chosen = selected + (size_t)t * width;
+        for (int h = 0; h < H; h++) {
+            const float *q = absorbed + ((size_t)t * H + h) * L;
+            float top = -INFINITY;
+            int used = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                const float *c_j = latent + (size_t)at * L;
+                float dot = 0.0f;
+                for (int d = 0; d < L; d++) dot += q[d] * c_j[d];
+                score[used] = dot * scale;
+                if (score[used] > top) top = score[used];
+                used++;
+            }
+            float *result = context + (size_t)h * V;
+            memset(result, 0, (size_t)V * sizeof(float));
+            if (!used) continue;
+            double total = 0.0;
+            for (int i = 0; i < used; i++) { score[i] = expf(score[i] - top); total += score[i]; }
+            memset(pooled, 0, (size_t)L * sizeof(float));
+            int seen_slot = 0;
+            for (int i = 0; i < width; i++) {
+                const int at = chosen[i];
+                if (at < 0 || at >= seen) continue;
+                const float weight = (float)(score[seen_slot++] / total);
+                const float *c_j = latent + (size_t)at * L;
+                for (int d = 0; d < L; d++) pooled[d] += weight * c_j[d];
+            }
+            mv_rows(result, &l->kvb_v, pooled, h * V, V);
+        }
+        mv(out + (size_t)t * c->hidden, &l->o, context);
     }
-    for (int t = 0; t < tokens; t++)
-        mv(out + (size_t)t * c->hidden, &l->o, context + (size_t)t * H * V);
+    free(score); free(pooled);
 
     free(context); free(selected); free(valid); free(head_w);
-    free(iq); free(expanded); free(latent); free(queries); free(qa);
+    free(iq); free(absorbed); free(queries); free(qa);
 }
 
 /* ---------- FFN: denso oppure MoE ---------- */
@@ -1273,7 +1386,12 @@ static void model_load(GModel *m, const char *dir) {
             l->qb = load_mat(m, "%slayers.%d.self_attn.q_b_proj.weight", P, i);
             l->kva = load_mat(m, "%slayers.%d.self_attn.kv_a_proj_with_mqa.weight", P, i);
             l->kva_ln = load_f32(m, "%slayers.%d.self_attn.kv_a_layernorm.weight", P, i);
-            l->kvb = load_mat(m, "%slayers.%d.self_attn.kv_b_proj.weight", P, i);
+            {
+                char kvb_name[512];
+                snprintf(kvb_name, sizeof(kvb_name),
+                         "%slayers.%d.self_attn.kv_b_proj.weight", P, i);
+                absorb_kvb(m, l, kvb_name);
+            }
             l->o = load_mat(m, "%slayers.%d.self_attn.o_proj.weight", P, i);
             l->iwq = load_mat(m, "%slayers.%d.self_attn.indexer.wq_b.weight", P, i);
             l->iwk = load_mat(m, "%slayers.%d.self_attn.indexer.wk.weight", P, i);
@@ -1448,11 +1566,10 @@ static GSession *session_open(const GModel *m, int cap) {
     for (int i = 0; i < c->n_layers; i++) {
         GLayerState *st = &s->layer[i];
         if (c->is_full[i]) {
-            st->keys = malloc((size_t)cap * c->n_heads * c->qk_nope * sizeof(float));
-            st->values = malloc((size_t)cap * c->n_heads * c->v_head * sizeof(float));
+            st->latent = malloc((size_t)cap * c->kv_lora * sizeof(float));
             st->ikeys = malloc((size_t)cap * c->index_hd * sizeof(float));
             st->igates = malloc((size_t)cap * c->index_hd * sizeof(float));
-            if (!st->keys || !st->values || !st->ikeys || !st->igates) {
+            if (!st->latent || !st->ikeys || !st->igates) {
                 fprintf(stderr, "OOM sulla cache del layer %d\n", i); exit(1);
             }
         } else if (c->kda_proj) {
@@ -1464,6 +1581,14 @@ static GSession *session_open(const GModel *m, int cap) {
             }
         }
     }
+    if (getenv("GLM53_VERBOSE")) {
+        int full = 0;
+        for (int i = 0; i < c->n_layers; i++) if (c->is_full[i]) full++;
+        const double per_token = (double)full * (c->kv_lora + 2 * c->index_hd) * sizeof(float);
+        fprintf(stderr, "cache: %.1f KB per token su %d layer DSA "
+                        "(%.2f GB a %d posizioni)\n",
+                per_token / 1024.0, full, per_token * cap / 1e9, cap);
+    }
     return s;
 }
 
@@ -1471,7 +1596,7 @@ static void session_close(const GModel *m, GSession *s) {
     if (!s) return;
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayerState *st = &s->layer[i];
-        free(st->keys); free(st->values); free(st->ikeys); free(st->igates);
+        free(st->latent); free(st->ikeys); free(st->igates);
         free(st->kda_state); free(st->kda_window);
     }
     free(s->kda_scratch);
