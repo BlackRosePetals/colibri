@@ -10,7 +10,8 @@
  * block-FP8 experts remain native in a bounded per-layer LRU; the 51B-parameter
  * PLE table remains on disk and only its sixteen 160-byte rows/token are read.
  *
- * Runtime: SNAP=<dir>, optional Q38_MAXT, and argv
+ * Runtime: SNAP=<dir>, optional Q38_MAXT, Q38_EXPERT_PREFETCH=0 and
+ * Q38_EXPERT_PARALLEL_READS=0 A/B controls, and argv
  * `qwen38 <cache/layer> <reserved> [ref.json]`.  The second positional remains
  * reserved so Colibri's common cache-aware launcher ABI stays stable.
  */
@@ -1625,10 +1626,11 @@ static int q38_segment_fused_matrix_bytes(Model *m,const st_tensor *tensor,
  * representative.  Fused containers have one dtype/geometry for every expert. */
 static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
                                      uint64_t *bytes_per_capacity,
+                                     uint64_t *fixed_scale_bytes,
                                      unsigned *numeric_kinds){
-    if(!m||!bytes_per_capacity||!numeric_kinds||begin>=end||
+    if(!m||!bytes_per_capacity||!fixed_scale_bytes||!numeric_kinds||begin>=end||
        end>(uint32_t)m->c.layers)return -1;
-    Cfg *c=&m->c;uint64_t range_bytes=0;unsigned kinds=0;
+    Cfg *c=&m->c;uint64_t range_bytes=0,range_scales=0;unsigned kinds=0;
     for(uint32_t layer=begin;layer<end;layer++){
         char name[320];q38_name(m,name,sizeof name,(int)layer,
                                 "mlp.experts.gate_up_proj");
@@ -1652,6 +1654,7 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
             const char *projection[3]={"gate_proj","up_proj","down_proj"};
             int rows[3]={c->inter,c->inter,c->hidden};
             int cols[3]={c->hidden,c->hidden,c->inter};
+            int all_native_fp8=m->native_fp8;
             for(int expert=0;expert<c->experts;expert++){
                 uint64_t expert_bytes=0;
                 for(int projection_index=0;projection_index<3;projection_index++){
@@ -1661,6 +1664,8 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
                         projection[projection_index]);
                     if(length<0||(size_t)length>=sizeof suffix)return -1;
                     q38_name(m,name,sizeof name,(int)layer,suffix);
+                    st_tensor *weight=st_find(&m->S,name);
+                    if(!weight||weight->dtype!=4)all_native_fp8=0;
                     uint64_t part;
                     if(q38_segment_matrix_bytes(m,name,rows[projection_index],
                          cols[projection_index],&part,&kinds)||
@@ -1668,17 +1673,37 @@ static int q38_segment_expert_layout(Model *m,uint32_t begin,uint32_t end,
                 }
                 if(expert_bytes>layer_bytes)layer_bytes=expert_bytes;
             }
+            if(all_native_fp8){
+                uint64_t scale_count=(uint64_t)fp8_nblk(c->inter)*
+                                     (uint64_t)fp8_nblk(c->hidden);
+                uint64_t per_slot_scales,layer_scale_bank;
+                if(q38_u64_mul(3u,scale_count,&per_slot_scales)||
+                   q38_u64_mul(per_slot_scales,sizeof(float),&per_slot_scales)||
+                   layer_bytes<per_slot_scales||
+                   q38_u64_mul(per_slot_scales,(uint64_t)c->experts,
+                               &layer_scale_bank)||
+                   q38_u64_add(&range_scales,layer_scale_bank))return -1;
+                /* Eligible checkpoints borrow normalized scales from one
+                 * per-layer bank, so only raw FP8 payload belongs to a slot.
+                 * Charging the full bank even for a repacked checkpoint that
+                 * later falls back is conservative and keeps tight Segment
+                 * memory limits safe. */
+                layer_bytes-=per_slot_scales;
+            }
         }
         if(!layer_bytes||q38_u64_add(&range_bytes,layer_bytes))return -1;
     }
-    *bytes_per_capacity=range_bytes;*numeric_kinds=kinds;return 0;
+    *bytes_per_capacity=range_bytes;*fixed_scale_bytes=range_scales;
+    *numeric_kinds=kinds;return 0;
 }
 
-static int q38_segment_cache_capacity(uint64_t bytes_per_capacity,int experts,
+static int q38_segment_cache_capacity(uint64_t bytes_per_capacity,
+                                      uint64_t fixed_scale_bytes,int experts,
                                       uint64_t memory_limit,int *capacity){
     if(!bytes_per_capacity||experts<1||!capacity)return -1;
     if(!memory_limit){*capacity=1;return 0;}
-    uint64_t slots=memory_limit/bytes_per_capacity;
+    if(memory_limit<=fixed_scale_bytes)return -1;
+    uint64_t slots=(memory_limit-fixed_scale_bytes)/bytes_per_capacity;
     if(!slots)return -1;
     if(slots>(uint64_t)experts)slots=(uint64_t)experts;
     *capacity=(int)slots;return 0;
@@ -1809,14 +1834,17 @@ static int qwen38_segment_engine_open(
      * cannot discard data or perturb LRU state. */
     model_init_range(&e->model,options->model_dir,1,8,
                      (int)e->layer_begin,(int)e->layer_end,0,0);
-    uint64_t bytes_per_capacity=0;unsigned numeric_kinds=0;int cap=1;
+    uint64_t bytes_per_capacity=0,fixed_scale_bytes=0;
+    unsigned numeric_kinds=0;int cap=1;
     if(q38_segment_expert_layout(&e->model,e->layer_begin,e->layer_end,
-                                 &bytes_per_capacity,&numeric_kinds)){
+                                 &bytes_per_capacity,&fixed_scale_bytes,
+                                 &numeric_kinds)){
         q38_model_free(&e->model);pthread_mutex_destroy(&e->run_lock);free(e);
         return coli_segment_adapter_error(error,error_size,
             "Qwen3.8 Segment checkpoint has an unsupported expert layout");
     }
-    if(q38_segment_cache_capacity(bytes_per_capacity,e->model.c.experts,
+    if(q38_segment_cache_capacity(bytes_per_capacity,fixed_scale_bytes,
+                                  e->model.c.experts,
                                   options->memory_limit_bytes,&cap)){
         q38_model_free(&e->model);pthread_mutex_destroy(&e->run_lock);free(e);
         return coli_segment_adapter_error(error,error_size,

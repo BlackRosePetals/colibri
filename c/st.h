@@ -938,6 +938,30 @@ static void st_read_raw_cap(shards *S, const char *name, void *out, int64_t cap,
     st_read_raw(S, name, out, drop);
 }
 
+/* Read an exact physical range from one indexed shard.  This is intentionally
+ * separate from tensor slices: callers may use it only after validating a
+ * checkpoint-specific packing invariant (for example, two adjacent tensors).
+ * The shard membership, file bounds and destination capacity remain enforced
+ * here so a malformed header cannot turn that optimization into an unchecked
+ * pread. */
+static void st_read_range_raw_cap(shards *S, int fd, int64_t off,
+                                  int64_t nbytes, void *out, int64_t cap,
+                                  int drop, const char *tag) {
+    int fidx=S?st_fidx(S,fd):-1;
+    if(fidx<0){fprintf(stderr,"physical range uses an unindexed shard fd\n");exit(1);}
+    if(off<0||nbytes<0||cap<0||nbytes>cap||
+       off>S->sizes[fidx]||nbytes>S->sizes[fidx]-off||
+       (uint64_t)nbytes>SIZE_MAX){
+        fprintf(stderr,"physical shard range [%lld,+%lld) exceeds file/destination bounds "
+                       "(file %lld, cap %lld) — refusing (untrusted container)\n",
+                (long long)off,(long long)nbytes,(long long)S->sizes[fidx],
+                (long long)cap);exit(1);
+    }
+    if(nbytes>0&&!out){fprintf(stderr,"physical range has a NULL destination\n");exit(1);}
+    if(nbytes>0)st_pread_full(fd,out,nbytes,off,tag&&*tag?tag:"pread physical range");
+    if(drop&&nbytes>0)posix_fadvise(fd,off,nbytes,POSIX_FADV_DONTNEED);
+}
+
 /* Read-only view of one tensor's exact stored bytes.  Unlike st_read_raw this
  * performs no allocation or copy; unlike a naked mmap pointer it carries the
  * aligned OS view/handle required for cleanup.  Callers must still validate

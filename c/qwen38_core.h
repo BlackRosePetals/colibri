@@ -40,6 +40,7 @@ typedef struct {
     int rows, cols;
     int64_t elements, scale_count;
     Q38WeightKind kind;
+    unsigned owns_data:1, owns_scales:1;
 } Q38Weight;
 
 typedef struct { float *norm; Q38Weight down, up, inject; } GatedResidual;
@@ -84,8 +85,20 @@ typedef struct {
     float *ple_norm_conv, *ple_conv;
 } Layer;
 
-typedef struct { int eid; Q38Weight gate, up, down; uint64_t used; } Slot;
+typedef struct {
+    int eid;
+    Q38Weight gate, up, down;
+    uint64_t used;
+    void *fp8_slab;
+    int64_t fp8_slab_bytes;
+} Slot;
 typedef struct { Slot *slots; int *by_expert, n, cap; } LCache;
+
+typedef struct {
+    float *values;                 /* [expert][gate,up,down][block] */
+    int64_t scale_count;
+    int ready;                     /* 0 unknown, 1 resident, -1 incompatible */
+} Q38ExpertScaleCache;
 
 typedef struct {
     Cfg c;
@@ -95,7 +108,11 @@ typedef struct {
     GatedResidual final_gr;
     Layer *L;
     LCache *cache;
+    Q38ExpertScaleCache *expert_scales;
     uint64_t clock, hits, miss;
+    uint64_t expert_weight_reads, expert_scale_reads, expert_pair_reads;
+    uint64_t expert_prefetch_ranges, expert_parallel_batches;
+    uint64_t expert_scale_bytes;
     float **DN_rec, **DN_conv;
     float **K, **V, **IK;
     int kv_len, kv_cap, max_t;
@@ -109,7 +126,7 @@ typedef struct {
     float *PLE_conv_state;
     int ple_history_len;
     int range_begin, range_end;
-    int native_fp8, native_bf16;
+    int native_fp8, native_bf16, expert_prefetch, expert_parallel_reads;
     uint64_t resident_weight_bytes;
     double dense_load_s;
     Q38Timers timers;
@@ -167,7 +184,9 @@ static void q38_matmul(float *y, const float *x, const float *W, int S, int I, i
 
 static void q38_weight_free(Q38Weight *weight) {
     if(!weight)return;
-    free(weight->data);free(weight->scales);memset(weight,0,sizeof(*weight));
+    if(weight->owns_data)free(weight->data);
+    if(weight->owns_scales)free(weight->scales);
+    memset(weight,0,sizeof(*weight));
 }
 
 static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int cols) {
@@ -177,7 +196,8 @@ static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int
     int64_t elements=(int64_t)rows*cols;
     int64_t scales=kind==Q38_WEIGHT_FP8?fp8_nblk(rows)*fp8_nblk(cols):0;
     if(weight->kind==kind&&weight->rows==rows&&weight->cols==cols&&
-       weight->data&&(!scales||weight->scales))return;
+       weight->owns_data&&weight->data&&
+       (!scales||(weight->owns_scales&&weight->scales)))return;
     q38_weight_free(weight);
     size_t element_size=kind==Q38_WEIGHT_F32?sizeof(float):
                         kind==Q38_WEIGHT_BF16?sizeof(uint16_t):
@@ -194,6 +214,7 @@ static void q38_weight_reserve(Q38Weight *weight,Q38WeightKind kind,int rows,int
     }
     weight->rows=rows;weight->cols=cols;weight->elements=elements;
     weight->scale_count=scales;weight->kind=kind;
+    weight->owns_data=1;weight->owns_scales=scales?1u:0u;
 }
 
 static uint64_t q38_weight_bytes(const Q38Weight *weight) {
@@ -623,6 +644,8 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     (void)bits; memset(m,0,sizeof(*m)); double t0=now_s();
     m->native_fp8=q38_env_bool("Q38_NATIVE_FP8",1);
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
+    m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
+    m->expert_parallel_reads=q38_env_bool("Q38_EXPERT_PARALLEL_READS",1);
     q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c); st_init(&m->S,snap);
     Cfg *c=&m->c; char nm[320];
     if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
@@ -638,7 +661,9 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     }
     m->L=(Layer*)calloc((size_t)c->layers,sizeof(Layer));
     m->cache=(LCache*)calloc((size_t)c->layers,sizeof(LCache));
-    if(!m->L||!m->cache){fprintf(stderr,"OOM model metadata\n");exit(1);}
+    m->expert_scales=(Q38ExpertScaleCache*)calloc((size_t)c->layers,
+                                                  sizeof(*m->expert_scales));
+    if(!m->L||!m->cache||!m->expert_scales){fprintf(stderr,"OOM model metadata\n");exit(1);}
     for(int i=layer_begin;i<layer_end;i++){
         Layer *l=&m->L[i]; q38_load_gr(m,&l->attn_gr,i,"attn_hyper_connection",1); q38_load_gr(m,&l->mlp_gr,i,"mlp_hyper_connection",1);
         #define WLD(field,suf,o,in) q38_name(m,nm,sizeof nm,i,suf); l->field=q38_load_weight(m,nm,(o),(in))
@@ -719,6 +744,217 @@ static void q38_gr_apply(const Cfg *c,float *hyper,const float *block,const floa
     }
 }
 
+typedef struct {
+    st_tensor *tensor;
+    int expert, projection;
+} Q38ScaleDesc;
+
+static int q38_scale_desc_cmp(const void *left,const void *right) {
+    const Q38ScaleDesc *a=(const Q38ScaleDesc*)left;
+    const Q38ScaleDesc *b=(const Q38ScaleDesc*)right;
+    if(a->tensor->off<b->tensor->off)return -1;
+    if(a->tensor->off>b->tensor->off)return 1;
+    return 0;
+}
+
+static int q38_scale_group_span(Q38ScaleDesc *desc,int count,int *fd,
+                                int64_t *begin,int64_t *nbytes) {
+    if(!desc||count<1||!fd||!begin||!nbytes)return -1;
+    qsort(desc,(size_t)count,sizeof(*desc),q38_scale_desc_cmp);
+    int group_fd=desc[0].tensor->fd;
+    int64_t first=desc[0].tensor->off,cursor=first;
+    for(int i=0;i<count;i++){
+        st_tensor *tensor=desc[i].tensor;
+        if(tensor->fd!=group_fd||tensor->off!=cursor||tensor->nbytes<=0||
+           tensor->nbytes>INT64_MAX-cursor)return -1;
+        cursor+=tensor->nbytes;
+    }
+    *fd=group_fd;*begin=first;*nbytes=cursor-first;return 0;
+}
+
+static void q38_decode_scale_tensor(float *out,const unsigned char *raw,
+                                     const st_tensor *tensor) {
+    if(tensor->dtype==2)memcpy(out,raw,(size_t)tensor->nbytes);
+    else for(int64_t i=0;i<tensor->numel;i++){
+        uint16_t half;memcpy(&half,raw+(size_t)i*sizeof(half),sizeof(half));
+        out[i]=tensor->dtype==0?bf16_to_f32(half):f16_to_f32(half);
+    }
+}
+
+/* The official checkpoint stores every layer's gate/up scale sidecars as one
+ * compact range and every down sidecar as another.  Normalize both ranges to
+ * an expert-indexed F32 bank once, scattering by the numeric expert id rather
+ * than the checkpoint's lexical tensor order (0, 1, 10, ...).  Variants that
+ * do not satisfy the compact-range invariant simply keep the established
+ * per-matrix loader. */
+static int q38_prepare_expert_scale_bank(Model *m,int layer) {
+    Cfg *c=&m->c;
+    if(!m->native_fp8||layer<0||layer>=c->layers)return 0;
+    if(!m->expert_scales){
+        m->expert_scales=(Q38ExpertScaleCache*)calloc((size_t)c->layers,
+                                                       sizeof(*m->expert_scales));
+        if(!m->expert_scales){fprintf(stderr,"OOM expert scale metadata\n");exit(1);}
+    }
+    Q38ExpertScaleCache *cache=&m->expert_scales[layer];
+    if(cache->ready)return cache->ready>0;
+    int64_t scale_count=fp8_nblk(c->inter)*fp8_nblk(c->hidden);
+    if(scale_count<1||(uint64_t)c->experts>SIZE_MAX/(3u*(uint64_t)scale_count*sizeof(float))){
+        fprintf(stderr,"invalid expert scale-bank geometry\n");exit(1);
+    }
+    Q38ScaleDesc *gate_up=(Q38ScaleDesc*)malloc((size_t)c->experts*2*sizeof(*gate_up));
+    Q38ScaleDesc *down=(Q38ScaleDesc*)malloc((size_t)c->experts*sizeof(*down));
+    if(!gate_up||!down){fprintf(stderr,"OOM expert scale descriptors\n");exit(1);}
+    int ngu=0,ndown=0;char suffix[192],name[320];
+    const char *projection[3]={"gate_proj","up_proj","down_proj"};
+    for(int expert=0;expert<c->experts;expert++)for(int kind=0;kind<3;kind++){
+        int rows=kind==2?c->hidden:c->inter;
+        int cols=kind==2?c->inter:c->hidden;
+        int length=snprintf(suffix,sizeof suffix,
+            "mlp.experts.%d.%s.weight_scale_inv",expert,projection[kind]);
+        if(length<0||(size_t)length>=sizeof suffix)goto incompatible;
+        q38_name(m,name,sizeof name,layer,suffix);
+        st_tensor *tensor=st_find(&m->S,name);
+        int64_t block_rows=fp8_nblk(rows),block_cols=fp8_nblk(cols);
+        if(!tensor||tensor->dtype<0||tensor->dtype>2||tensor->rank!=2||
+           tensor->shape[0]!=block_rows||tensor->shape[1]!=block_cols||
+           tensor->numel!=scale_count||
+           tensor->numel>INT64_MAX/st_dtype_esz(tensor->dtype)||
+           tensor->nbytes!=tensor->numel*st_dtype_esz(tensor->dtype))
+            goto incompatible;
+        Q38ScaleDesc item={tensor,expert,kind};
+        if(kind<2)gate_up[ngu++]=item;else down[ndown++]=item;
+    }
+    int gu_fd,down_fd;int64_t gu_begin,down_begin,gu_bytes,down_bytes;
+    if(q38_scale_group_span(gate_up,ngu,&gu_fd,&gu_begin,&gu_bytes)||
+       q38_scale_group_span(down,ndown,&down_fd,&down_begin,&down_bytes)||
+       (uint64_t)gu_bytes>SIZE_MAX||(uint64_t)down_bytes>SIZE_MAX)
+        goto incompatible;
+    float *values=(float*)malloc((size_t)c->experts*3*(size_t)scale_count*sizeof(float));
+    unsigned char *gu_raw=(unsigned char*)malloc((size_t)gu_bytes);
+    unsigned char *down_raw=(unsigned char*)malloc((size_t)down_bytes);
+    if(!values||!gu_raw||!down_raw){fprintf(stderr,"OOM resident expert scales\n");exit(1);}
+    double started=now_s();
+    st_read_range_raw_cap(&m->S,gu_fd,gu_begin,gu_bytes,gu_raw,gu_bytes,1,
+                          "pread Qwen3.8 gate/up scales");
+    st_read_range_raw_cap(&m->S,down_fd,down_begin,down_bytes,down_raw,down_bytes,1,
+                          "pread Qwen3.8 down scales");
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_scale_reads+=2;
+    for(int i=0;i<ngu;i++){
+        Q38ScaleDesc *item=&gate_up[i];
+        float *dst=values+((int64_t)item->expert*3+item->projection)*scale_count;
+        q38_decode_scale_tensor(dst,gu_raw+(item->tensor->off-gu_begin),item->tensor);
+    }
+    for(int i=0;i<ndown;i++){
+        Q38ScaleDesc *item=&down[i];
+        float *dst=values+((int64_t)item->expert*3+item->projection)*scale_count;
+        q38_decode_scale_tensor(dst,down_raw+(item->tensor->off-down_begin),item->tensor);
+    }
+    free(gu_raw);free(down_raw);free(gate_up);free(down);
+    cache->values=values;cache->scale_count=scale_count;cache->ready=1;
+    m->expert_scale_bytes+=(uint64_t)c->experts*3*(uint64_t)scale_count*sizeof(float);
+    return 1;
+incompatible:
+    free(gate_up);free(down);cache->ready=-1;return 0;
+}
+
+static void q38_bind_borrowed_fp8(Q38Weight *weight,void *data,float *scales,
+                                  int rows,int cols) {
+    q38_weight_free(weight);
+    weight->data=data;weight->scales=scales;weight->rows=rows;weight->cols=cols;
+    weight->elements=(int64_t)rows*cols;
+    weight->scale_count=fp8_nblk(rows)*fp8_nblk(cols);
+    weight->kind=Q38_WEIGHT_FP8;
+}
+
+static void q38_bind_fp8_slot(Slot *slot,float *scales,int scale_count,
+                              int hidden,int intermediate) {
+    int64_t matrix_bytes=(int64_t)hidden*intermediate;
+    if(matrix_bytes<1||matrix_bytes>INT64_MAX/3||
+       (uint64_t)(matrix_bytes*3)>SIZE_MAX||
+       scale_count!=fp8_nblk(hidden)*fp8_nblk(intermediate)){
+        fprintf(stderr,"invalid native FP8 expert slab geometry\n");exit(1);
+    }
+    q38_weight_free(&slot->gate);q38_weight_free(&slot->up);
+    q38_weight_free(&slot->down);
+    int64_t slab_bytes=matrix_bytes*3;
+    if(!slot->fp8_slab||slot->fp8_slab_bytes!=slab_bytes){
+        void *replacement=realloc(slot->fp8_slab,(size_t)slab_bytes);
+        if(!replacement){fprintf(stderr,"OOM native FP8 expert slab\n");exit(1);}
+        slot->fp8_slab=replacement;slot->fp8_slab_bytes=slab_bytes;
+    }
+    unsigned char *raw=(unsigned char*)slot->fp8_slab;
+    q38_bind_borrowed_fp8(&slot->gate,raw,scales,intermediate,hidden);
+    q38_bind_borrowed_fp8(&slot->up,raw+matrix_bytes,scales+scale_count,
+                          intermediate,hidden);
+    q38_bind_borrowed_fp8(&slot->down,raw+2*matrix_bytes,scales+2*scale_count,
+                          hidden,intermediate);
+}
+
+static int q38_native_fp8_expert_tensors(Model *m,int layer,int expert,
+                                         st_tensor *weight[3]) {
+    if(!m->native_fp8)return 0;
+    Cfg *c=&m->c;const char *projection[3]={"gate_proj","up_proj","down_proj"};
+    int rows[3]={c->inter,c->inter,c->hidden};
+    int cols[3]={c->hidden,c->hidden,c->inter};
+    char suffix[192],name[320];
+    for(int kind=0;kind<3;kind++){
+        int length=snprintf(suffix,sizeof suffix,"mlp.experts.%d.%s.weight",
+                            expert,projection[kind]);
+        if(length<0||(size_t)length>=sizeof suffix)return 0;
+        q38_name(m,name,sizeof name,layer,suffix);weight[kind]=st_find(&m->S,name);
+        if(!weight[kind]||weight[kind]->dtype!=4||weight[kind]->rank!=2||
+           weight[kind]->shape[0]!=rows[kind]||weight[kind]->shape[1]!=cols[kind]||
+           weight[kind]->nbytes!=(int64_t)rows[kind]*cols[kind])return 0;
+    }
+    if(weight[0]->fd!=weight[1]->fd||
+       weight[0]->off>INT64_MAX-weight[0]->nbytes||
+       weight[1]->off!=weight[0]->off+weight[0]->nbytes)return 0;
+    return 1;
+}
+
+static void q38_load_native_fp8_ranges(Model *m,int layer,int expert,Slot *slot,
+                                       st_tensor *weight[3]) {
+    Cfg *c=&m->c;
+    Q38ExpertScaleCache *cache=&m->expert_scales[layer];
+    float *scales=cache->values+(int64_t)expert*3*cache->scale_count;
+    q38_bind_fp8_slot(slot,scales,(int)cache->scale_count,c->hidden,c->inter);
+    int64_t pair_bytes=weight[0]->nbytes+weight[1]->nbytes;
+    unsigned char *raw=(unsigned char*)slot->fp8_slab;
+    st_read_range_raw_cap(&m->S,weight[0]->fd,weight[0]->off,pair_bytes,
+                          raw,pair_bytes,1,"pread Qwen3.8 gate/up expert");
+    st_read_range_raw_cap(&m->S,weight[2]->fd,weight[2]->off,weight[2]->nbytes,
+                          raw+pair_bytes,slot->fp8_slab_bytes-pair_bytes,1,
+                          "pread Qwen3.8 down expert");
+}
+
+static int q38_try_load_native_fp8_expert(Model *m,int layer,int expert,Slot *slot) {
+    st_tensor *weight[3];
+    if(!q38_native_fp8_expert_tensors(m,layer,expert,weight)||
+       !q38_prepare_expert_scale_bank(m,layer))return 0;
+    double started=now_s();
+    q38_load_native_fp8_ranges(m,layer,expert,slot,weight);
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+    m->expert_weight_reads+=2;m->expert_pair_reads++;
+    return 1;
+}
+
+static void q38_prefetch_native_fp8_experts(Model *m,int layer,
+                                            const int *experts,int count) {
+    if(!m->expert_prefetch||!m->native_fp8||!experts||count<1||
+       !q38_prepare_expert_scale_bank(m,layer))return;
+    LCache *cache=&m->cache[layer];
+    for(int index=0;index<count;index++){
+        int expert=experts[index];st_tensor *weight[3];
+        if(expert<0||expert>=m->c.experts||cache->by_expert[expert]>=0||
+           !q38_native_fp8_expert_tensors(m,layer,expert,weight))continue;
+        posix_fadvise(weight[0]->fd,weight[0]->off,
+                      weight[0]->nbytes+weight[1]->nbytes,POSIX_FADV_WILLNEED);
+        posix_fadvise(weight[2]->fd,weight[2]->off,weight[2]->nbytes,
+                      POSIX_FADV_WILLNEED);
+        m->expert_prefetch_ranges+=2;
+    }
+}
+
 static void q38_load_fp8_expert_weight(Model *m,const char *wn,const char *sn,
                                         Q38Weight *out,int O,int I) {
     st_tensor *w=st_find(&m->S,wn),*sc=st_find(&m->S,sn);
@@ -735,6 +971,7 @@ static void q38_load_fp8_expert_weight(Model *m,const char *wn,const char *sn,
         st_read_raw_cap(&m->S,wn,out->data,w->nbytes,1);
         st_read_f32(&m->S,sn,out->scales,1);
         q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+        m->expert_weight_reads++;m->expert_scale_reads++;
         return;
     }
     q38_weight_reserve(out,Q38_WEIGHT_F32,O,I);
@@ -742,7 +979,8 @@ static void q38_load_fp8_expert_weight(Model *m,const char *wn,const char *sn,
     if(!raw){fprintf(stderr,"OOM FP8 expert staging\n");exit(1);}
     double started=now_s();
     st_read_raw_cap(&m->S,wn,raw,w->nbytes,1);st_read_f32(&m->S,sn,scale,1);
-    q38_tm_add(m,Q38_TM_EXPERT_READ,started); started=now_s();
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+    m->expert_weight_reads++;m->expert_scale_reads++;started=now_s();
     float *decoded=(float*)out->data;
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++)for(int i=0;i<I;i++)
@@ -764,7 +1002,7 @@ static void q38_load_expert_weight(Model *m,const char *name,Q38Weight *out,
     if(kind==Q38_WEIGHT_BF16)
         st_read_raw_cap(&m->S,name,out->data,tensor->nbytes,1);
     else st_read_f32(&m->S,name,(float*)out->data,1);
-    q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
 }
 
 static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *tensor,
@@ -780,7 +1018,7 @@ static void q38_load_expert_slice(Model *m,const char *name,const st_tensor *ten
         st_read_slice_raw_cap(&m->S,name,element_offset*(int64_t)sizeof(uint16_t),
                               bytes,out->data,bytes,1);
     } else st_read_slice_f32(&m->S,name,element_offset,(int64_t)O*I,(float*)out->data,1);
-    q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+    q38_tm_add(m,Q38_TM_EXPERT_READ,started);m->expert_weight_reads++;
 }
 
 static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
@@ -797,6 +1035,7 @@ static void q38_load_expert(Model *m,int layer,int eid,Slot *s) {
         q38_load_expert_slice(m,nm,t,(int64_t)eid*H*I,&s->down,H,I);
         return;
     }
+    if(q38_try_load_native_fp8_expert(m,layer,eid,s))return;
     const char *kind[3]={"gate_proj","up_proj","down_proj"};Q38Weight *dst[3]={&s->gate,&s->up,&s->down};
     int os[3]={I,I,H},is[3]={H,H,I};
     for(int k=0;k<3;k++){
@@ -817,6 +1056,97 @@ static Slot *q38_expert_get(Model *m,int layer,int eid) {
         s=&lc->slots[victim];if(s->eid>=0)lc->by_expert[s->eid]=-1;
     }
     s->eid=-1;q38_load_expert(m,layer,eid,s);s->eid=eid;s->used=++m->clock;lc->by_expert[eid]=(int)(s-lc->slots);return s;
+}
+
+typedef struct {
+    int expert;
+    Slot *slot;
+    st_tensor *weight[3];
+} Q38ExpertLoadJob;
+
+/* Reserve an entire routed demand set on the main thread, fill distinct slots
+ * in parallel, then publish every cache index on the main thread.  Demand-set
+ * residents are protected from victim selection, so no worker can overwrite a
+ * slot another selected expert will consume.  Smaller caches and heterogeneous
+ * layouts retain the serial LRU path. */
+static int q38_expert_get_batch(Model *m,int layer,const int *experts,int count,
+                                Slot **selected) {
+    if(!m->expert_parallel_reads||!experts||!selected||count<2||
+       count>Q38_MAX_TOPK)return 0;
+    LCache *cache=&m->cache[layer];
+    if(cache->cap<count||!q38_prepare_expert_scale_bank(m,layer))return 0;
+    Q38ExpertLoadJob jobs[Q38_MAX_TOPK];
+    for(int index=0;index<count;index++){
+        int expert=experts[index];
+        if(expert<0||expert>=m->c.experts)return 0;
+        for(int previous=0;previous<index;previous++)
+            if(experts[previous]==expert)return 0;
+        int slot_index=cache->by_expert[expert];
+        if(slot_index>=0){
+            if(slot_index>=cache->n||cache->slots[slot_index].eid!=expert)return 0;
+            continue;
+        }
+        st_tensor *weight[3];
+        if(!q38_native_fp8_expert_tensors(m,layer,expert,weight))return 0;
+    }
+    unsigned char *protected_slots=(unsigned char*)calloc((size_t)cache->cap,1);
+    if(!protected_slots){fprintf(stderr,"OOM expert batch reservations\n");exit(1);}
+    for(int index=0;index<count;index++){
+        int slot_index=cache->by_expert[experts[index]];
+        if(slot_index>=0)protected_slots[slot_index]=1;
+    }
+    int job_count=0;
+    for(int index=0;index<count;index++){
+        int expert=experts[index],slot_index=cache->by_expert[expert];Slot *slot;
+        if(slot_index>=0){
+            slot=&cache->slots[slot_index];m->hits++;
+        }else{
+            m->miss++;
+            if(cache->n<cache->cap){
+                slot=&cache->slots[cache->n++];slot->eid=-1;
+            }else{
+                int victim=-1;
+                for(int candidate=0;candidate<cache->n;candidate++)
+                    if(!protected_slots[candidate]&&
+                       (victim<0||cache->slots[candidate].used<cache->slots[victim].used))
+                        victim=candidate;
+                if(victim<0){
+                    fprintf(stderr,"Qwen3.8 expert demand set has no reservable cache slot\n");
+                    exit(1);
+                }
+                slot=&cache->slots[victim];
+                if(slot->eid>=0)cache->by_expert[slot->eid]=-1;
+            }
+            slot->eid=-1;jobs[job_count].expert=expert;jobs[job_count].slot=slot;
+            if(!q38_native_fp8_expert_tensors(m,layer,expert,jobs[job_count].weight)){
+                fprintf(stderr,"Qwen3.8 expert layout changed during batch reservation\n");exit(1);
+            }
+            job_count++;
+        }
+        slot->used=++m->clock;selected[index]=slot;
+        protected_slots[slot-cache->slots]=1;
+    }
+    free(protected_slots);
+    if(job_count){
+        int workers=job_count;
+#ifdef _OPENMP
+        int thread_limit=omp_get_max_threads();if(workers>thread_limit)workers=thread_limit;
+#endif
+        double started=now_s();
+        #pragma omp parallel for schedule(static) num_threads(workers) if(job_count>1)
+        for(int job=0;job<job_count;job++)
+            q38_load_native_fp8_ranges(m,layer,jobs[job].expert,jobs[job].slot,
+                                        jobs[job].weight);
+        q38_tm_add(m,Q38_TM_EXPERT_READ,started);
+        m->expert_weight_reads+=(uint64_t)job_count*2;
+        m->expert_pair_reads+=(uint64_t)job_count;
+        if(job_count>1)m->expert_parallel_batches++;
+        for(int job=0;job<job_count;job++){
+            Slot *slot=jobs[job].slot;slot->eid=jobs[job].expert;
+            cache->by_expert[jobs[job].expert]=(int)(slot-cache->slots);
+        }
+    }
+    return 1;
 }
 
 static void q38_ple_row(Model *m,int64_t row,float *out) {
@@ -990,19 +1320,22 @@ static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out)
         float route_gates[Q38_MAX_TOPK];
         for(int z=0;z<K;z++) route_gates[z]=(float)(val[z]/den);
         rt_route(layer,s,idx,route_gates,K); /* shared counts + post-normalization trace */
+        q38_prefetch_native_fp8_experts(m,layer,idx,K);
+        double phase_started=now_s();
+        q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
+        for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
+        float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
+        q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+        Slot *selected[Q38_MAX_TOPK];
+        int loaded_batch=q38_expert_get_batch(m,layer,idx,K,selected);
         for(int z=0;z<K;z++){
-            Slot *ex=q38_expert_get(m,layer,idx[z]); double phase_started=now_s();
+            Slot *ex=loaded_batch?selected[z]:q38_expert_get(m,layer,idx[z]);phase_started=now_s();
             q38_weight_matmul(eg,xs,&ex->gate,1,H,I);q38_weight_matmul(eu,xs,&ex->up,1,H,I);
             for(int j=0;j<I;j++)eh[j]=q38_silu(eg[j])*eu[j];q38_weight_matmul(eo,eh,&ex->down,1,I,H);
             for(int d=0;d<H;d++)ys[d]+=route_gates[z]*eo[d];
             q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
         }
-        double phase_started=now_s();
-        q38_weight_matmul(sg,xs,&l->sh_g,1,H,SI);q38_weight_matmul(su,xs,&l->sh_u,1,H,SI);
-        for(int j=0;j<SI;j++)sh[j]=q38_silu(sg[j])*su[j];q38_weight_matmul(shared,sh,&l->sh_d,1,SI,H);
-        float gate=0.f;for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];gate=q38_sigmoid(gate);
         for(int d=0;d<H;d++)ys[d]+=gate*shared[d];
-        q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
     }
     rt_trace_end();
     free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);
@@ -1101,6 +1434,16 @@ static void q38_tm_report_bank(const Q38Timers *timers,const char *scope) {
 
 static void tm_report(const Model *m) {
     q38_tm_report_bank(&m->timers,"total");
+    if(q38_tm_enabled())
+        fprintf(stderr,"[qwen38 expert I/O] weight-ranges=%llu scale-ranges=%llu "
+                       "coalesced-gate-up=%llu prefetched=%llu parallel-batches=%llu "
+                       "resident-scales=%.2f MiB\n",
+                (unsigned long long)m->expert_weight_reads,
+                (unsigned long long)m->expert_scale_reads,
+                (unsigned long long)m->expert_pair_reads,
+                (unsigned long long)m->expert_prefetch_ranges,
+                (unsigned long long)m->expert_parallel_batches,
+                m->expert_scale_bytes/1048576.0);
 }
 
 static void q38_layer_free(Layer *l) {
@@ -1126,13 +1469,15 @@ static void q38_model_free(Model *m) {
                 q38_weight_free(&m->cache[i].slots[s].gate);
                 q38_weight_free(&m->cache[i].slots[s].up);
                 q38_weight_free(&m->cache[i].slots[s].down);
+                free(m->cache[i].slots[s].fp8_slab);
             }
             free(m->cache[i].slots); free(m->cache[i].by_expert);
         }
+        if(m->expert_scales)free(m->expert_scales[i].values);
         free(m->DN_rec ? m->DN_rec[i] : NULL); free(m->DN_conv ? m->DN_conv[i] : NULL);
         free(m->K ? m->K[i] : NULL); free(m->V ? m->V[i] : NULL); free(m->IK ? m->IK[i] : NULL);
     }
-    free(m->L); free(m->cache); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
+    free(m->L); free(m->cache); free(m->expert_scales); free(m->DN_rec); free(m->DN_conv); free(m->K); free(m->V); free(m->IK);
     q38_weight_free(&m->embed);q38_weight_free(&m->lm_head);
     free(m->final_gr.norm);q38_weight_free(&m->final_gr.down);q38_weight_free(&m->final_gr.up);q38_weight_free(&m->final_gr.inject);
     free(m->ple_history); free(m->PLE_conv_state); free(m->c.is_attn); st_destroy(&m->S);

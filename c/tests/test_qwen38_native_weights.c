@@ -20,7 +20,7 @@ typedef struct {
     unsigned char raw[24];
     size_t raw_bytes;
     float scale;
-    int is_scale;
+    int expert,projection,is_scale;
 } FixtureTensor;
 
 static uint16_t to_bf16(float value){
@@ -61,10 +61,12 @@ static int add_fixture_tensor(FixtureTensor *tensors,int *count,int64_t *offset,
     int length=snprintf(tensor->name,sizeof tensor->name,"%s",name);
     if(length<0||(size_t)length>=sizeof tensor->name)return -1;
     tensor->dtype=dtype;tensor->rows=rows;tensor->cols=cols;
-    tensor->begin=*offset;tensor->is_scale=is_scale;
+    tensor->begin=*offset;tensor->expert=expert;tensor->projection=projection;
+    tensor->is_scale=is_scale;
     if(is_scale){
         tensor->scale=0.125f*(float)(1+expert*3+projection);
-        *offset+=(int64_t)sizeof(float);
+        *offset+=!strcmp(dtype,"F32")?(int64_t)sizeof(float):
+                                      (int64_t)sizeof(uint16_t);
     }else if(!strcmp(dtype,"BF16")){
         tensor->raw_bytes=(size_t)rows*cols*sizeof(uint16_t);
         for(int index=0;index<rows*cols;index++){
@@ -81,7 +83,7 @@ static int add_fixture_tensor(FixtureTensor *tensors,int *count,int64_t *offset,
     tensor->end=*offset;return 0;
 }
 
-static int write_fp8_fixture(const char *directory,int mixed){
+static int write_fp8_fixture(const char *directory,int mixed,int adjacent){
     FixtureTensor tensors[12];int count=0;int64_t offset=0;
     const char *projection[3]={"gate_proj","up_proj","down_proj"};
     for(int expert=0;expert<2;expert++)for(int kind=0;kind<3;kind++){
@@ -97,8 +99,39 @@ static int write_fp8_fixture(const char *directory,int mixed){
             "model.layers.0.mlp.experts.%d.%s.weight_scale_inv",expert,
             projection[kind]);
         if(length<0||(size_t)length>=sizeof name||
-           add_fixture_tensor(tensors,&count,&offset,name,"F32",1,1,
+           add_fixture_tensor(tensors,&count,&offset,name,adjacent?"BF16":"F32",1,1,
                               expert,kind,1))return -1;
+    }
+
+    int order[12];for(int index=0;index<count;index++)order[index]=index;
+    if(adjacent){
+        /* Match the official packing invariant while deliberately keeping the
+         * JSON entries in construction order: compact gate/up sidecars, compact
+         * down sidecars, then gate+up payload pairs.  The production loader
+         * must use offsets and numeric expert ids, not header order. */
+        for(int left=1;left<count;left++){
+            int value=order[left],right=left-1;
+            FixtureTensor *v=&tensors[value];
+            int vcat=v->is_scale?(v->projection<2?0:1):2;
+            int vkey=vcat*100+v->expert*3+v->projection;
+            while(right>=0){
+                FixtureTensor *r=&tensors[order[right]];
+                int rcat=r->is_scale?(r->projection<2?0:1):2;
+                int rkey=rcat*100+r->expert*3+r->projection;
+                if(rkey<=vkey)break;
+                order[right+1]=order[right];right--;
+            }
+            order[right+1]=value;
+        }
+        offset=0;
+        for(int physical=0;physical<count;physical++){
+            FixtureTensor *tensor=&tensors[order[physical]];
+            int64_t bytes=tensor->is_scale?
+                (!strcmp(tensor->dtype,"F32")?(int64_t)sizeof(float):
+                                                (int64_t)sizeof(uint16_t)):
+                (int64_t)tensor->raw_bytes;
+            tensor->begin=offset;tensor->end=offset+bytes;offset+=bytes;
+        }
     }
 
     char header[8192];size_t used=0;header[used++]='{';
@@ -121,10 +154,14 @@ static int write_fp8_fixture(const char *directory,int mixed){
     uint64_t header_length=used;
     int failed=fwrite(&header_length,sizeof header_length,1,file)!=1||
                fwrite(header,1,used,file)!=used;
-    for(int index=0;index<count&&!failed;index++){
-        FixtureTensor *tensor=&tensors[index];
-        if(tensor->is_scale)
+    for(int physical=0;physical<count&&!failed;physical++){
+        FixtureTensor *tensor=&tensors[order[physical]];
+        if(tensor->is_scale&&!strcmp(tensor->dtype,"F32"))
             failed=fwrite(&tensor->scale,sizeof tensor->scale,1,file)!=1;
+        else if(tensor->is_scale){
+            uint16_t scale=to_bf16(tensor->scale);
+            failed=fwrite(&scale,sizeof scale,1,file)!=1;
+        }
         else
             failed=fwrite(tensor->raw,1,tensor->raw_bytes,file)!=tensor->raw_bytes;
     }
@@ -155,10 +192,13 @@ static void destroy_fixture_model(Model *model){
             q38_weight_free(&model->cache[0].slots[slot].gate);
             q38_weight_free(&model->cache[0].slots[slot].up);
             q38_weight_free(&model->cache[0].slots[slot].down);
+            free(model->cache[0].slots[slot].fp8_slab);
         }
         free(model->cache[0].slots);free(model->cache[0].by_expert);
     }
-    free(model->cache);st_destroy(&model->S);memset(model,0,sizeof(*model));
+    if(model->expert_scales)free(model->expert_scales[0].values);
+    free(model->expert_scales);free(model->cache);st_destroy(&model->S);
+    memset(model,0,sizeof(*model));
 }
 
 static uint8_t fixture_fp8_byte(int expert,int projection,int index){
@@ -204,25 +244,30 @@ static int verify_loaded_fp8_slot(const Slot *slot,int expert,int native_fp8){
            verify_loaded_fp8_weight(&slot->down,expert,2,native_fp8)?-1:0;
 }
 
-static int check_fixture_mode(const char *directory,int native_fp8){
+static int check_fixture_mode(const char *directory,int native_fp8,int expect_fast){
     Model model;if(init_fixture_model(&model,directory,native_fp8))return -1;
     int result=-1;
-    uint64_t bytes_per_capacity=0;unsigned numeric_kinds=0;
-    if(q38_segment_expert_layout(&model,0,1,&bytes_per_capacity,&numeric_kinds))
+    uint64_t bytes_per_capacity=0,fixed_scale_bytes=0;unsigned numeric_kinds=0;
+    if(q38_segment_expert_layout(&model,0,1,&bytes_per_capacity,
+                                 &fixed_scale_bytes,&numeric_kinds))
         goto cleanup;
     char numeric_class[96];
     q38_segment_numeric_class(numeric_class,sizeof numeric_class,numeric_kinds);
     if(native_fp8){
-        if(bytes_per_capacity!=30||numeric_kinds!=Q38_EXPERT_FP8_BLOCK||
+        if(bytes_per_capacity!=18||fixed_scale_bytes!=24||
+           numeric_kinds!=Q38_EXPERT_FP8_BLOCK||
            strcmp(numeric_class,
                   "qwen38/fp8-block-f32dot-f64blocksum/cpu-v1"))goto cleanup;
-    }else if(bytes_per_capacity!=72||numeric_kinds!=Q38_EXPERT_FP8_EXPANDED||
+    }else if(bytes_per_capacity!=72||fixed_scale_bytes||
+              numeric_kinds!=Q38_EXPERT_FP8_EXPANDED||
               strcmp(numeric_class,
                      "qwen38/fp8-expanded-f32dot/cpu-v1"))goto cleanup;
     int capacity=0;
-    if(q38_segment_cache_capacity(bytes_per_capacity,2,bytes_per_capacity*2,
+    if(q38_segment_cache_capacity(bytes_per_capacity,fixed_scale_bytes,2,
+                                  fixed_scale_bytes+bytes_per_capacity*2,
                                   &capacity)||capacity!=2||
-       !q38_segment_cache_capacity(bytes_per_capacity,2,bytes_per_capacity-1,
+       !q38_segment_cache_capacity(bytes_per_capacity,fixed_scale_bytes,2,
+                                   fixed_scale_bytes+bytes_per_capacity-1,
                                    &capacity))goto cleanup;
     if(q38_segment_cache_resize(&model,2)||model.cache[0].cap!=2||
        q38_segment_cache_resize(&model,1)||model.cache[0].cap!=1)goto cleanup;
@@ -232,6 +277,15 @@ static int check_fixture_mode(const char *directory,int native_fp8){
     if(first->gate.kind!=expected||first->up.kind!=expected||
        first->down.kind!=expected||model.miss!=1||model.hits!=0||
        verify_loaded_fp8_slot(first,0,native_fp8))goto cleanup;
+    void *slab=first->fp8_slab;
+    if(expect_fast){
+        if(!native_fp8||!slab||first->gate.data!=slab||
+           first->up.data!=(unsigned char*)slab+6||
+           first->down.data!=(unsigned char*)slab+12||
+           model.expert_weight_reads!=2||model.expert_scale_reads!=2||
+           model.expert_pair_reads!=1||model.expert_scale_bytes!=24)
+            goto cleanup;
+    }else if(model.expert_pair_reads||slab)goto cleanup;
     float first_value=native_fp8?e4m3_decode(((uint8_t*)first->gate.data)[0])*
                                   first->gate.scales[0]:
                                  ((float*)first->gate.data)[0];
@@ -240,12 +294,18 @@ static int check_fixture_mode(const char *directory,int native_fp8){
     if(second!=first||model.cache[0].by_expert[0]!=-1||
        model.cache[0].by_expert[1]!=0||model.miss!=2||model.hits!=1||
        verify_loaded_fp8_slot(second,1,native_fp8))goto cleanup;
+    if(expect_fast&&(second->fp8_slab!=slab||model.expert_weight_reads!=4||
+                     model.expert_scale_reads!=2||model.expert_pair_reads!=2))
+        goto cleanup;
     float second_value=native_fp8?e4m3_decode(((uint8_t*)second->gate.data)[0])*
                                    second->gate.scales[0]:
                                   ((float*)second->gate.data)[0];
     if(first_value==second_value)goto cleanup;
     if(q38_expert_get(&model,0,0)!=first||model.cache[0].by_expert[0]!=0||
        model.cache[0].by_expert[1]!=-1||model.miss!=3)goto cleanup;
+    if(expect_fast&&(first->fp8_slab!=slab||model.expert_weight_reads!=6||
+                     model.expert_scale_reads!=2||model.expert_pair_reads!=3))
+        goto cleanup;
     result=0;
 cleanup:
     destroy_fixture_model(&model);return result;
@@ -255,10 +315,10 @@ static int check_mixed_layout(const char *directory,int native_fp8,
                               uint64_t expected_bytes,unsigned expected_kinds,
                               const char *expected_class){
     Model model;if(init_fixture_model(&model,directory,native_fp8))return -1;
-    uint64_t bytes=0;unsigned kinds=0;char numeric_class[96];int result=-1;
-    if(!q38_segment_expert_layout(&model,0,1,&bytes,&kinds)){
+    uint64_t bytes=0,fixed=0;unsigned kinds=0;char numeric_class[96];int result=-1;
+    if(!q38_segment_expert_layout(&model,0,1,&bytes,&fixed,&kinds)){
         q38_segment_numeric_class(numeric_class,sizeof numeric_class,kinds);
-        if(bytes==expected_bytes&&kinds==expected_kinds&&
+        if(bytes==expected_bytes&&!fixed&&kinds==expected_kinds&&
            !strcmp(numeric_class,expected_class)){
             Slot *slot=q38_expert_get(&model,0,0);
             if(slot&&!verify_loaded_fp8_slot(slot,0,native_fp8)&&
@@ -281,6 +341,29 @@ static int check_mixed_layout(const char *directory,int native_fp8,
             }
         }
     }
+    destroy_fixture_model(&model);return result;
+}
+
+static int check_parallel_batch(const char *directory){
+    Model model;if(init_fixture_model(&model,directory,1))return -1;
+    int result=-1;model.expert_parallel_reads=1;
+    int first_ids[2]={1,0};Slot *first[2]={0};
+    if(q38_expert_get_batch(&model,0,first_ids,2,first)||model.cache[0].n||
+       model.miss||model.hits)goto cleanup;
+    if(q38_segment_cache_resize(&model,2))goto cleanup;
+    if(!q38_expert_get_batch(&model,0,first_ids,2,first)||!first[0]||!first[1]||
+       first[0]==first[1]||first[0]->eid!=1||first[1]->eid!=0||
+       model.miss!=2||model.hits||model.expert_parallel_batches!=1||
+       model.expert_weight_reads!=4||model.expert_scale_reads!=2||
+       model.expert_pair_reads!=2||verify_loaded_fp8_slot(first[0],1,1)||
+       verify_loaded_fp8_slot(first[1],0,1))goto cleanup;
+    int second_ids[2]={0,1};Slot *second[2]={0};
+    if(!q38_expert_get_batch(&model,0,second_ids,2,second)||
+       second[0]!=first[1]||second[1]!=first[0]||model.miss!=2||
+       model.hits!=2||model.expert_parallel_batches!=1||
+       model.expert_weight_reads!=4)goto cleanup;
+    result=0;
+cleanup:
     destroy_fixture_model(&model);return result;
 }
 
@@ -339,9 +422,9 @@ int main(void){
     q38_weight_free(&bf16);
 
     char directory[]="test_qwen38_native_XXXXXX";CHECK(mkdtemp(directory)!=NULL);
-    CHECK(write_fp8_fixture(directory,0)==0);
-    CHECK(check_fixture_mode(directory,1)==0);
-    CHECK(check_fixture_mode(directory,0)==0);
+    CHECK(write_fp8_fixture(directory,0,0)==0);
+    CHECK(check_fixture_mode(directory,1,0)==0);
+    CHECK(check_fixture_mode(directory,0,0)==0);
     char path[512];int path_length=snprintf(path,sizeof path,
                                            "%s/model.safetensors",directory);
     CHECK(path_length>0&&(size_t)path_length<sizeof path);
@@ -349,7 +432,7 @@ int main(void){
 
     char mixed_directory[]="test_qwen38_mixed_XXXXXX";
     CHECK(mkdtemp(mixed_directory)!=NULL);
-    CHECK(write_fp8_fixture(mixed_directory,1)==0);
+    CHECK(write_fp8_fixture(mixed_directory,1,0)==0);
     CHECK(check_mixed_layout(mixed_directory,1,32,
           Q38_EXPERT_FP8_BLOCK|Q38_EXPERT_BF16,
           "qwen38/mixed-expert-arithmetic-05/cpu-v1")==0);
@@ -360,8 +443,18 @@ int main(void){
     CHECK(path_length>0&&(size_t)path_length<sizeof path);
     CHECK(remove(path)==0);CHECK(rmdir(mixed_directory)==0);
 
+    char adjacent_directory[]="test_qwen38_adjacent_XXXXXX";
+    CHECK(mkdtemp(adjacent_directory)!=NULL);
+    CHECK(write_fp8_fixture(adjacent_directory,0,1)==0);
+    CHECK(check_fixture_mode(adjacent_directory,1,1)==0);
+    CHECK(check_fixture_mode(adjacent_directory,0,0)==0);
+    CHECK(check_parallel_batch(adjacent_directory)==0);
+    path_length=snprintf(path,sizeof path,"%s/model.safetensors",adjacent_directory);
+    CHECK(path_length>0&&(size_t)path_length<sizeof path);
+    CHECK(remove(path)==0);CHECK(rmdir(adjacent_directory)==0);
+
     CHECK(check_segment_failure_outputs()==0);
 
-    puts("qwen38 native weights: independent FP8 oracle, real loader, LRU, mixed classes, adapter failures: ok");
+    puts("qwen38 native weights: FP8 oracle, coalesced slabs/scales, parallel demand sets, fallbacks, adapter failures: ok");
     return 0;
 }
