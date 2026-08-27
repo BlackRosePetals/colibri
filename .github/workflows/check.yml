@@ -34,7 +34,13 @@ jobs:
     # (MSYS2/UCRT64), the exact toolchain the README's Windows port targets.
     name: Windows UCRT64
     runs-on: windows-latest
-    timeout-minutes: 20
+    # Measured, not guessed: this job now runs 19-21 minutes, so a 20-minute
+    # limit decided the result by runner luck. Three consecutive runs on
+    # 2026-08-27 took 19m21s (passed), 20m18s and 20m32s (both cancelled at the
+    # limit and reported as failures), including one on dev itself. The suite
+    # has grown - segment conformance and adapters, the edge runtime, per-engine
+    # cache indices - and MinGW is the slowest toolchain we build on.
+    timeout-minutes: 35
     defaults:
       run:
         shell: msys2 {0}
