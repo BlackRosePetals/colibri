@@ -574,6 +574,7 @@ int main(int argc, char **argv) {
  * che i token siano quelli giusti, provati contro l'oracolo. */
 #include "delta_attention.h"
 #include "sparse_index.h"
+#include "vision_tower.h"
 
 typedef struct { const float *w; int rows, columns; } Mat;
 
@@ -601,6 +602,10 @@ typedef struct {
     const float *embed, *final_norm, *head;
     GLayer *layer;
     char prefix[64];
+    /* torre vision: presente solo se il checkpoint la porta */
+    int has_vision;
+    ColiVisionTower vision;
+    ColiVisionBlock *vblocks;
 } GModel;
 
 static const float *load_f32(GModel *m, const char *fmt, ...) {
@@ -774,6 +779,15 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
                                  c->index_kpool_tail)) {
         fprintf(stderr, "selezione indexer fallita\n"); exit(1);
     }
+    /* GLM53_DUMP_INDEX=1 stampa le righe scelte dall'indexer: e' il primo
+     * posto da guardare quando il motore diverge solo su certe lunghezze. */
+    if (getenv("GLM53_DUMP_INDEX")) {
+        for (int t = 0; t < tokens; t++) {
+            fprintf(stderr, "index q=%d ->", t);
+            for (int i = 0; i < width; i++) fprintf(stderr, " %d", selected[(size_t)t * width + i]);
+            fprintf(stderr, "\n");
+        }
+    }
     float *context = malloc((size_t)tokens * H * V * sizeof(float));
     if (coli_sparse_attention(context, queries, keys, values, selected,
                               tokens, width, H, QK, V)) {
@@ -841,6 +855,8 @@ static void ffn_layer(const Cfg *c, const GLayer *l, int index, const float *x,
 }
 
 /* ---------- caricamento ---------- */
+static void vision_load(GModel *m);
+
 static void model_load(GModel *m, const char *dir) {
     load_cfg(&m->c, dir);
     st_init(&m->S, dir);
@@ -935,10 +951,111 @@ static void model_load(GModel *m, const char *dir) {
             }
         }
     }
+    vision_load(m);
 }
 
-/* ---------- il passaggio completo ---------- */
-static float *forward(GModel *m, const int *tokens, int n) {
+/* ---------- vision ----------
+ * La torre e' in vision_tower.h e non sa nulla di GLM: qui si riempiono solo i
+ * puntatori ai pesi e si traduce la config. Il checkpoint solo-testo non porta
+ * `model.visual.*` e allora has_vision resta 0: l'engine funziona identico. */
+static void vision_load(GModel *m) {
+    const Cfg *c = &m->c;
+    m->has_vision = 0;
+    if (c->vis_layers <= 0) return;
+    if (!st_find(&m->S, "model.visual.patch_embed.proj.weight")) return;
+    const char *V = "model.visual.";
+
+    m->vision.config = (ColiVisionConfig){
+        .depth = c->vis_layers, .hidden = c->vis_hidden, .heads = c->vis_heads,
+        .head_dim = c->vis_hidden / c->vis_heads, .intermediate = c->vis_inter,
+        .patch = c->vis_patch, .temporal = c->vis_temporal, .merge = c->vis_merge,
+        .in_channels = c->vis_in_ch, .out_hidden = c->vis_out_hidden,
+        .proj_intermediate = c->vis_proj_inter ? c->vis_proj_inter : c->vis_inter,
+        .eps = c->vis_eps, .swiglu_limit = c->vis_swiglu_limit,
+        .rope_theta = 10000.0f,
+    };
+    m->vision.patch_w = load_f32(m, "%spatch_embed.proj.weight", V);
+    m->vision.patch_b = load_f32(m, "%spatch_embed.proj.bias", V);
+    m->vision.post_norm = load_f32(m, "%spost_layernorm.weight", V);
+    m->vision.down_w = load_f32(m, "%sdownsample.weight", V);
+    m->vision.down_b = load_f32(m, "%sdownsample.bias", V);
+    m->vision.merger_proj = load_f32(m, "%smerger.proj.weight", V);
+    m->vision.merger_norm_w = load_f32(m, "%smerger.post_projection_norm.weight", V);
+    m->vision.merger_norm_b = load_f32(m, "%smerger.post_projection_norm.bias", V);
+    m->vision.merger_gate = load_f32(m, "%smerger.gate_proj.weight", V);
+    m->vision.merger_up = load_f32(m, "%smerger.up_proj.weight", V);
+    m->vision.merger_down = load_f32(m, "%smerger.down_proj.weight", V);
+
+    m->vblocks = calloc((size_t)c->vis_layers, sizeof(*m->vblocks));
+    if (!m->vblocks) { fprintf(stderr, "OOM sui blocchi vision\n"); exit(1); }
+    for (int b = 0; b < c->vis_layers; b++) {
+        ColiVisionBlock *vb = &m->vblocks[b];
+        vb->norm1 = load_f32(m, "%sblocks.%d.norm1.weight", V, b);
+        vb->norm2 = load_f32(m, "%sblocks.%d.norm2.weight", V, b);
+        vb->qkv_w = load_f32(m, "%sblocks.%d.attn.qkv.weight", V, b);
+        vb->qkv_b = load_f32(m, "%sblocks.%d.attn.qkv.bias", V, b);
+        vb->q_norm = load_f32(m, "%sblocks.%d.attn.q_norm.weight", V, b);
+        vb->k_norm = load_f32(m, "%sblocks.%d.attn.k_norm.weight", V, b);
+        vb->proj_w = load_f32(m, "%sblocks.%d.attn.proj.weight", V, b);
+        vb->proj_b = load_f32(m, "%sblocks.%d.attn.proj.bias", V, b);
+        vb->gate_w = load_f32(m, "%sblocks.%d.mlp.gate_proj.weight", V, b);
+        vb->gate_b = load_f32(m, "%sblocks.%d.mlp.gate_proj.bias", V, b);
+        vb->up_w = load_f32(m, "%sblocks.%d.mlp.up_proj.weight", V, b);
+        vb->up_b = load_f32(m, "%sblocks.%d.mlp.up_proj.bias", V, b);
+        vb->down_w = load_f32(m, "%sblocks.%d.mlp.down_proj.weight", V, b);
+        vb->down_b = load_f32(m, "%sblocks.%d.mlp.down_proj.bias", V, b);
+    }
+    m->vision.blocks = m->vblocks;
+    m->has_vision = 1;
+}
+
+/* Un'immagine gia' in patch -> embedding pronti per il flusso testuale.
+ *
+ * `patches` e' [grid_h*grid_w, in_channels*temporal*patch*patch] nell'ordine in
+ * cui il processore li produce; la torre restituisce
+ * grid_h/merge * grid_w/merge righe da out_hidden. Il chiamante possiede il
+ * buffer restituito. */
+static float *vision_encode(GModel *m, const float *patches,
+                            int grid_h, int grid_w, int *out_tokens) {
+    if (!m->has_vision) {
+        fprintf(stderr, "questo checkpoint non porta la torre vision\n");
+        exit(1);
+    }
+    const int tokens = coli_vision_output_tokens(&m->vision.config, grid_h, grid_w);
+    if (tokens <= 0) {
+        fprintf(stderr, "griglia %dx%d non divisibile per merge %d\n",
+                grid_h, grid_w, m->vision.config.merge);
+        exit(1);
+    }
+    float *out = malloc((size_t)tokens * m->vision.config.out_hidden * sizeof(float));
+    if (!out) { fprintf(stderr, "OOM sugli embedding vision\n"); exit(1); }
+    if (coli_vision_forward(out, &m->vision, patches, grid_h, grid_w) != 0) {
+        fprintf(stderr, "la torre vision ha rifiutato l'ingresso\n");
+        exit(1);
+    }
+    /* La torre esce a out_hidden; il flusso testuale vuole hidden. Il
+     * checkpoint li dichiara uguali (4096) e il merger e' proprio il pezzo che
+     * fa combaciare i due, quindi una differenza qui e' una config sbagliata,
+     * non qualcosa da rattoppare in silenzio. */
+    if (m->vision.config.out_hidden != m->c.hidden) {
+        fprintf(stderr, "vision out_hidden %d != hidden %d\n",
+                m->vision.config.out_hidden, m->c.hidden);
+        exit(1);
+    }
+    *out_tokens = tokens;
+    return out;
+}
+
+/* ---------- il passaggio completo ----------
+ *
+ * `vision` sono gli embedding usciti dalla torre, `n_vision` quanti sono: uno
+ * per ogni token immagine presente in `tokens`, nello stesso ordine. Il
+ * processore ha gia' espanso ogni immagine in altrettanti segnaposto
+ * `image_token_id`, quindi qui non c'e' nulla da inserire: si sostituisce la
+ * riga dell'embedding testuale con quella della torre e le posizioni restano
+ * quelle che sono. Prompt di solo testo passano vision=NULL, n_vision=0. */
+static float *forward(GModel *m, const int *tokens, int n,
+                      const float *vision, int n_vision) {
     const Cfg *c = &m->c;
     const int H = c->hc_mult, D = c->hidden;
     float *streams = malloc((size_t)n * H * D * sizeof(float));
@@ -948,11 +1065,32 @@ static float *forward(GModel *m, const int *tokens, int n) {
     float *branch = malloc((size_t)n * D * sizeof(float));
     float *post = malloc((size_t)n * H * sizeof(float));
     float *comb = malloc((size_t)n * H * H * sizeof(float));
-    /* l'embedding entra replicato in ognuno degli H flussi residui */
-    for (int t = 0; t < n; t++)
+    /* l'embedding entra replicato in ognuno degli H flussi residui; sui token
+     * immagine la riga viene dalla torre invece che dalla tabella */
+    int consumed = 0;
+    for (int t = 0; t < n; t++) {
+        const float *row;
+        if (vision && c->image_token >= 0 && tokens[t] == c->image_token) {
+            if (consumed >= n_vision) {
+                fprintf(stderr, "il prompt ha piu' token immagine (%d+) degli "
+                                "embedding forniti (%d)\n", consumed + 1, n_vision);
+                exit(1);
+            }
+            row = vision + (size_t)consumed++ * D;
+        } else {
+            row = m->embed + (size_t)tokens[t] * D;
+        }
         for (int h = 0; h < H; h++)
-            memcpy(streams + ((size_t)t * H + h) * D,
-                   m->embed + (size_t)tokens[t] * D, (size_t)D * sizeof(float));
+            memcpy(streams + ((size_t)t * H + h) * D, row, (size_t)D * sizeof(float));
+    }
+    /* Avanzare in silenzio con embedding non consumati vorrebbe dire mandare al
+     * modello un'immagine diversa da quella che il chiamante crede di aver
+     * passato: e' un errore, non un caso limite. */
+    if (consumed != n_vision) {
+        fprintf(stderr, "%d embedding vision forniti ma solo %d token immagine "
+                        "nel prompt\n", n_vision, consumed);
+        exit(1);
+    }
 
     float *state = NULL, *window = NULL, *scratch = NULL;
     if (c->kda_proj) {
@@ -1024,17 +1162,25 @@ static int argmax(const float *v, int n) {
 }
 
 int main(int argc, char **argv) {
-    const char *dir = NULL, *ids = NULL;
-    int greedy = 0, show_logits = 0;
+    const char *dir = NULL, *ids = NULL, *patch_file = NULL;
+    int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids = argv[++i];
         else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--logits")) show_logits = 1;
+        else if (!strcmp(argv[i], "--patches") && i + 1 < argc) patch_file = argv[++i];
+        else if (!strcmp(argv[i], "--grid") && i + 1 < argc &&
+                 sscanf(argv[++i], "%dx%d", &grid_h, &grid_w) == 2) continue;
         else { fprintf(stderr, "argomento sconosciuto: %s\n", argv[i]); return 2; }
     }
     if (!dir || !ids) {
-        fprintf(stderr, "uso: %s --model DIR --ids a,b,c [--greedy N] [--logits]\n", argv[0]);
+        fprintf(stderr, "uso: %s --model DIR --ids a,b,c [--greedy N] [--logits]\n"
+                        "         [--patches FILE.f32 --grid HxW]\n", argv[0]);
+        return 2;
+    }
+    if (!!patch_file != (grid_h > 0 && grid_w > 0)) {
+        fprintf(stderr, "--patches e --grid vanno insieme\n");
         return 2;
     }
     int capacity = 1024, count = 0;
@@ -1053,7 +1199,35 @@ int main(int argc, char **argv) {
     model_load(&model, dir);
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
 
-    float *logits = forward(&model, tokens, count);
+    float *vision = NULL;
+    int n_vision = 0;
+    if (patch_file) {
+        const ColiVisionConfig *vc = &model.vision.config;
+        if (!model.has_vision) {
+            fprintf(stderr, "--patches ma il checkpoint non porta la torre vision\n");
+            return 2;
+        }
+        const size_t per_patch = (size_t)vc->in_channels * vc->temporal * vc->patch * vc->patch;
+        const size_t wanted = (size_t)grid_h * grid_w * per_patch;
+        FILE *f = fopen(patch_file, "rb");
+        if (!f) { fprintf(stderr, "non apro %s\n", patch_file); return 2; }
+        float *patches = malloc(wanted * sizeof(float));
+        if (!patches) { fprintf(stderr, "OOM sulle patch\n"); return 2; }
+        size_t got = fread(patches, sizeof(float), wanted, f);
+        /* Una patch corta darebbe comunque un'uscita, con la coda letta da
+         * memoria non inizializzata: meglio fermarsi e dire di quanto. */
+        if (got != wanted) {
+            fprintf(stderr, "%s: %zu float su %zu attesi per una griglia %dx%d\n",
+                    patch_file, got, wanted, grid_h, grid_w);
+            return 2;
+        }
+        fclose(f);
+        vision = vision_encode(&model, patches, grid_h, grid_w, &n_vision);
+        free(patches);
+        printf("vision_tokens %d\n", n_vision);
+    }
+
+    float *logits = forward(&model, tokens, count, vision, n_vision);
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)
         printf(" %d", argmax(logits + (size_t)t * model.c.vocab, model.c.vocab));
@@ -1071,7 +1245,9 @@ int main(int argc, char **argv) {
         printf("greedy");
         for (int step = 0; step < greedy; step++) {
             free(logits);
-            logits = forward(&model, sequence, total);
+            /* i token immagine restano nel prefisso a ogni passo, quindi la
+             * torre si rifornisce identica: non si riesegue e non si sposta */
+            logits = forward(&model, sequence, total, vision, n_vision);
             int next = argmax(logits + (size_t)(total - 1) * model.c.vocab, model.c.vocab);
             sequence[total++] = next;
             printf(" %d", next);
@@ -1080,6 +1256,7 @@ int main(int argc, char **argv) {
         free(sequence);
     }
     free(logits);
+    free(vision);
     free(tokens);
     return 0;
 }
