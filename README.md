@@ -457,7 +457,11 @@ COLI_MODEL=/nvme/glm52_i4 ./coli tune     # measure and save this machine's fast
 ./coli serve --model /nvme/glm52_i4       # API + dashboard, no browser (headless)
 ```
 
-On Windows the same commands work with `python coli chat --model D:\glm52_i4`.
+On Windows a release archive ships `coli.cmd`: double-click it for the quick
+start, or run `coli.cmd chat --model D:\glm52_i4` from cmd or PowerShell.
+From a source checkout the same commands work with `python coli chat --model
+D:\glm52_i4`. The `.exe` files are the engines, not the launcher: started on
+their own they have no model to load and exit immediately.
 The engine at runtime is pure C — python is only used by the one-time converter
 and the optional API gateway.
 
@@ -507,6 +511,8 @@ Two things that differ per model, both documented in the per-model page:
 | Vulkan backend (any GPU: AMD via RADV, incl. cards ROCm dropped) | [docs/vulkan.md](docs/vulkan.md) |
 | Apple Silicon Metal backend | [docs/metal.md](docs/metal.md) |
 | OpenAI-compatible API, KV slots, web dashboard | [docs/api.md](docs/api.md) |
+| Experimental layer-segment embedding ABI | [docs/segment-runtime.md](docs/segment-runtime.md) |
+| Experimental tokenizer/embedding/head Edge ABI | [docs/edge-runtime.md](docs/edge-runtime.md) |
 | Grammar-forced drafts (structured output) | [docs/grammar-draft.md](docs/grammar-draft.md) |
 | Environment variable inventory | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) |
 

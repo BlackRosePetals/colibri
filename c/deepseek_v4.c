@@ -3449,6 +3449,11 @@ struct ColiDeepSeekV4Indexer {
     int capacity;
     int count;
     float *compressed;
+    /* Persistent arena scratch buffer for coli_v4_indexer_select_batch.
+     * Assumes single-threaded execution per indexer instance (standard in SERVE chunk prefill). */
+    void *scratch_buf;
+    size_t scratch_cap;
+    char in_use;
 };
 
 typedef struct { float score; int index; } IndexScore;
@@ -3553,7 +3558,21 @@ void coli_v4_indexer_destroy(ColiDeepSeekV4Indexer *state) {
     if (!state) return;
     coli_v4_compressor_destroy(state->compressor);
     free(state->compressed);
+    free(state->scratch_buf);
     free(state);
+}
+
+static void *indexer_scratch_alloc(ColiDeepSeekV4Indexer *state, size_t needed) {
+    if (!state) return NULL;
+    if (state->scratch_cap < needed) {
+        size_t new_cap = needed < 65536 ? 65536 : (needed + needed / 4);
+        void *new_buf = malloc(new_cap);
+        if (!new_buf) return NULL;
+        free(state->scratch_buf);
+        state->scratch_buf = new_buf;
+        state->scratch_cap = new_cap;
+    }
+    return state->scratch_buf;
 }
 
 static int apply_position_rope(float *queries,
@@ -3723,6 +3742,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     if (max_count > state->count)
         return set_error(error, error_size, "indexer batch counts exceed cache");
 
+    if (__atomic_test_and_set(&state->in_use, __ATOMIC_ACQUIRE))
+        return set_error(error, error_size, "concurrent indexer batch selection on single instance");
+
     static int prof = -1;
     if (prof < 0) prof = getenv("DSV4_ATTN_PROF") != NULL;
     struct timespec ts_prev, ts_now;
@@ -3730,24 +3752,54 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
 #define IDX_PROF_MARK(acc) do { if (prof) {         clock_gettime(CLOCK_MONOTONIC, &ts_now);         acc += (ts_now.tv_sec - ts_prev.tv_sec) +                (ts_now.tv_nsec - ts_prev.tv_nsec) * 1e-9;         ts_prev = ts_now; } } while (0)
     if (prof) clock_gettime(CLOCK_MONOTONIC, &ts_prev);
     ColiTensorView wq;
-    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b"))
+    if (fp8_view(&wq, state->weights, "attn.indexer.wq_b")) {
+        __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
         return set_error(error, error_size, "missing indexer query weight");
+    }
     const uint16_t *raw_weights = value(
         state->weights, "attn.indexer.weights_proj.weight", NULL);
     size_t qn = (size_t)heads * dimension;
-    float *queries = malloc((size_t)batch * qn * sizeof(*queries));
-    float *sq = malloc((size_t)need * qn * sizeof(*sq));
-    float *head_weights = malloc((size_t)need * heads * sizeof(*head_weights));
-    int *scounts = malloc((size_t)need * sizeof(*scounts));
-    int *stoken = malloc((size_t)need * sizeof(*stoken));
-    float *scores = malloc((size_t)need * max_count * sizeof(*scores));
-    IndexScore *ranked = malloc((size_t)max_count * sizeof(*ranked));
-    uint8_t *scales = malloc((size_t)dimension / 32);
-    float *qdq = malloc((size_t)dimension * sizeof(*qdq));
+    size_t cols = (size_t)wq.columns;
+
+#define ALIGN32(n) (((size_t)(n) + 31) & ~(size_t)31)
+    size_t sz_queries = ALIGN32((size_t)batch * qn * sizeof(float));
+    size_t sz_sq = ALIGN32((size_t)need * qn * sizeof(float));
+    size_t sz_head_weights = ALIGN32((size_t)need * heads * sizeof(float));
+    size_t sz_scounts = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_stoken = ALIGN32((size_t)need * sizeof(int));
+    size_t sz_scores = ALIGN32((size_t)need * max_count * sizeof(float));
+    size_t sz_ranked = ALIGN32((size_t)max_count * sizeof(IndexScore));
+    size_t sz_scales = ALIGN32((size_t)dimension / 32);
+    size_t sz_qdq = ALIGN32((size_t)dimension * sizeof(float));
+#ifdef COLI_V4_GPU_TIER
+    size_t sz_xq = (need <= 1024) ? ALIGN32((size_t)need * cols * sizeof(float)) : 0;
+    size_t sz_yq = (need <= 1024) ? ALIGN32((size_t)need * qn * sizeof(float)) : 0;
+    size_t sz_xs = (need <= 1024) ? ALIGN32((size_t)need * (cols / 128)) : 0;
+#else
+    size_t sz_xq = 0, sz_yq = 0, sz_xs = 0;
+#endif
+
+    size_t total_scratch = sz_queries + sz_sq + sz_head_weights + sz_scounts + sz_stoken +
+                           sz_scores + sz_ranked + sz_scales + sz_qdq + sz_xq + sz_yq + sz_xs + 256;
+
+    char *scratch_ptr = (char *)indexer_scratch_alloc(state, total_scratch);
+    if (!scratch_ptr || !raw_weights) {
+        __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
+        return set_error(error, error_size, "out of memory scoring indexer batch");
+    }
+
+    scratch_ptr = (char *)(((uintptr_t)scratch_ptr + 31) & ~(uintptr_t)31);
+
+    float *queries = (float *)scratch_ptr; scratch_ptr += sz_queries;
+    float *sq = (float *)scratch_ptr; scratch_ptr += sz_sq;
+    float *head_weights = (float *)scratch_ptr; scratch_ptr += sz_head_weights;
+    int *scounts = (int *)scratch_ptr; scratch_ptr += sz_scounts;
+    int *stoken = (int *)scratch_ptr; scratch_ptr += sz_stoken;
+    float *scores = (float *)scratch_ptr; scratch_ptr += sz_scores;
+    IndexScore *ranked = (IndexScore *)scratch_ptr; scratch_ptr += sz_ranked;
+    uint8_t *scales = (uint8_t *)scratch_ptr; scratch_ptr += sz_scales;
+    float *qdq = (float *)scratch_ptr; scratch_ptr += sz_qdq;
     int result = 0;
-    if (!queries || !sq || !head_weights || !scounts || !stoken || !scores ||
-        !ranked || !scales || !qdq || !raw_weights)
-        result = set_error(error, error_size, "out of memory scoring indexer batch");
 
     /* Query projection. Preferred: host fp8 activation quantization (the
      * reference qdq, per token) + the GPU replica of the reference matmul —
@@ -3758,10 +3810,9 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
     int projected = 0;
 #ifdef COLI_V4_GPU_TIER
     if (!result && need <= 1024) {
-        size_t cols = (size_t)wq.columns;
-        float *xq = malloc((size_t)need * cols * sizeof(*xq));
-        float *yq = malloc((size_t)need * qn * sizeof(*yq));
-        uint8_t *xs = malloc((size_t)need * (cols / 128));
+        float *xq = (float *)scratch_ptr; scratch_ptr += sz_xq;
+        float *yq = (float *)scratch_ptr; scratch_ptr += sz_yq;
+        uint8_t *xs = (uint8_t *)scratch_ptr; scratch_ptr += sz_xs;
         int qok = xq && yq && xs;
         if (qok) {
             int i = 0;
@@ -3784,7 +3835,6 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
             }
             projected = 1;
         }
-        free(xs); free(yq); free(xq);
     }
 #endif
     {
@@ -3913,8 +3963,7 @@ int coli_v4_indexer_select_batch(ColiDeepSeekV4Indexer *state, int *indices,
                 t_prep * 1e3, t_score * 1e3, t_sort * 1e3,
                 gpu_scored ? "" : " (cpu-score)");
 #undef IDX_PROF_MARK
-    free(qdq); free(scales); free(ranked); free(scores); free(stoken);
-    free(scounts); free(head_weights); free(sq); free(queries);
+    __atomic_clear(&state->in_use, __ATOMIC_RELEASE);
     return result;
 }
 
@@ -7735,8 +7784,9 @@ int coli_deepseek_v4_expert_store_open(
     /* DUAL-SSD: register COLI_MODEL_MIRROR copies and derive the read split
      * before any expert load, so pin warmup and demand reads stream from all
      * drives. */
-    coli_st_mirror_setup(state->index, options->model_dir,
-                         options->experts_per_layer);
+    if (!options->skip_mirror_setup)
+        coli_st_mirror_setup(state->index, options->model_dir,
+                             options->experts_per_layer);
     size_t record_count = (size_t)state->layers * state->experts_per_layer;
     state->records = malloc(record_count * sizeof(*state->records)); /* build_record zeroes each */
     if (!state->records) {
@@ -9430,7 +9480,8 @@ int coli_v4_engine_open(ColiV4Engine **output,
                 engine->config.n_routed_experts,
                 4ULL << 30,
                 engine->runtime.pin_slots_per_layer,
-                engine->runtime.repin_interval},
+                engine->runtime.repin_interval,
+                0},
             &engine->experts, error, error_size))
         goto fail;
     engine->owns_experts = 1;
@@ -11606,7 +11657,7 @@ int main(int argc, char **argv) {
     }
     ColiDeepSeekV4ExpertStoreOptions store_opts = {
         argv[1], config.num_hidden_layers, config.n_routed_experts,
-        UINT64_C(4) * 1024 * 1024 * 1024, -1, 0,
+        UINT64_C(4) * 1024 * 1024 * 1024, -1, 0, 0,
     };
     /* Route through the pluggable backend registry when COLI_EXPERT_STORE names
      * a non-"auto" backend (e.g. a networked/remote store). The
@@ -13876,6 +13927,7 @@ int main(int argc, char **argv) {
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
+    if (argc < 2) { coli_print_launcher_help("DeepSeek V4"); return 1; }
     if (v4_cli_parse(argc, argv, &cli)) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;
@@ -16914,3 +16966,931 @@ int coli_fp4_dual_matvec_rows16_v10(float *output_a, float *output_b,
 #endif
 }
 #endif /* COLI_V4_UNIT_NATIVE_QUANT_ROWS16 */
+
+#if defined(COLI_V4_UNIT_SEGMENT_ADAPTER) && defined(COLI_SEGMENT_ADAPTER)
+/* ######## DeepSeek V4 engine-owned Segment adapter #####################
+ *
+ * The ordinary DeepSeek engine and CLI never compile this unit.  A Segment
+ * consumer links it explicitly beside the standard V4 object units and calls
+ * coli_deepseek_v4_segment_adapter_register() during initialization.
+ */
+#include "deepseek_v4_internal.h"
+#include "segment_adapter_internal.h"
+#include "segment_adapters.h"
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "tok.h"
+#include "edge_tok_internal.h"
+
+#include <float.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
+
+typedef struct {
+    ColiV4Engine *model;
+    uint32_t layer_begin, layer_end, context_tokens, state_width;
+    uint64_t memory_limit_bytes;
+    pthread_mutex_t run_lock;
+} DeepSeekV4SegmentEngine;
+
+typedef struct {
+    DeepSeekV4SegmentEngine *engine;
+    ColiDeepSeekV4WindowAttentionState **attention;
+    uint32_t context_tokens, position;
+} DeepSeekV4SegmentSession;
+
+static uint64_t deepseek_v4_segment_expert_record_bytes(
+    const ColiSafetensorsIndex *index) {
+    static const char *parts[] = {
+        "layers.0.ffn.experts.0.w1.weight",
+        "layers.0.ffn.experts.0.w1.scale",
+        "layers.0.ffn.experts.0.w2.weight",
+        "layers.0.ffn.experts.0.w2.scale",
+        "layers.0.ffn.experts.0.w3.weight",
+        "layers.0.ffn.experts.0.w3.scale",
+    };
+    uint64_t total = 0;
+    for (size_t item = 0; item < sizeof(parts) / sizeof(parts[0]); item++) {
+        const ColiSafetensorsTensor *tensor = coli_st_find(index, parts[item]);
+        if (!tensor || tensor->nbytes < 0 ||
+            UINT64_MAX - total < (uint64_t)tensor->nbytes)
+            return 0;
+        total += (uint64_t)tensor->nbytes;
+    }
+    return total;
+}
+
+static void deepseek_v4_segment_engine_destroy(void *engine_impl) {
+    DeepSeekV4SegmentEngine *engine = engine_impl;
+    if (!engine) return;
+    coli_v4_engine_destroy(engine->model);
+    pthread_mutex_destroy(&engine->run_lock);
+    free(engine);
+}
+
+static int deepseek_v4_segment_engine_open(
+    void **engine_impl, ColiSegmentCapabilities *capabilities,
+    const ColiSegmentEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_segment_adapter_error(error, error_size,
+                                           "invalid DeepSeek V4 Segment open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_SEGMENT_CAP_CPU))
+        return coli_segment_adapter_error(
+            error, error_size, "DeepSeek V4 Segment currently supports CPU only");
+
+    DeepSeekV4SegmentEngine *engine = calloc(1, sizeof(*engine));
+    ColiV4Engine *model = calloc(1, sizeof(*model));
+    if (!engine || !model) {
+        free(model); free(engine);
+        return coli_segment_adapter_error(
+            error, error_size, "out of memory opening DeepSeek V4 Segment");
+    }
+    engine->model = model;
+    engine->layer_begin = options->layer_begin;
+    engine->layer_end = options->layer_end;
+    engine->context_tokens = options->context_tokens;
+    engine->memory_limit_bytes = options->memory_limit_bytes;
+    if (pthread_mutex_init(&engine->run_lock, NULL)) {
+        free(model); free(engine);
+        return coli_segment_adapter_error(
+            error, error_size, "cannot initialize DeepSeek V4 Segment lock");
+    }
+
+    model->owned_target_model_dir = strdup(options->model_dir);
+    if (!model->owned_target_model_dir) {
+        coli_segment_adapter_error(error, error_size,
+                                   "out of memory copying model directory");
+        goto fail;
+    }
+    model->runtime.target_model_dir = model->owned_target_model_dir;
+    model->runtime.context_tokens = (int)options->context_tokens;
+    model->runtime.memory_limit_bytes = options->memory_limit_bytes;
+    model->runtime.pin_slots_per_layer = 0;
+    model->runtime.dense_resident = 1;
+    if (coli_v4_config_load(&model->config, options->model_dir,
+                            error, error_size) ||
+        options->layer_end > (uint32_t)model->config.num_hidden_layers ||
+        options->context_tokens >
+            (uint32_t)model->config.max_position_embeddings) {
+        if (error && error_size && !error[0])
+            snprintf(error, error_size,
+                     "DeepSeek V4 Segment range/context exceeds model");
+        goto fail;
+    }
+    uint64_t width = (uint64_t)model->config.hc_mult *
+                     (uint64_t)model->config.hidden_size;
+    if (!width || width > UINT32_MAX) {
+        coli_segment_adapter_error(error, error_size,
+                                   "DeepSeek V4 Segment state width overflows");
+        goto fail;
+    }
+    engine->state_width = (uint32_t)width;
+
+    if (coli_st_index_open(&model->target_index, options->model_dir,
+                           error, error_size))
+        goto fail;
+    model->owns_index = 1;
+    uint64_t record_bytes =
+        deepseek_v4_segment_expert_record_bytes(model->target_index);
+    if (!record_bytes) {
+        coli_segment_adapter_error(
+            error, error_size, "cannot determine DeepSeek V4 expert size");
+        goto fail;
+    }
+    uint64_t active_layers = options->layer_end - options->layer_begin;
+    uint64_t minimum_slots = model->config.n_routed_experts < 6
+        ? (uint64_t)model->config.n_routed_experts : UINT64_C(6);
+    uint64_t slots = 8;
+    if (options->memory_limit_bytes) {
+        if (active_layers > UINT64_MAX / record_bytes) {
+            coli_segment_adapter_error(
+                error, error_size,
+                "DeepSeek V4 Segment expert cache denominator overflows");
+            goto fail;
+        }
+        uint64_t denominator = active_layers * record_bytes;
+        slots = denominator ? options->memory_limit_bytes / denominator : 0;
+    }
+    if (slots < minimum_slots) {
+        coli_segment_adapter_error(
+            error, error_size,
+            "DeepSeek V4 Segment memory limit cannot hold routed top-k");
+        goto fail;
+    }
+    if (slots > (uint64_t)model->config.n_routed_experts)
+        slots = (uint64_t)model->config.n_routed_experts;
+    if (slots && (uint64_t)model->config.num_hidden_layers >
+                     UINT64_MAX / slots / record_bytes) {
+        coli_segment_adapter_error(error, error_size,
+                                   "DeepSeek V4 expert cache size overflows");
+        goto fail;
+    }
+    uint64_t store_capacity = (uint64_t)model->config.num_hidden_layers *
+                              slots * record_bytes;
+    ColiDeepSeekV4ExpertStoreOptions store_options = {
+        .model_dir = options->model_dir,
+        .layers = model->config.num_hidden_layers,
+        .experts_per_layer = model->config.n_routed_experts,
+        .cache_bytes = store_capacity,
+        .pin_slots_per_layer = 0,
+        .repin_interval = 0,
+        .skip_mirror_setup = 1,
+    };
+    /* The base store scans the complete content-addressed manifest because
+     * expert keys use absolute layer IDs, but allocates slabs lazily.  Only
+     * this engine's selected range can load expert bytes. */
+    if (coli_deepseek_v4_expert_store_open_base(
+            &store_options, &model->experts, error, error_size))
+        goto fail;
+    model->owns_experts = 1;
+    model->summary.dense_resident = 1;
+    model->summary.expert_cache_bytes = active_layers * slots * record_bytes;
+    model->summary.slots_per_layer = (int)slots;
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_TOKEN_IDS |
+                          COLI_SEGMENT_CAP_SNAPSHOT |
+                          COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION |
+                          COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id),
+                                   "deepseek_v4");
+    coli_segment_capability_string(
+        capabilities->state_schema, sizeof(capabilities->state_schema),
+        "deepseek-v4/mhc-window-compressor-indexer-f32-v1");
+    coli_segment_capability_string(
+        capabilities->numeric_class, sizeof(capabilities->numeric_class),
+        "deepseek-v4/fp8-mxfp4-bf16/f32/cpu-v1");
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens =
+        (uint32_t)model->config.max_position_embeddings;
+    capabilities->num_layers = (uint32_t)model->config.num_hidden_layers;
+    *engine_impl = engine;
+    return 0;
+
+fail:
+    deepseek_v4_segment_engine_destroy(engine);
+    return -1;
+}
+
+static int deepseek_v4_segment_prepare_session(
+    DeepSeekV4SegmentSession *session, char *error, size_t error_size) {
+    DeepSeekV4SegmentEngine *engine = session->engine;
+    ColiV4Engine *model = engine->model;
+    int result = 0;
+    pthread_mutex_lock(&engine->run_lock);
+    for (uint32_t layer = engine->layer_begin;
+         !result && layer < engine->layer_end; layer++) {
+        ColiDeepSeekV4LayerWeights weights;
+        if (coli_v4_layer_load(model, &weights, &model->config,
+                               model->target_index, (int)layer,
+                               error, error_size)) {
+            result = -1;
+            break;
+        }
+        result = coli_v4_window_attention_prepare(
+            session->attention[layer], &weights, &model->config,
+            error, error_size);
+        coli_v4_layer_free(model, &weights);
+    }
+    pthread_mutex_unlock(&engine->run_lock);
+    return result;
+}
+
+static void deepseek_v4_segment_session_destroy(void *session_impl) {
+    DeepSeekV4SegmentSession *session = session_impl;
+    if (!session) return;
+    if (session->attention)
+        for (uint32_t layer = session->engine->layer_begin;
+             layer < session->engine->layer_end; layer++)
+            coli_v4_window_attention_destroy(session->attention[layer]);
+    free(session->attention);
+    free(session);
+}
+
+static int deepseek_v4_segment_session_create(
+    void *engine_impl, void **session_impl,
+    const ColiSegmentSessionOptions *options, char *error, size_t error_size) {
+    DeepSeekV4SegmentEngine *engine = engine_impl;
+    if (!engine || !session_impl || !options)
+        return coli_segment_adapter_error(
+            error, error_size, "invalid DeepSeek V4 Segment session");
+    *session_impl = NULL;
+    DeepSeekV4SegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(
+            error, error_size, "out of memory creating DeepSeek V4 session");
+    session->engine = engine;
+    session->context_tokens = options->context_tokens;
+    session->attention = calloc(
+        (size_t)engine->model->config.num_hidden_layers,
+        sizeof(*session->attention));
+    if (!session->attention) goto fail;
+    for (uint32_t layer = engine->layer_begin; layer < engine->layer_end;
+         layer++)
+        if (coli_v4_window_attention_create(
+                &session->attention[layer], &engine->model->config))
+            goto fail;
+    if (deepseek_v4_segment_prepare_session(session, error, error_size))
+        goto fail;
+    *session_impl = session;
+    return 0;
+
+fail:
+    deepseek_v4_segment_session_destroy(session);
+    if (error && error_size && !error[0])
+        snprintf(error, error_size,
+                 "cannot allocate DeepSeek V4 Segment attention state");
+    return -1;
+}
+
+static int deepseek_v4_segment_session_run(
+    void *session_impl, const ColiSegmentRunRequest *request,
+    char *error, size_t error_size) {
+    DeepSeekV4SegmentSession *session = session_impl;
+    if (!session || !request || request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size,
+            "DeepSeek V4 Segment requires contiguous positions");
+    if (request->should_cancel &&
+        request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(
+            error, error_size, "DeepSeek V4 Segment run cancelled");
+    DeepSeekV4SegmentEngine *engine = session->engine;
+    size_t cells;
+    if (coli_segment_size_mul(request->rows, engine->state_width, &cells))
+        return coli_segment_adapter_error(
+            error, error_size, "DeepSeek V4 Segment activation size overflows");
+    float *state = malloc(cells * sizeof(*state));
+    float *next = malloc(cells * sizeof(*next));
+    int *tokens = malloc((size_t)request->rows * sizeof(*tokens));
+    if (!state || !next || !tokens) {
+        free(tokens); free(next); free(state);
+        return coli_segment_adapter_error(
+            error, error_size, "out of memory running DeepSeek V4 Segment");
+    }
+    memcpy(state, request->input, cells * sizeof(*state));
+    for (uint32_t row = 0; row < request->rows; row++)
+        tokens[row] = request->token_ids[row];
+
+    int result = 0;
+    ColiV4Engine *model = engine->model;
+    pthread_mutex_lock(&engine->run_lock);
+    for (uint32_t layer = engine->layer_begin;
+         !result && layer < engine->layer_end; layer++) {
+        ColiDeepSeekV4LayerWeights weights;
+        if (coli_v4_layer_load(model, &weights, &model->config,
+                               model->target_index, (int)layer,
+                               error, error_size)) {
+            result = -1;
+            break;
+        }
+        result = coli_v4_block_window_batch_ref(
+            next, session->attention[layer], &weights, &model->config,
+            model->experts, state, tokens, (int)request->position,
+            (int)request->rows, error, error_size);
+        coli_v4_layer_free(model, &weights);
+        if (!result) {
+            float *swap = state; state = next; next = swap;
+        }
+    }
+    pthread_mutex_unlock(&engine->run_lock);
+    if (!result) {
+        memcpy(request->output, state, cells * sizeof(*state));
+        session->position += request->rows;
+    }
+    free(tokens); free(next); free(state);
+    return result;
+}
+
+#ifdef _WIN32
+static __int64 deepseek_v4_segment_tell(FILE *stream) {
+    return _ftelli64(stream);
+}
+static int deepseek_v4_segment_seek(FILE *stream, __int64 offset, int origin) {
+    return _fseeki64(stream, offset, origin);
+}
+#else
+static int64_t deepseek_v4_segment_tell(FILE *stream) {
+    return (int64_t)ftello(stream);
+}
+static int deepseek_v4_segment_seek(FILE *stream, int64_t offset, int origin) {
+    return fseeko(stream, (off_t)offset, origin);
+}
+#endif
+
+static void deepseek_v4_segment_snapshots_destroy(
+    ColiV4AttentionSnapshot **snapshots, uint32_t count) {
+    if (!snapshots) return;
+    for (uint32_t item = 0; item < count; item++)
+        coli_v4_attention_snapshot_destroy(snapshots[item]);
+    free(snapshots);
+}
+
+static int deepseek_v4_segment_snapshot_file(
+    DeepSeekV4SegmentSession *session, FILE **output,
+    uint64_t *payload_bytes, uint64_t *payload_hash,
+    char *error, size_t error_size) {
+    *output = NULL; *payload_bytes = 0; *payload_hash = COLI_SEGMENT_HASH_INIT;
+    FILE *stream = tmpfile();
+    if (!stream)
+        return coli_segment_adapter_error(
+            error, error_size, "cannot create DeepSeek V4 snapshot staging file");
+    DeepSeekV4SegmentEngine *engine = session->engine;
+    int result = 0;
+    pthread_mutex_lock(&engine->run_lock);
+    for (uint32_t layer = engine->layer_begin;
+         !result && layer < engine->layer_end; layer++) {
+        ColiV4AttentionSnapshot *snapshot = NULL;
+        if (coli_v4_attention_snapshot_create(session->attention[layer],
+                                               &snapshot) ||
+            coli_v4_attention_snapshot_write(snapshot, stream))
+            result = -1;
+        coli_v4_attention_snapshot_destroy(snapshot);
+    }
+    pthread_mutex_unlock(&engine->run_lock);
+    int64_t length = deepseek_v4_segment_tell(stream);
+    if (result || length < 0 || deepseek_v4_segment_seek(stream, 0, SEEK_SET)) {
+        fclose(stream);
+        return coli_segment_adapter_error(
+            error, error_size, "cannot serialize DeepSeek V4 Segment state");
+    }
+    unsigned char chunk[64 * 1024];
+    uint64_t hash = COLI_SEGMENT_HASH_INIT;
+    uint64_t remaining = (uint64_t)length;
+    while (remaining) {
+        size_t wanted = remaining < sizeof(chunk) ? (size_t)remaining
+                                                  : sizeof(chunk);
+        if (fread(chunk, 1, wanted, stream) != wanted) {
+            fclose(stream);
+            return coli_segment_adapter_error(
+                error, error_size, "cannot hash DeepSeek V4 Segment state");
+        }
+        hash = coli_segment_hash_update(hash, chunk, wanted);
+        remaining -= wanted;
+    }
+    if (deepseek_v4_segment_seek(stream, 0, SEEK_SET)) {
+        fclose(stream);
+        return coli_segment_adapter_error(
+            error, error_size, "cannot rewind DeepSeek V4 Segment state");
+    }
+    *output = stream;
+    *payload_bytes = (uint64_t)length;
+    *payload_hash = hash;
+    return 0;
+}
+
+static int deepseek_v4_segment_session_snapshot(
+    void *session_impl, ColiSegmentWriteFn write_fn, void *write_user_data,
+    char *error, size_t error_size) {
+    DeepSeekV4SegmentSession *session = session_impl;
+    if (!session)
+        return coli_segment_adapter_error(
+            error, error_size, "invalid DeepSeek V4 snapshot session");
+    FILE *stream = NULL;
+    uint64_t payload_bytes = 0, payload_hash = 0;
+    if (deepseek_v4_segment_snapshot_file(
+            session, &stream, &payload_bytes, &payload_hash,
+            error, error_size))
+        return -1;
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(
+        &header, "deepseek_v4", session->engine->layer_begin,
+        session->engine->layer_end, session->context_tokens,
+        session->position, payload_bytes, payload_hash);
+    int result = coli_segment_stream_write(
+        write_fn, write_user_data, &header, sizeof(header), error, error_size);
+    unsigned char chunk[64 * 1024];
+    uint64_t remaining = payload_bytes;
+    while (!result && remaining) {
+        size_t wanted = remaining < sizeof(chunk) ? (size_t)remaining
+                                                  : sizeof(chunk);
+        if (fread(chunk, 1, wanted, stream) != wanted)
+            result = coli_segment_adapter_error(
+                error, error_size, "cannot read DeepSeek V4 snapshot staging file");
+        else
+            result = coli_segment_stream_write(
+                write_fn, write_user_data, chunk, wanted, error, error_size);
+        remaining -= wanted;
+    }
+    fclose(stream);
+    return result;
+}
+
+static int deepseek_v4_segment_payload_bound(
+    const DeepSeekV4SegmentSession *session, uint64_t *bound) {
+    const ColiDeepSeekV4Config *config = &session->engine->model->config;
+    uint64_t layers = session->engine->layer_end -
+                      session->engine->layer_begin;
+    uint64_t per_layer = (uint64_t)config->sliding_window * config->head_dim;
+    uint64_t variable = (uint64_t)session->context_tokens *
+        ((uint64_t)config->head_dim + config->index_head_dim +
+         16u * (uint64_t)config->hidden_size);
+    if (UINT64_MAX - per_layer < variable) return -1;
+    per_layer += variable;
+    if (per_layer > UINT64_MAX / sizeof(float))
+        return -1;
+    uint64_t scaled = per_layer * sizeof(float);
+    if (!scaled) return -1;
+    if (layers > (UINT64_MAX - (1u << 20)) / scaled) return -1;
+    *bound = layers * scaled + (1u << 20);
+    return 0;
+}
+
+static int deepseek_v4_segment_session_restore(
+    void *session_impl, ColiSegmentReadFn read_fn, void *read_user_data,
+    char *error, size_t error_size) {
+    DeepSeekV4SegmentSession *session = session_impl;
+    ColiSegmentSnapshotHeader header;
+    if (!session || coli_segment_stream_read(
+            read_fn, read_user_data, &header, sizeof(header),
+            error, error_size))
+        return -1;
+    if (coli_segment_snapshot_header_valid(
+            &header, "deepseek_v4", session->engine->layer_begin,
+            session->engine->layer_end, session->context_tokens,
+            header.payload_bytes, error, error_size))
+        return -1;
+    uint64_t bound = 0;
+    if (deepseek_v4_segment_payload_bound(session, &bound) ||
+        header.payload_bytes > bound)
+        return coli_segment_adapter_error(
+            error, error_size, "DeepSeek V4 snapshot payload is too large");
+
+    FILE *stream = tmpfile();
+    if (!stream)
+        return coli_segment_adapter_error(
+            error, error_size, "cannot create DeepSeek V4 restore staging file");
+    unsigned char chunk[64 * 1024];
+    uint64_t remaining = header.payload_bytes;
+    uint64_t hash = COLI_SEGMENT_HASH_INIT;
+    int result = 0;
+    while (!result && remaining) {
+        size_t wanted = remaining < sizeof(chunk) ? (size_t)remaining
+                                                  : sizeof(chunk);
+        if (coli_segment_stream_read(read_fn, read_user_data, chunk, wanted,
+                                     error, error_size))
+            result = -1;
+        else if (fwrite(chunk, 1, wanted, stream) != wanted)
+            result = coli_segment_adapter_error(
+                error, error_size, "cannot stage DeepSeek V4 restore payload");
+        else
+            hash = coli_segment_hash_update(hash, chunk, wanted);
+        remaining -= wanted;
+    }
+    if (!result && hash != header.payload_hash)
+        result = coli_segment_adapter_error(
+            error, error_size, "DeepSeek V4 snapshot checksum mismatch");
+    if (!result && deepseek_v4_segment_seek(stream, 0, SEEK_SET))
+        result = coli_segment_adapter_error(
+            error, error_size, "cannot rewind DeepSeek V4 restore payload");
+
+    uint32_t count = session->engine->layer_end -
+                     session->engine->layer_begin;
+    ColiV4AttentionSnapshot **incoming = calloc(count, sizeof(*incoming));
+    ColiV4AttentionSnapshot **backup = calloc(count, sizeof(*backup));
+    if (!result && (!incoming || !backup))
+        result = coli_segment_adapter_error(
+            error, error_size, "out of memory restoring DeepSeek V4 state");
+    for (uint32_t item = 0; !result && item < count; item++)
+        if (coli_v4_attention_snapshot_read(stream, &incoming[item]))
+            result = coli_segment_adapter_error(
+                error, error_size, "invalid DeepSeek V4 attention snapshot");
+    int64_t consumed = !result ? deepseek_v4_segment_tell(stream) : -1;
+    if (!result && (consumed < 0 || (uint64_t)consumed != header.payload_bytes))
+        result = coli_segment_adapter_error(
+            error, error_size, "DeepSeek V4 snapshot has trailing data");
+
+    DeepSeekV4SegmentEngine *engine = session->engine;
+    if (!result) {
+        pthread_mutex_lock(&engine->run_lock);
+        for (uint32_t item = 0; !result && item < count; item++) {
+            uint32_t layer = engine->layer_begin + item;
+            if (coli_v4_attention_snapshot_create(
+                    session->attention[layer], &backup[item]))
+                result = coli_segment_adapter_error(
+                    error, error_size, "cannot back up DeepSeek V4 state");
+        }
+        for (uint32_t item = 0; !result && item < count; item++) {
+            uint32_t layer = engine->layer_begin + item;
+            if (coli_v4_attention_snapshot_restore(
+                    session->attention[layer], incoming[item]))
+                result = coli_segment_adapter_error(
+                    error, error_size, "incompatible DeepSeek V4 attention state");
+        }
+        if (result)
+            for (uint32_t item = 0; item < count; item++) {
+                uint32_t layer = engine->layer_begin + item;
+                if (backup[item]) (void)coli_v4_attention_snapshot_restore(
+                    session->attention[layer], backup[item]);
+            }
+        else
+            session->position = header.position;
+        pthread_mutex_unlock(&engine->run_lock);
+    }
+    deepseek_v4_segment_snapshots_destroy(backup, count);
+    deepseek_v4_segment_snapshots_destroy(incoming, count);
+    fclose(stream);
+    return result;
+}
+
+static const ColiSegmentAdapter deepseek_v4_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "deepseek_v4",
+    deepseek_v4_segment_engine_open, deepseek_v4_segment_engine_destroy,
+    deepseek_v4_segment_session_create, deepseek_v4_segment_session_destroy,
+    deepseek_v4_segment_session_run, deepseek_v4_segment_session_snapshot,
+    deepseek_v4_segment_session_restore, {0}
+};
+
+int coli_deepseek_v4_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&deepseek_v4_segment_adapter);
+}
+
+#ifdef COLI_EDGE_ADAPTER
+/* ######## DeepSeek V4 engine-owned model Edge adapter ################# */
+
+typedef struct {
+    ColiDeepSeekV4Config config;
+    ColiSafetensorsIndex *index;
+    ColiFloatTensor head_function, head_base, head_scale, final_norm;
+    Tok tokenizer;
+    uint32_t state_width;
+} DeepSeekV4EdgeEngine;
+
+static void deepseek_v4_edge_engine_destroy(void *engine_impl) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    if (!engine) return;
+    tok_free(&engine->tokenizer);
+    coli_float_tensor_free(&engine->final_norm);
+    coli_float_tensor_free(&engine->head_scale);
+    coli_float_tensor_free(&engine->head_base);
+    coli_float_tensor_free(&engine->head_function);
+    coli_st_index_close(engine->index);
+    free(engine);
+}
+
+static int deepseek_v4_edge_engine_open(
+    void **engine_impl, ColiEdgeCapabilities *capabilities,
+    const ColiEdgeEngineOptions *options, char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return coli_edge_adapter_error(error, error_size,
+                                       "invalid DeepSeek V4 Edge open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_EDGE_CAP_CPU))
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 Edge supports CPU only");
+    DeepSeekV4EdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening DeepSeek V4 Edge");
+    if (coli_v4_config_load(&engine->config, options->model_dir,
+                            error, error_size) ||
+        coli_st_index_open(&engine->index, options->model_dir,
+                           error, error_size)) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return -1;
+    }
+    uint64_t width = (uint64_t)engine->config.hc_mult *
+                     (uint64_t)engine->config.hidden_size;
+    if (!width || width > UINT32_MAX) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 boundary state is too wide");
+    }
+    engine->state_width = (uint32_t)width;
+    if (coli_tensor_load_f32(&engine->head_function, engine->index,
+                             "hc_head_fn", error, error_size) ||
+        coli_tensor_load_f32(&engine->head_base, engine->index,
+                             "hc_head_base", error, error_size) ||
+        coli_tensor_load_f32(&engine->head_scale, engine->index,
+                             "hc_head_scale", error, error_size) ||
+        coli_tensor_load_f32(&engine->final_norm, engine->index,
+                             "norm.weight", error, error_size)) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return -1;
+    }
+    int hidden = engine->config.hidden_size, hc = engine->config.hc_mult;
+    if (hc < 1 || hc > 16 ||
+        engine->head_function.count < (uint64_t)hc * hc * hidden ||
+        engine->head_base.count < (uint64_t)hc ||
+        engine->head_scale.count < 1 ||
+        engine->final_norm.count < (uint64_t)hidden) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 global tensor shape mismatch");
+    }
+    const ColiSafetensorsTensor *embedding =
+        coli_st_find(engine->index, "embed.weight");
+    const ColiSafetensorsTensor *head =
+        coli_st_find(engine->index, "head.weight");
+    uint64_t boundary_cells = (uint64_t)engine->config.vocab_size *
+                              (uint64_t)engine->config.hidden_size;
+    if (!embedding || embedding->dtype != COLI_ST_BF16 ||
+        embedding->numel != (int64_t)boundary_cells ||
+        !head || head->dtype != COLI_ST_BF16 ||
+        head->numel != (int64_t)boundary_cells) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 embedding/head shape or dtype mismatch");
+    }
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+    uint64_t resident = (engine->head_function.count +
+                         engine->head_base.count +
+                         engine->head_scale.count +
+                         engine->final_norm.count) * sizeof(float);
+    if (options->memory_limit_bytes && resident > options->memory_limit_bytes) {
+        deepseek_v4_edge_engine_destroy(engine);
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 Edge exceeds memory limit");
+    }
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
+                          COLI_EDGE_CAP_DETOKENIZE |
+                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_CPU;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id),
+                                "deepseek_v4");
+    coli_edge_capability_string(
+        capabilities->state_schema, sizeof(capabilities->state_schema),
+        "deepseek-v4/mhc-window-compressor-indexer-f32-v1");
+    coli_edge_capability_string(
+        capabilities->numeric_class, sizeof(capabilities->numeric_class),
+        "deepseek-v4/fp8-mxfp4-bf16/f32/cpu-v1");
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                "deepseek-v4/byte-bpe-v1");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->vocab_size = (uint32_t)engine->config.vocab_size;
+    capabilities->max_batch_rows = 128;
+    capabilities->max_context_tokens =
+        (uint32_t)engine->config.max_position_embeddings;
+    capabilities->num_layers =
+        (uint32_t)engine->config.num_hidden_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = 1;
+    capabilities->resident_bytes = resident;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int deepseek_v4_edge_tokenize(
+    void *engine_impl, const char *text, size_t text_bytes,
+    int32_t *token_ids, size_t token_capacity, size_t *token_count,
+    char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    return coli_edge_tok_tokenize(&engine->tokenizer, text, text_bytes,
+                                  token_ids, token_capacity, token_count,
+                                  error, error_size);
+}
+
+static int deepseek_v4_edge_detokenize(
+    void *engine_impl, const int32_t *token_ids, size_t token_count,
+    char *text, size_t text_capacity, size_t *text_bytes,
+    char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    return coli_edge_tok_detokenize(&engine->tokenizer, token_ids, token_count,
+                                    text, text_capacity, text_bytes,
+                                    error, error_size);
+}
+
+static int deepseek_v4_edge_embed(void *engine_impl,
+                                  const ColiEdgeEmbedRequest *request,
+                                  char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    const ColiSafetensorsTensor *embedding =
+        coli_st_find(engine->index, "embed.weight");
+    if (!embedding || embedding->dtype != COLI_ST_BF16)
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 embedding is unavailable");
+    int hidden = engine->config.hidden_size;
+    int copies = engine->config.hc_mult;
+    int shard = coli_st_tensor_shard(engine->index, embedding);
+    uint16_t *packed = malloc((size_t)hidden * sizeof(*packed));
+    if (!packed)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory reading DeepSeek V4 embedding");
+    float *output = request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        int token = request->token_ids[row];
+        if (token < 0 || token >= engine->config.vocab_size ||
+            coli_st_read_at(
+                engine->index, shard,
+                (uint64_t)embedding->off +
+                    (uint64_t)token * hidden * sizeof(*packed),
+                (size_t)hidden * sizeof(*packed), packed)) {
+            free(packed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "cannot read DeepSeek V4 embedding");
+        }
+        float *state = output + (size_t)row * engine->state_width;
+        for (int copy = 0; copy < copies; copy++)
+            for (int item = 0; item < hidden; item++)
+                state[(size_t)copy * hidden + item] =
+                    coli_bf16_decode(packed[item]);
+    }
+    free(packed);
+    return 0;
+}
+
+static void deepseek_v4_edge_final_hidden(
+    DeepSeekV4EdgeEngine *engine, float *output, const float *state) {
+    int hidden = engine->config.hidden_size;
+    int copies = engine->config.hc_mult;
+    int flattened = copies * hidden;
+    float square = 0.0f;
+    for (int item = 0; item < flattened; item++)
+        square += state[item] * state[item];
+    float inverse_rms = 1.0f / sqrtf(
+        square / flattened + engine->config.rms_norm_eps);
+    float pre[16];
+    for (int copy = 0; copy < copies; copy++) {
+        float mix = 0.0f;
+        for (int item = 0; item < flattened; item++)
+            mix += engine->head_function.data[
+                (size_t)copy * flattened + item] * state[item];
+        float z = mix * inverse_rms * engine->head_scale.data[0] +
+                  engine->head_base.data[copy];
+        float sigmoid = z >= 0.0f
+            ? 1.0f / (1.0f + expf(-z))
+            : expf(z) / (1.0f + expf(z));
+        pre[copy] = sigmoid + engine->config.hc_eps;
+    }
+    for (int item = 0; item < hidden; item++) {
+        float value = 0.0f;
+        for (int copy = 0; copy < copies; copy++)
+            value += pre[copy] * state[(size_t)copy * hidden + item];
+        output[item] = coli_bf16_round(value);
+    }
+    coli_v4_rmsnorm(output, output, engine->final_norm.data,
+                    hidden, engine->config.rms_norm_eps);
+    coli_bf16_round_array(output, (size_t)hidden);
+}
+
+static float deepseek_v4_edge_head_dot(
+    const uint16_t *weight, const float *hidden, int dimension) {
+    float sum = 0.0f;
+    int column = 0;
+#ifdef __AVX2__
+    for (; column + 8 <= dimension; column += 8) {
+        float products[8];
+        __m128i packed = _mm_loadu_si128((const __m128i *)(weight + column));
+        __m256i bits = _mm256_slli_epi32(
+            _mm256_cvtepu16_epi32(packed), 16);
+        _mm256_storeu_ps(products, _mm256_mul_ps(
+            _mm256_castsi256_ps(bits), _mm256_loadu_ps(hidden + column)));
+        for (int lane = 0; lane < 8; lane++) sum += products[lane];
+    }
+#endif
+    for (; column < dimension; column++)
+        sum += coli_bf16_decode(weight[column]) * hidden[column];
+    return sum;
+}
+
+static int deepseek_v4_edge_argmax(
+    DeepSeekV4EdgeEngine *engine, const float *hidden,
+    int32_t *best_token, float *best_logit,
+    ColiEdgeCancelFn should_cancel, void *cancel_user_data) {
+    const ColiSafetensorsTensor *head =
+        coli_st_find(engine->index, "head.weight");
+    if (!head || head->dtype != COLI_ST_BF16) return -1;
+    int dimension = engine->config.hidden_size;
+    int vocab = engine->config.vocab_size;
+    int shard = coli_st_tensor_shard(engine->index, head);
+    enum { TILE_ROWS = 64 };
+    uint16_t *raw = malloc((size_t)TILE_ROWS * dimension * sizeof(*raw));
+    float *scores = malloc((size_t)TILE_ROWS * sizeof(*scores));
+    if (!raw || !scores) { free(scores); free(raw); return -1; }
+    int winner = -1;
+    float maximum = -FLT_MAX;
+    for (int start = 0; start < vocab; start += TILE_ROWS) {
+        if (should_cancel && should_cancel(cancel_user_data)) {
+            free(scores); free(raw); return -2;
+        }
+        int rows = vocab - start < TILE_ROWS ? vocab - start : TILE_ROWS;
+        size_t bytes = (size_t)rows * dimension * sizeof(*raw);
+        if (coli_st_read_at(
+                engine->index, shard,
+                (uint64_t)head->off +
+                    (uint64_t)start * dimension * sizeof(*raw),
+                bytes, raw)) {
+            free(scores); free(raw); return -1;
+        }
+        #pragma omp parallel for schedule(static)
+        for (int row = 0; row < rows; row++)
+            scores[row] = deepseek_v4_edge_head_dot(
+                raw + (size_t)row * dimension, hidden, dimension);
+        for (int row = 0; row < rows; row++)
+            if (scores[row] > maximum) {
+                maximum = scores[row]; winner = start + row;
+            }
+    }
+    free(scores); free(raw);
+    *best_token = winner;
+    if (best_logit) *best_logit = maximum;
+    return winner < 0 ? -1 : 0;
+}
+
+static int deepseek_v4_edge_select(void *engine_impl,
+                                   const ColiEdgeSelectRequest *request,
+                                   char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    int hidden = engine->config.hidden_size;
+    float *final = malloc((size_t)hidden * sizeof(*final));
+    if (!final)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory running DeepSeek V4 head");
+    const float *input = request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        deepseek_v4_edge_final_hidden(
+            engine, final, input + (size_t)row * engine->state_width);
+        int result = deepseek_v4_edge_argmax(
+            engine, final, &request->token_ids[row],
+            request->scores ? &request->scores[row] : NULL,
+            request->should_cancel, request->cancel_user_data);
+        if (result) {
+            free(final);
+            return coli_edge_adapter_error(
+                error, error_size, result == -2
+                    ? "DeepSeek V4 Edge selection cancelled"
+                    : "DeepSeek V4 Edge head failed");
+        }
+    }
+    free(final);
+    return 0;
+}
+
+static const ColiEdgeAdapter deepseek_v4_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "deepseek_v4",
+    deepseek_v4_edge_engine_open, deepseek_v4_edge_engine_destroy,
+    deepseek_v4_edge_tokenize, deepseek_v4_edge_detokenize,
+    deepseek_v4_edge_embed, deepseek_v4_edge_select, {0}
+};
+
+int coli_deepseek_v4_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&deepseek_v4_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */
+#endif /* COLI_V4_UNIT_SEGMENT_ADAPTER && COLI_SEGMENT_ADAPTER */
