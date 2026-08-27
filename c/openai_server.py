@@ -1365,6 +1365,73 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+GLM53_TOOL_PREAMBLE = (
+    "<|system|>\n# Tools\n\n"
+    "You may call one or more functions to assist with the user query.\n\n"
+    "You are provided with function signatures within <tools></tools> XML tags:\n"
+    "<tools>\n")
+GLM53_TOOL_EPILOGUE = (
+    "\n</tools>\n\n"
+    "For each function call, output the function name and arguments within the "
+    "following XML format:\n"
+    "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key>"
+    "<arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key>"
+    "<arg_value>{arg-value-2}</arg_value>...</tool_call>")
+
+
+def _glm53_tool_json(tool):
+    """Una firma di strumento come la serializza il template di GLM-5.3.
+
+    Le chiavi restano nell'ordine in cui il client le ha mandate, perche' il
+    template itera `tool.items()` e non le riordina; `defer_loading` e `strict`
+    non entrano nel prompt."""
+    if isinstance(tool, dict) and "function" in tool:
+        tool = tool["function"]
+    if not isinstance(tool, dict):
+        raise APIError(400, "each tool must be an object.", "tools")
+    parts = [f'"{key}": {json.dumps(value, ensure_ascii=False)}'
+             for key, value in tool.items()
+             if key not in ("defer_loading", "strict")]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _glm53_tool_block(tools):
+    """Il blocco di dichiarazione, spaziatura compresa.
+
+    Gli a capo non sono decorativi: sono quelli che escono da chat_template.jinja
+    e il test li confronta byte a byte contro jinja2, perche' un prompt che
+    somiglia a quello dell'addestramento non e' quello dell'addestramento."""
+    body = "".join(f"\n{_glm53_tool_json(tool)}\n\n"
+                   for tool in tools
+                   if not (isinstance(tool, dict)
+                           and (tool.get("function", tool) or {}).get("defer_loading")))
+    return GLM53_TOOL_PREAMBLE + body + GLM53_TOOL_EPILOGUE
+
+
+def _glm53_tool_calls(calls):
+    """Le chiamate di un turno assistente passato, nel formato che il modello
+    stesso produce: <tool_call>nome<arg_key>k</arg_key><arg_value>v</arg_value>.
+    Le stringhe passano cosi' come sono, il resto come JSON."""
+    out = []
+    for call in calls or []:
+        if isinstance(call, dict) and "function" in call:
+            call = call["function"]
+        name = (call or {}).get("name", "")
+        arguments = (call or {}).get("arguments")
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = {}
+        pieces = [f"<tool_call>{name}"]
+        for key, value in (arguments or {}).items():
+            rendered = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+            pieces.append(f"<arg_key>{key}</arg_key><arg_value>{rendered}</arg_value>")
+        pieces.append("</tool_call>")
+        out.append("".join(pieces))
+    return "\n" + "".join(out) + "\n" if out else ""
+
+
 def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                       tool_choice=None):
     """Render the text-only subset of the official GLM-5.3-Flash chat template.
@@ -1372,27 +1439,38 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     Not a variant of the GLM-5.2 renderer above, and the differences are not
     cosmetic. GLM-5.3 emits the reasoning-effort system line ALWAYS, because its
     template defaults the effort to Max rather than leaving it unset; it accepts
-    only low, high and max, not the six-level ladder; and its generation prompt
+    only low, high and max, not the six-level ladder; its generation prompt
     OPENS the reasoning block with a bare `<think>` where 5.2 closed it
-    immediately with `<think></think>`. A past assistant turn still closes it.
+    immediately; and it declares tools with its own preamble and spacing.
 
-    Tools are refused rather than rendered. GLM-5.3 declares them inside a
-    `<tool_response><tools>` wrapper with its own JSON serialization, which is
-    not the block 5.2 uses, and emitting 5.2's shape here would put a prompt in
-    front of the model that it was never trained on -- an answer that looks
-    fine and is quietly wrong is worse than an error that says what is missing.
+    What the two share is how a call comes BACK: both models emit
+    `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
+    so the existing parser needs nothing added for this family.
+
+    The whole thing is pinned byte for byte against chat_template.jinja rendered
+    with jinja2 (tests/test_glm53_chat_template.py). Getting the prompt nearly
+    right is the failure mode worth guarding: the model answers either way.
     """
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools and tool_choice != "none":
-        raise APIError(400, "Tool calling is not wired for GLM-5.3-Flash yet; "
-                            "its declaration block differs from GLM-5.2's.", "tools")
 
-    # low/high passano, tutto il resto e' Max: e' la scala del template, non la
-    # nostra. `none` non arriva qui, spegne il ragionamento a monte.
+    forced = None
+    if isinstance(tool_choice, dict):
+        forced = ((tool_choice.get("function") or {}).get("name")
+                  or tool_choice.get("name"))
+        if forced:
+            tools = [t for t in (tools or [])
+                     if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
+    elif tool_choice == "none":
+        tools = None                              # il client li ha vietati: non si offrono
+
+    # low e high passano, tutto il resto e' Max: e' la scala del template, non
+    # la nostra. `none` non arriva qui, spegne il ragionamento a monte.
     effort = {"minimal": "Low", "low": "Low", "medium": "High",
               "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
     prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+    if tools:
+        prompt.append(_glm53_tool_block(tools))
 
     for message in messages:
         if not isinstance(message, dict):
@@ -1407,16 +1485,16 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
             prompt.append(f"<|user|>{content}")
         elif role == "system":
             prompt.append(f"<|system|>{content}")
+        elif role == "tool":
+            prompt.append(f"<|observation|><tool_response>{content}</tool_response>")
         elif role == "assistant":
             reasoning = message.get("reasoning_content")
             if not isinstance(reasoning, str) and "</think>" in content:
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
-            prompt.append(f"<|assistant|>{opened}{content.strip()}")
-        elif role == "tool":
-            raise APIError(400, "Tool results are not wired for GLM-5.3-Flash yet.",
-                           "messages")
+            prompt.append(f"<|assistant|>{opened}{content.strip()}"
+                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
