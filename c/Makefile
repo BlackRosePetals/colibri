@@ -1106,8 +1106,8 @@ tests/test_st_pread$(EXE): tests/test_st_pread.c st.h json.h compat.h
 tests/test_st_slice$(EXE): tests/test_st_slice.c st.h json.h compat.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
-tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
-	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+tests/test_qwen38_tokenizer$(EXE): tests/test_qwen38_tokenizer.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h edge_runtime.c edge_runtime.h edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< edge_runtime.c -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)

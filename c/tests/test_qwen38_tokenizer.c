@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #define QWEN38_NO_MAIN
 #define QWEN38_TEST_TOKENIZER
+#define COLI_EDGE_ADAPTER
 #include "../qwen38.c"
 
 #define CHECK(x) do { if(!(x)){ \
@@ -137,11 +138,20 @@ int main(void) {
                      invalid_output,sizeof invalid_output,&invalid_n)==12);
     for(int i=0;i<12;i+=3)CHECK(!memcmp(invalid_output+i,replacement,3));
 
-    char **grown=realloc(g_tok,15u*sizeof(char*));CHECK(grown!=NULL);g_tok=grown;
+    char **grown=realloc(g_tok,16u*sizeof(char*));CHECK(grown!=NULL);g_tok=grown;
     g_tok[12]=malloc(257);CHECK(g_tok[12]!=NULL);
     for(int i=0;i<128;i++){g_tok[12][2*i]=(char)0xc4;g_tok[12][2*i+1]=(char)0xa0;}
     g_tok[12][256]='\0';g_tok[13]=strdup("<0x00>");CHECK(g_tok[13]!=NULL);
-    g_tok[14]=strdup("<0xFF>");CHECK(g_tok[14]!=NULL);g_tok_n=15;
+    g_tok[14]=strdup("<0xFF>");CHECK(g_tok[14]!=NULL);g_tok[15]=NULL;g_tok_n=16;
+    Qwen38EdgeEngine edge={0};edge.model.c.vocab=g_tok_n;
+    const int32_t invalid_edge_ids[]={-1,15,g_tok_n};char edge_error[128];
+    for(size_t index=0;
+        index<sizeof(invalid_edge_ids)/sizeof(invalid_edge_ids[0]);index++){
+        size_t text_bytes=0;
+        CHECK(qwen38_edge_detokenize(&edge,&invalid_edge_ids[index],1,
+                                     NULL,0,&text_bytes,
+                                     edge_error,sizeof edge_error)<0);
+    }
     const int range_ids[]={12,13,12};unsigned char *range=NULL;size_t range_n=0;
     CHECK(decode_range_alloc(range_ids,0,3,&range,&range_n)==0);
     CHECK(range_n==257);CHECK(range[128]=='\0');

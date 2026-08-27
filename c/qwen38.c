@@ -1400,56 +1400,15 @@ static void q38_prefix_cache_release(Model *m){
     q38_prefix_cache_dispose(&g_q38_prefix);
 }
 
-/* Grow QSA storage without disturbing rows already described by the prefix.
- * The core's ordinary allocator intentionally frees on growth for cold
- * inference; serve needs this transactional variant for a cached extension. */
-static int q38_serve_ensure_kv(Model *m,int required){
-    if(!m||required<1)return 0;
-    if(m->K&&required<=m->kv_cap){m->max_t=required;return 1;}
-    int old_cap=m->kv_cap,old_max=m->max_t,keep=m->kv_len;
-    if(!m->K||old_cap<1||keep<1){m->max_t=required;ensure_kv(m);return 1;}
-    if(keep>old_cap)keep=old_cap;if(keep>required)keep=required;
-    Cfg *c=&m->c;float **new_k=(float**)calloc((size_t)c->layers,sizeof(float*));
-    float **new_v=(float**)calloc((size_t)c->layers,sizeof(float*));
-    float **new_ik=(float**)calloc((size_t)c->layers,sizeof(float*));
-    if(!new_k||!new_v||!new_ik)goto oom;
-    size_t cells=0;
-    for(int i=0;i<c->layers;i++)if(c->is_attn[i]){
-        if(c->kv_heads<=0||c->head_dim<=0||c->idx_dim<=0||
-           !m->K[i]||!m->V[i]||!m->IK[i]||
-           !q38_size_mul((size_t)c->kv_heads,(size_t)required,&cells)||
-           !q38_size_mul(cells,(size_t)c->head_dim,&cells)||
-           cells>SIZE_MAX/sizeof(float))goto oom;
-        new_k[i]=(float*)malloc(cells*sizeof(float));new_v[i]=(float*)malloc(cells*sizeof(float));
-        if(!new_k[i]||!new_v[i])goto oom;
-        size_t row_cells=0,row_bytes=0;
-        if(!q38_size_mul((size_t)keep,(size_t)c->head_dim,&row_cells)||
-           !q38_size_mul(row_cells,sizeof(float),&row_bytes))goto oom;
-        for(int h=0;h<c->kv_heads;h++){
-            size_t old_off=0,new_off=0;
-            if(!q38_size_mul((size_t)h,(size_t)old_cap,&old_off)||
-               !q38_size_mul(old_off,(size_t)c->head_dim,&old_off)||
-               !q38_size_mul((size_t)h,(size_t)required,&new_off)||
-               !q38_size_mul(new_off,(size_t)c->head_dim,&new_off))goto oom;
-            memcpy(new_k[i]+new_off,m->K[i]+old_off,row_bytes);
-            memcpy(new_v[i]+new_off,m->V[i]+old_off,row_bytes);
-        }
-        if(!q38_size_mul((size_t)required,(size_t)c->idx_dim,&cells)||
-           cells>SIZE_MAX/sizeof(float))goto oom;
-        new_ik[i]=(float*)malloc(cells*sizeof(float));if(!new_ik[i])goto oom;
-        size_t index_cells=0,index_bytes=0;
-        if(!q38_size_mul((size_t)keep,(size_t)c->idx_dim,&index_cells)||
-           !q38_size_mul(index_cells,sizeof(float),&index_bytes))goto oom;
-        memcpy(new_ik[i],m->IK[i],index_bytes);
-    }
-    for(int i=0;i<c->layers;i++){
-        free(m->K[i]);free(m->V[i]);free(m->IK[i]);
-    }
-    free(m->K);free(m->V);free(m->IK);m->K=new_k;m->V=new_v;m->IK=new_ik;
-    m->kv_cap=required;m->max_t=required;return 1;
-oom:
-    if(new_k)for(int i=0;i<c->layers;i++){free(new_k[i]);free(new_v?new_v[i]:NULL);free(new_ik?new_ik[i]:NULL);}
-    free(new_k);free(new_v);free(new_ik);m->max_t=old_max;return 0;
+/* Allocate the complete served QSA bank once, before READY.  Prefix reuse
+ * relies on append-only position rows; one planned allocation both preserves
+ * those rows and avoids a growth peak containing the old and new banks at the
+ * same time.  An initialized serve model is therefore never grown in place. */
+static int q38_serve_ensure_kv(Model *m,int capacity){
+    if(!m||capacity<1)return 0;
+    if(m->kv_cap>0)return m->K&&m->kv_cap>=capacity;
+    m->max_t=capacity;ensure_kv(m);
+    return m->K&&m->kv_cap>=capacity;
 }
 
 static double q38_cache_hit_percent(uint64_t hits,uint64_t misses){
@@ -1478,8 +1437,7 @@ static int q38_format_prof(char *out,size_t capacity,double wall_s,int prompt_to
 static int serve_one(Model *m, ServeReq *q){
     int *ids=NULL, np=0;
     encode_text_n(q->payload,(size_t)q->plen,&ids,&np); /* byte-counted prompt; qwen38 adds no BOS */
-    int max_ctx = qwen38_max_ctx();
-    if(max_ctx > m->c.max_positions) max_ctx = m->c.max_positions;
+    int max_ctx=m->kv_cap;
     if(np<1 || np>max_ctx || q->max_tok<1 || q->max_tok>max_ctx-np){
         printf("ERROR %s CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d\n",q->id,np,q->max_tok,max_ctx);
         fflush(stdout); free(ids); return 0;
@@ -1488,11 +1446,6 @@ static int serve_one(Model *m, ServeReq *q){
     double request_started=now_s();
     uint64_t hits_before=m->hits, misses_before=m->miss;
     Q38Timers timers_before=m->timers;
-    int request_capacity=np+q->max_tok;
-    if(!q38_serve_ensure_kv(m,request_capacity)){
-        coli_serve_write_error(stdout,q->id,"unable to grow QSA state");
-        free(ids);return 0;
-    }
     int reuse=q38_prefix_restore(m,ids,np);
     float *lo=NULL;
     if(reuse==np){
@@ -1589,6 +1542,11 @@ static int serve_one(Model *m, ServeReq *q){
 static void serve_loop(Model *m){
     coli_serve_binary_mode();
     setvbuf(stdin,NULL,_IONBF,0);
+    int max_ctx=qwen38_max_ctx();
+    if(max_ctx>m->c.max_positions)max_ctx=m->c.max_positions;
+    if(!q38_serve_ensure_kv(m,max_ctx)){
+        fprintf(stderr,"[serve] unable to allocate QSA state\n");return;
+    }
     fputs("\x01\x01READY\x01\x01\n",stdout);
     printf("STAT 0 0.00 0.0 %.2f\n",rss_gb());
     fflush(stdout);
@@ -2483,8 +2441,8 @@ static int qwen38_edge_detokenize(
     void *engine_impl,const int32_t *token_ids,size_t token_count,
     char *text,size_t text_capacity,size_t *text_bytes,
     char *error,size_t error_size) {
-    (void)engine_impl;
-    if(!token_ids||!token_count||!text_bytes||token_count>INT_MAX||
+    Qwen38EdgeEngine *engine=(Qwen38EdgeEngine*)engine_impl;
+    if(!engine||!token_ids||!token_count||!text_bytes||token_count>INT_MAX||
        token_count>SIZE_MAX/sizeof(int))
         return coli_edge_adapter_error(error,error_size,
                                        "invalid Qwen3.8 detokenizer input");
@@ -2492,7 +2450,16 @@ static int qwen38_edge_detokenize(
     if(!ids)
         return coli_edge_adapter_error(error,error_size,
             "out of memory detokenizing Qwen3.8 tokens");
-    for(size_t item=0;item<token_count;item++)ids[item]=token_ids[item];
+    for(size_t item=0;item<token_count;item++){
+        int token=token_ids[item];
+        if(token<0||token>=engine->model.c.vocab||token>=g_tok_n||
+           !g_tok||!g_tok[token]){
+            free(ids);
+            return coli_edge_adapter_error(error,error_size,
+                                           "Qwen3.8 token ID is not decodable");
+        }
+        ids[item]=token;
+    }
     unsigned char *decoded=NULL;size_t decoded_bytes=0;
     int result=decode_range_alloc(ids,0,(int)token_count,
                                   &decoded,&decoded_bytes);

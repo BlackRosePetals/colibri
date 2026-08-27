@@ -52,10 +52,11 @@ int main(void){
     CHECK(m.DN_rec[0]&&m.DN_conv[0]&&m.PLE_conv_state&&m.ple_history);
     CHECK(q38_prefix_cache_layout(&m));
 
-    /* QSA rows are position-indexed.  Verify growth keeps the old prefix. */
-    m.c.kv_heads=1;m.c.head_dim=2;m.c.idx_dim=2;m.kv_cap=3;m.kv_len=3;
-    m.K[1]=malloc(6*sizeof(float));m.V[1]=malloc(6*sizeof(float));m.IK[1]=malloc(6*sizeof(float));
-    CHECK(m.K[1]&&m.V[1]&&m.IK[1]);
+    /* Serve allocates its planned QSA ceiling once.  Reuse must preserve the
+     * position-indexed prefix without a second allocation or growth peak. */
+    m.c.kv_heads=1;m.c.head_dim=2;m.c.idx_dim=2;
+    CHECK(q38_serve_ensure_kv(&m,6));CHECK(m.kv_cap==6);m.kv_len=3;
+    float *initial_k=m.K[1],*initial_v=m.V[1],*initial_ik=m.IK[1];
     for(int i=0;i<6;i++){m.K[1][i]=(float)i;m.V[1][i]=(float)(10+i);m.IK[1][i]=(float)(20+i);}
 
     const int first[]={1,2,3};float first_logits[8];
@@ -65,6 +66,8 @@ int main(void){
     const int extension[]={1,2,3,4};
     CHECK(q38_prefix_restore(&m,extension,4)==3);CHECK(check_state(&m,7.f));
     CHECK(q38_serve_ensure_kv(&m,6));CHECK(m.kv_cap==6&&m.kv_len==3);
+    CHECK(m.K[1]==initial_k&&m.V[1]==initial_v&&m.IK[1]==initial_ik);
+    CHECK(!q38_serve_ensure_kv(&m,7));
     for(int i=0;i<6;i++){CHECK(m.K[1][i]==(float)i);CHECK(m.V[1][i]==(float)(10+i));CHECK(m.IK[1][i]==(float)(20+i));}
 
     /* An exact prompt restores the recurrent state and its saved logits. */
@@ -84,6 +87,6 @@ int main(void){
     for(size_t i=0;i<g_q38_prefix.conv_cells;i++)CHECK(m.DN_conv[0][i]==0.f);
     for(size_t i=0;i<g_q38_prefix.ple_cells;i++)CHECK(m.PLE_conv_state[i]==0.f);
     free_fake(&m);
-    puts("qwen38 prefix: exact reuse, extension, mismatch reset, state restore: ok");
+    puts("qwen38 prefix: single QSA allocation, exact/extension reuse, reset: ok");
     return 0;
 }

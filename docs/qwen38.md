@@ -65,7 +65,9 @@ saved DeltaNet/PLE recurrent state is restored before evaluating only the
 extension. An identical prompt also reuses its saved final logits. Mismatched
 or shorter prompts reset every hybrid component rather than guessing at cache
 identity. Decode and cancellation mutate only live state, not the published
-prompt snapshot.
+prompt snapshot. The complete configured QSA context bank is allocated once
+before the engine publishes `READY`; serve never grows it alongside a still-live
+old bank, so the planner's single context-bank reservation is also the peak.
 
 QSA caches the two K/V heads and the indexer's raw key. Complete four-token
 blocks are pooled and scored, the best 512 blocks are retained, and a causal

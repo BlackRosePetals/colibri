@@ -150,6 +150,18 @@ int main(int argc, char **argv) {
             "tokenizer round-trip differs");
     free(probe_text); probe_text = NULL;
     free(probe_ids); probe_ids = NULL;
+    if (!strcmp(family, "qwen38")) {
+        int32_t invalid_ids[] = {-1, (int32_t)edge_cap.vocab_size};
+        for (size_t invalid = 0;
+             invalid < sizeof(invalid_ids) / sizeof(invalid_ids[0]);
+             invalid++) {
+            size_t rejected_bytes = 0;
+            REQUIRE(coli_edge_detokenize(edge, &invalid_ids[invalid], 1,
+                                         NULL, 0, &rejected_bytes,
+                                         error, sizeof(error)) != 0,
+                    "Qwen3.8 detokenizer accepted an invalid token ID");
+        }
+    }
 
     uint32_t context = (uint32_t)(prompt_count + max_new + 2);
     ColiSegmentEngineOptions segment_options = {

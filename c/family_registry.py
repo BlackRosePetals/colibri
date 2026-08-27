@@ -224,6 +224,9 @@ def _qwen38_geometry(config, context, _model_dir):
     index_ratio = _required_int(config, "indexer_compress_ratio", family)
     if index_kv != 1 or index_dim < rotary_dim or index_budget % index_ratio:
         raise ValueError(f"{family}: invalid sparse indexer geometry")
+    # Serve allocates this complete QSA bank once before publishing READY and
+    # never grows it in place. One context-sized bank is therefore both the
+    # steady allocation and the allocation peak; no old/new growth pair exists.
     context_state = full * context * (2 * n_kv * head_dim + index_kv * index_dim) * 4
 
     value_heads = _required_int(config, "linear_num_value_heads", family)
