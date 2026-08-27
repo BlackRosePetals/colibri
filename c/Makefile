@@ -1303,6 +1303,7 @@ SEGMENT_CPU_CFLAGS = $(filter-out -DCOLI_CUDA -DCOLI_ANS -DCOLI_METAL \
 	-DCOLI_SEGMENT_ADAPTER -DCOLI_EDGE_ADAPTER
 SEGMENT_ENGINE_OBJS = \
 	$(SEGMENT_BUILD_DIR)/glm.o \
+	$(SEGMENT_BUILD_DIR)/glm53.o \
 	$(SEGMENT_BUILD_DIR)/inkling.o \
 	$(SEGMENT_BUILD_DIR)/kimi.o \
 	$(SEGMENT_BUILD_DIR)/olmoe.o \
@@ -1325,6 +1326,12 @@ $(SEGMENT_BUILD_DIR)/glm.o: colibri.c segment_runtime.h edge_runtime.h \
 		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
 		edge_adapter_internal.h edge_tok_internal.h st.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DCOLIBRI_NO_MAIN -c colibri.c -o $@
+
+$(SEGMENT_BUILD_DIR)/glm53.o: glm53.c segment_runtime.h edge_runtime.h \
+		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
+		edge_adapter_internal.h st.h quant.h tok.h hyper_connections.h \
+		delta_attention.h sparse_index.h vision_tower.h | $(SEGMENT_BUILD_DIR)
+	$(CC) $(SEGMENT_CPU_CFLAGS) -DGLM53_NO_MAIN -c glm53.c -o $@
 
 $(SEGMENT_BUILD_DIR)/inkling.o: inkling.c segment_runtime.h edge_runtime.h \
 		segment_adapters.h edge_adapters.h segment_adapter_internal.h \
@@ -1409,12 +1416,14 @@ edge-adapters: tests/test_edge_adapters_registration$(EXE)
 # its production-size reserve heuristic from making the test host-dependent.
 segment-adapters-real: tests/test_segment_adapters_real$(EXE)
 	@test -n "$(GLM_SEGMENT_MODEL)" || { echo "set GLM_SEGMENT_MODEL" >&2; exit 2; }
+	@test -n "$(GLM53_SEGMENT_MODEL)" || { echo "set GLM53_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(INKLING_SEGMENT_MODEL)" || { echo "set INKLING_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(KIMI_SEGMENT_MODEL)" || { echo "set KIMI_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(OLMOE_SEGMENT_MODEL)" || { echo "set OLMOE_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(QWEN_SEGMENT_MODEL)" || { echo "set QWEN_SEGMENT_MODEL" >&2; exit 2; }
 	@test -n "$(DEEPSEEK_SEGMENT_MODEL)" || { echo "set DEEPSEEK_SEGMENT_MODEL" >&2; exit 2; }
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm "$(GLM_SEGMENT_MODEL)" 0 3 5 8
+	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) glm53 "$(GLM53_SEGMENT_MODEL)" 0 2 4 16
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) inkling "$(INKLING_SEGMENT_MODEL)" 0 4 8 8
 	COLI_RAM_OVERCOMMIT=1 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) kimi "$(KIMI_SEGMENT_MODEL)" 0 3 6 8
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_segment_adapters_real$(EXE) olmoe "$(OLMOE_SEGMENT_MODEL)" 0 2 4 8
@@ -1427,12 +1436,14 @@ segment-adapters-real: tests/test_segment_adapters_real$(EXE)
 # helper is only for existing math-only tiny checkpoints that omit one.
 edge-adapters-real: tests/test_edge_adapters_real$(EXE)
 	@test -n "$(GLM_EDGE_MODEL)" && test -n "$(GLM_EDGE_REF)" || { echo "set GLM_EDGE_MODEL and GLM_EDGE_REF" >&2; exit 2; }
+	@test -n "$(GLM53_EDGE_MODEL)" && test -n "$(GLM53_EDGE_REF)" || { echo "set GLM53_EDGE_MODEL and GLM53_EDGE_REF" >&2; exit 2; }
 	@test -n "$(INKLING_EDGE_MODEL)" && test -n "$(INKLING_EDGE_REF)" || { echo "set INKLING_EDGE_MODEL and INKLING_EDGE_REF" >&2; exit 2; }
 	@test -n "$(KIMI_EDGE_MODEL)" && test -n "$(KIMI_EDGE_REF)" || { echo "set KIMI_EDGE_MODEL and KIMI_EDGE_REF" >&2; exit 2; }
 	@test -n "$(OLMOE_EDGE_MODEL)" && test -n "$(OLMOE_EDGE_REF)" || { echo "set OLMOE_EDGE_MODEL and OLMOE_EDGE_REF" >&2; exit 2; }
 	@test -n "$(QWEN_EDGE_MODEL)" && test -n "$(QWEN_EDGE_REF)" || { echo "set QWEN_EDGE_MODEL and QWEN_EDGE_REF" >&2; exit 2; }
 	@test -n "$(DEEPSEEK_EDGE_MODEL)" && test -n "$(DEEPSEEK_EDGE_REF)" || { echo "set DEEPSEEK_EDGE_MODEL and DEEPSEEK_EDGE_REF" >&2; exit 2; }
 	GLM_SEGMENT_EBITS=16 GLM_SEGMENT_DBITS=16 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm "$(GLM_EDGE_MODEL)" "$(GLM_EDGE_REF)" 3
+	GLM53_BITS=32 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm53 "$(GLM53_EDGE_MODEL)" "$(GLM53_EDGE_REF)" 3
 	INK_SEGMENT_BITS=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) inkling "$(INKLING_EDGE_MODEL)" "$(INKLING_EDGE_REF)" 3
 	COLI_RAM_OVERCOMMIT=1 K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) kimi "$(KIMI_EDGE_MODEL)" "$(KIMI_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) olmoe "$(OLMOE_EDGE_MODEL)" "$(OLMOE_EDGE_REF)" 3

@@ -650,6 +650,11 @@ typedef struct {
     Mat head;
     GLayer *layer;
     char prefix[64];
+    /* Quali layer questo motore possiede davvero. Un segment ne carica un
+     * pezzo, e caricare il resto vorrebbe dire tenere in RAM i pesi che sta
+     * macinando un'altra macchina. */
+    int layer_begin, layer_end;
+    int has_io;                           /* embedding e testa: solo agli estremi */
     /* esperti: o residenti (checkpoint f32) o in streaming (container int4) */
     int streaming;
     struct ERef *eref;
@@ -1146,7 +1151,8 @@ static void expert_table_init(GModel *m) {
     m->eref = calloc((size_t)c->n_layers * c->n_experts, sizeof(*m->eref));
     if (!m->eref) { fprintf(stderr, "OOM sulla tabella degli esperti\n"); exit(1); }
 
-    for (int i = c->first_dense; i < c->n_layers; i++) {
+    const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
+    for (int i = from; i < m->layer_end; i++) {
         for (int e = 0; e < c->n_experts; e++) {
             ERef *ref = &m->eref[(size_t)i * c->n_experts + e];
             for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
@@ -1180,14 +1186,16 @@ static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
     double budget = setting ? atof(setting) : 8.0;
-    const int sparse = c->n_layers - c->first_dense;
+    const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
+    int sparse = m->layer_end - from;
+    if (sparse < 0) sparse = 0;
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
     if (cap < 1) cap = 1;
     if (cap > c->n_experts) cap = c->n_experts;
 
     m->ecache = calloc((size_t)c->n_layers, sizeof(*m->ecache));
     if (!m->ecache) { fprintf(stderr, "OOM sulla cache degli esperti\n"); exit(1); }
-    for (int i = c->first_dense; i < c->n_layers; i++) {
+    for (int i = from; i < m->layer_end; i++) {
         LCache *cache = &m->ecache[i];
         cache->cap = cap;
         cache->s = calloc((size_t)cap, sizeof(*cache->s));
@@ -1322,11 +1330,13 @@ static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
 
 /* ---------- caricamento ---------- */
 static void vision_load(GModel *m);
+static void model_load_range(GModel *m, const char *dir, int b, int e, int io);
 static void expert_geometry(GModel *m);
 static void expert_table_init(GModel *m);
 static void expert_cache_init(GModel *m);
 
-static void model_load(GModel *m, const char *dir) {
+static void model_load_range(GModel *m, const char *dir, int layer_begin,
+                             int layer_end, int load_io) {
     load_cfg(&m->c, dir);
     st_init(&m->S, dir);
     /* Il checkpoint reale annida il modello testuale sotto il wrapper vision;
@@ -1338,28 +1348,41 @@ static void model_load(GModel *m, const char *dir) {
     if (!st_find(&m->S, probe)) snprintf(m->prefix, sizeof(m->prefix), "model.");
     const char *P = m->prefix;
 
-    m->embed = load_f32(m, "%sembed_tokens.weight", P);
-    m->final_norm = load_f32(m, "%snorm.weight", P);
+    if (layer_end < 0 || layer_end > m->c.n_layers) layer_end = m->c.n_layers;
+    if (layer_begin < 0) layer_begin = 0;
+    if (layer_begin > layer_end) layer_begin = layer_end;
+    m->layer_begin = layer_begin;
+    m->layer_end = layer_end;
+    m->has_io = load_io;
+
+    if (load_io) {
+        m->embed = load_f32(m, "%sembed_tokens.weight", P);
+        m->final_norm = load_f32(m, "%snorm.weight", P);
+    }
     /* La testa e' l'unica matrice grande fuori dagli esperti: a vocab 154880
      * per hidden 4096 sono 2,5 GB in f32, quindi passa dallo stesso
      * quantizzatore dei densi. Se il checkpoint la lega all'embedding, si
-     * riusa quella tabella cosi' com'e'. */
-    if (st_find(&m->S, "lm_head.weight")) {
-        m->head = load_mat(m, "lm_head.weight");
-    } else {
-        memset(&m->head, 0, sizeof(m->head));
-        m->head.f = m->embed;
-        m->head.rows = m->c.vocab;
-        m->head.columns = m->c.hidden;
+     * riusa quella tabella cosi' com'e'. Un segment che non tiene l'ultimo
+     * layer non la carica proprio: non ha logit da produrre. */
+    if (load_io) {
+        if (st_find(&m->S, "lm_head.weight")) {
+            m->head = load_mat(m, "lm_head.weight");
+        } else {
+            memset(&m->head, 0, sizeof(m->head));
+            m->head.f = m->embed;
+            m->head.rows = m->c.vocab;
+            m->head.columns = m->c.hidden;
+        }
     }
     m->layer = calloc((size_t)m->c.n_layers, sizeof(*m->layer));
 
     /* Streaming o residenti: lo decide il contenitore, non una variabile
      * d'ambiente. Si guarda il primo esperto del primo layer sparso. */
-    if (m->c.first_dense < m->c.n_layers) {
+    int probe_layer = m->c.first_dense > layer_begin ? m->c.first_dense : layer_begin;
+    if (probe_layer < layer_end) {
         char first[512];
         snprintf(first, sizeof(first), "%slayers.%d.mlp.experts.0.gate_proj.weight",
-                 P, m->c.first_dense);
+                 P, probe_layer);
         st_tensor *probe_expert = st_find(&m->S, first);
         if (!probe_expert) { fprintf(stderr, "manca %s\n", first); exit(1); }
         m->streaming = probe_expert->dtype == 3;
@@ -1370,7 +1393,7 @@ static void model_load(GModel *m, const char *dir) {
         expert_cache_init(m);
     }
 
-    for (int i = 0; i < m->c.n_layers; i++) {
+    for (int i = layer_begin; i < layer_end; i++) {
         GLayer *l = &m->layer[i];
         l->in_ln = load_f32(m, "%slayers.%d.input_layernorm.weight", P, i);
         l->post_ln = load_f32(m, "%slayers.%d.post_attention_layernorm.weight", P, i);
@@ -1604,6 +1627,143 @@ static void session_close(const GModel *m, GSession *s) {
     free(s);
 }
 
+/* I layer [begin, end) su `streams`, che entra e esce come H flussi residui
+ * per posizione. E' il pezzo che un segment esegue: prima e dopo ci sono
+ * l'embedding e la testa, che stanno agli estremi della catena e non in mezzo.
+ *
+ * `next` e' il secondo banco, della stessa misura: il passaggio li scambia a
+ * ogni sito, quindi alla fine il risultato puo' essere in uno o nell'altro, e
+ * la funzione restituisce quale. */
+static float *run_layers(GModel *m, GSession *s, float *streams, float *next,
+                         int n, int start, int begin, int end) {
+    const Cfg *c = &m->c;
+    const int H = c->hc_mult, D = c->hidden;
+    float *collapsed = malloc((size_t)n * D * sizeof(float));
+    float *normed = malloc((size_t)n * D * sizeof(float));
+    float *branch = malloc((size_t)n * D * sizeof(float));
+    float *post = malloc((size_t)n * H * sizeof(float));
+    float *comb = malloc((size_t)n * H * H * sizeof(float));
+    if (!collapsed || !normed || !branch || !post || !comb) {
+        fprintf(stderr, "OOM nei temporanei del passaggio\n"); exit(1);
+    }
+
+    for (int i = begin; i < end; i++) {
+        GLayer *l = &m->layer[i];
+        for (int site = 0; site < 2; site++) {
+            const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
+            const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
+            const float *scale = site ? l->hc_ffn_scale : l->hc_attn_scale;
+            for (int t = 0; t < n; t++)
+                coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
+                            comb + (size_t)t * H * H, streams + (size_t)t * H * D,
+                            fn, scale, base, H, D, c->hc_iters, c->eps, c->hc_eps);
+            for (int t = 0; t < n; t++)
+                rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
+                    site ? l->post_ln : l->in_ln, D, c->eps);
+            if (!site) {
+                GLayerState *st = &s->layer[i];
+                /* Lo stato non si azzera a ogni chiamata: e' della
+                 * conversazione, e azzerarlo qui vorrebbe dire ricominciare
+                 * la ricorrenza a ogni token generato. */
+                if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
+                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
+                               s->kda_scratch);
+            } else {
+                ffn_layer(m, l, i, normed, n, branch);
+            }
+            for (int t = 0; t < n; t++)
+                coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
+                             streams + (size_t)t * H * D, post + (size_t)t * H,
+                             comb + (size_t)t * H * H, H, D);
+            float *swap = streams; streams = next; next = swap;
+        }
+    }
+    free(comb); free(post); free(branch); free(normed); free(collapsed);
+    return streams;
+}
+
+/* Rilascio completo del modello.
+ *
+ * Una CLI che finisce lascia fare al sistema operativo; un ospite che tiene
+ * piu' motori nello stesso processo no, e un motore che non si smonta diventa
+ * una perdita per richiesta. Ogni allocazione fatta dal caricamento ha qui il
+ * suo rilascio, l'indice dei tensori compreso. */
+static void mat_release(Mat *mat) {
+    free((void *)mat->f); free((void *)mat->q8);
+    free((void *)mat->q4); free((void *)mat->s);
+    memset(mat, 0, sizeof(*mat));
+}
+
+static void model_release(GModel *m) {
+    if (!m) return;
+    if (m->layer) {
+        for (int i = m->layer_begin; i < m->layer_end; i++) {
+            GLayer *l = &m->layer[i];
+            Mat *mats[] = { &l->kq, &l->kk, &l->kv, &l->ko, &l->kga, &l->kgb,
+                            &l->kfa, &l->kfb, &l->kb, &l->qa, &l->qb, &l->kva,
+                            &l->kvb_kt, &l->kvb_v, &l->o, &l->iwq, &l->iwk,
+                            &l->iwp, &l->ikpg, &l->dg, &l->du, &l->dd,
+                            &l->rg, &l->ru, &l->rd };
+            for (size_t k = 0; k < sizeof(mats) / sizeof(*mats); k++) mat_release(mats[k]);
+            const float *vectors[] = { l->in_ln, l->post_ln, l->hc_attn_fn,
+                                       l->hc_attn_base, l->hc_attn_scale,
+                                       l->hc_ffn_fn, l->hc_ffn_base, l->hc_ffn_scale,
+                                       l->conv, l->dt, l->alog, l->onorm,
+                                       l->qa_ln, l->kva_ln, l->ik_nw, l->ik_nb,
+                                       l->ikpa, l->router, l->rbias };
+            for (size_t k = 0; k < sizeof(vectors) / sizeof(*vectors); k++)
+                free((void *)vectors[k]);
+            if (!m->streaming && l->eg) {
+                for (int e = 0; e < m->c.n_experts; e++) {
+                    mat_release(&l->eg[e]); mat_release(&l->eu[e]); mat_release(&l->ed[e]);
+                }
+            }
+            free(l->eg); free(l->eu); free(l->ed);
+        }
+        free(m->layer);
+    }
+    if (m->ecache) {
+        for (int i = 0; i < m->c.n_layers; i++) {
+            LCache *cache = &m->ecache[i];
+            for (int j = 0; j < cache->cap; j++) free(cache->s[j].base);
+            free(cache->s);
+        }
+        free(m->ecache);
+    }
+    free(m->eref);
+    if (m->vblocks) {
+        for (int b = 0; b < m->c.vis_layers; b++) {
+            ColiVisionBlock *vb = &m->vblocks[b];
+            const float *parts[] = { vb->norm1, vb->norm2, vb->qkv_w, vb->qkv_b,
+                                     vb->q_norm, vb->k_norm, vb->proj_w, vb->proj_b,
+                                     vb->gate_w, vb->gate_b, vb->up_w, vb->up_b,
+                                     vb->down_w, vb->down_b };
+            for (size_t k = 0; k < sizeof(parts) / sizeof(*parts); k++)
+                free((void *)parts[k]);
+        }
+        free(m->vblocks);
+        const float *tower[] = { m->vision.patch_w, m->vision.patch_b,
+                                 m->vision.post_norm, m->vision.down_w,
+                                 m->vision.down_b, m->vision.merger_proj,
+                                 m->vision.merger_norm_w, m->vision.merger_norm_b,
+                                 m->vision.merger_gate, m->vision.merger_up,
+                                 m->vision.merger_down };
+        for (size_t k = 0; k < sizeof(tower) / sizeof(*tower); k++) free((void *)tower[k]);
+    }
+    /* La testa puo' essere la tabella degli embedding: liberarla due volte
+     * sarebbe un doppio free, non un risparmio. */
+    if (m->head.f != m->embed) mat_release(&m->head);
+    free((void *)m->embed);
+    free((void *)m->final_norm);
+    st_destroy(&m->S);
+    memset(m, 0, sizeof(*m));
+}
+
+/* Il caso pieno: tutti i layer, embedding e testa comprese. */
+static void model_load(GModel *m, const char *dir) {
+    model_load_range(m, dir, 0, -1, 1);
+}
+
 /* ---------- il passaggio completo ----------
  *
  * `vision` sono gli embedding usciti dalla torre, `n_vision` quanti sono: uno
@@ -1623,11 +1783,6 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     const int H = c->hc_mult, D = c->hidden;
     float *streams = malloc((size_t)n * H * D * sizeof(float));
     float *next = malloc((size_t)n * H * D * sizeof(float));
-    float *collapsed = malloc((size_t)n * D * sizeof(float));
-    float *normed = malloc((size_t)n * D * sizeof(float));
-    float *branch = malloc((size_t)n * D * sizeof(float));
-    float *post = malloc((size_t)n * H * sizeof(float));
-    float *comb = malloc((size_t)n * H * H * sizeof(float));
     /* l'embedding entra replicato in ognuno degli H flussi residui; sui token
      * immagine la riga viene dalla torre invece che dalla tabella */
     int consumed = 0;
@@ -1662,37 +1817,13 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
         exit(1);
     }
 
-    for (int i = 0; i < c->n_layers; i++) {
-        GLayer *l = &m->layer[i];
-        for (int site = 0; site < 2; site++) {
-            const float *fn = site ? l->hc_ffn_fn : l->hc_attn_fn;
-            const float *base = site ? l->hc_ffn_base : l->hc_attn_base;
-            const float *scale = site ? l->hc_ffn_scale : l->hc_attn_scale;
-            for (int t = 0; t < n; t++)
-                coli_hc_pre(collapsed + (size_t)t * D, post + (size_t)t * H,
-                            comb + (size_t)t * H * H, streams + (size_t)t * H * D,
-                            fn, scale, base, H, D, c->hc_iters, c->eps, c->hc_eps);
-            for (int t = 0; t < n; t++)
-                rms(normed + (size_t)t * D, collapsed + (size_t)t * D,
-                    site ? l->post_ln : l->in_ln, D, c->eps);
-            if (!site) {
-                GLayerState *st = &s->layer[i];
-                /* Lo stato non si azzera piu' a ogni chiamata: e' della
-                 * conversazione, e azzerarlo qui vorrebbe dire ricominciare
-                 * la ricorrenza a ogni token generato. */
-                if (c->is_full[i]) mla_layer(c, l, normed, n, branch, st, start);
-                else kda_layer(c, l, normed, n, branch, st->kda_state, st->kda_window,
-                               s->kda_scratch);
-            } else {
-                ffn_layer(m, l, i, normed, n, branch);
-            }
-            for (int t = 0; t < n; t++)
-                coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
-                             streams + (size_t)t * H * D, post + (size_t)t * H,
-                             comb + (size_t)t * H * H, H, D);
-            float *swap = streams; streams = next; next = swap;
-        }
-    }
+    streams = run_layers(m, s, streams, next, n, start,
+                         m->layer_begin, m->layer_end);
+
+    float *collapsed = malloc((size_t)n * D * sizeof(float));
+    float *normed = malloc((size_t)n * D * sizeof(float));
+    if (!collapsed || !normed) { fprintf(stderr, "OOM in chiusura\n"); exit(1); }
+
     /* i flussi si richiudono con una media NON pesata */
     for (int t = 0; t < n; t++)
         for (int d = 0; d < D; d++) {
@@ -1707,7 +1838,7 @@ static float *forward_span(GModel *m, GSession *s, const int *tokens, int n,
     for (int t = 0; t < n; t++)
         mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
 
-    free(comb); free(post); free(branch); free(normed); free(collapsed);
+    free(normed); free(collapsed);
     free(next); free(streams);
     s->filled = start + n;
     return logits;
@@ -2162,6 +2293,7 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
     }
 }
 
+#ifndef GLM53_NO_MAIN
 int main(int argc, char **argv) {
     const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
@@ -2324,3 +2456,511 @@ int main(int argc, char **argv) {
     free(tokens);
     return 0;
 }
+#endif /* GLM53_NO_MAIN */
+
+/* ================= segment adapter =================
+ *
+ * Un segment esegue un INTERVALLO di layer su attivazioni, non un modello
+ * intero su token: entrano H flussi residui per posizione, escono gli stessi
+ * flussi dopo quei layer. Embedding e testa stanno agli estremi della catena e
+ * non in mezzo, quindi qui non si caricano proprio.
+ *
+ * Lo stato della conversazione appartiene alla sessione, i pesi al motore. Un
+ * ospite puo' tenere piu' motori nello stesso processo, quindi qui non ci sono
+ * variabili globali e ogni allocazione ha il suo rilascio.
+ */
+#ifdef COLI_SEGMENT_ADAPTER
+#include <pthread.h>
+#include "segment_runtime.h"
+#include "segment_adapters.h"
+#include "segment_adapter_internal.h"
+
+typedef struct {
+    GModel model;
+    uint32_t layer_begin, layer_end, context_tokens, state_width;
+    pthread_mutex_t run_lock;
+} Glm53SegmentEngine;
+
+typedef struct {
+    Glm53SegmentEngine *engine;
+    GSession *session;
+    uint32_t context_tokens, position;
+} Glm53SegmentSession;
+
+/* I pezzi di stato che uno snapshot deve portarsi dietro, nell'ordine in cui
+ * si scrivono. Un layer DSA tiene il latente MLA e le due file dell'indexer,
+ * un layer KDA la ricorrenza e la finestra della convoluzione. */
+static size_t glm53_segment_spans(const Glm53SegmentEngine *engine,
+                                  const Glm53SegmentSession *session,
+                                  ColiSegmentStateSpan *spans, size_t capacity) {
+    const Cfg *c = &engine->model.c;
+    const size_t cap = session->context_tokens;
+    size_t count = 0;
+    for (uint32_t i = engine->layer_begin; i < engine->layer_end; i++) {
+        GLayerState *st = &session->session->layer[i];
+        if (c->is_full[i]) {
+            if (count + 3 > capacity) return 0;
+            spans[count++] = (ColiSegmentStateSpan){ st->latent, cap * (size_t)c->kv_lora * sizeof(float) };
+            spans[count++] = (ColiSegmentStateSpan){ st->ikeys, cap * (size_t)c->index_hd * sizeof(float) };
+            spans[count++] = (ColiSegmentStateSpan){ st->igates, cap * (size_t)c->index_hd * sizeof(float) };
+        } else if (c->kda_proj) {
+            if (count + 2 > capacity) return 0;
+            spans[count++] = (ColiSegmentStateSpan){
+                st->kda_state, (size_t)c->kda_heads * c->kda_hd * c->kda_hd * sizeof(float) };
+            spans[count++] = (ColiSegmentStateSpan){
+                st->kda_window, 3u * (size_t)c->kda_proj * c->conv_k * sizeof(float) };
+        }
+    }
+    return count;
+}
+
+#define GLM53_SEGMENT_MAX_SPANS 512
+
+static int glm53_segment_engine_open(void **engine_impl,
+                                     ColiSegmentCapabilities *capabilities,
+                                     const ColiSegmentEngineOptions *options,
+                                     char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options || !options->model_dir)
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment needs a model directory");
+    Glm53SegmentEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_segment_adapter_error(error, error_size,
+                                          "out of memory opening GLM-5.3 Segment");
+
+    /* Solo i layer chiesti: e' quello che promette RANGE_NATIVE, e caricare il
+     * resto vorrebbe dire tenere in RAM i pesi che macina un'altra macchina. */
+    const int begin = (int)options->layer_begin;
+    const int end = options->layer_end ? (int)options->layer_end : -1;
+    model_load_range(&engine->model, options->model_dir, begin, end, 0);
+    engine->layer_begin = (uint32_t)engine->model.layer_begin;
+    engine->layer_end = (uint32_t)engine->model.layer_end;
+    engine->context_tokens = options->context_tokens ? options->context_tokens : 4096u;
+    engine->state_width = (uint32_t)(engine->model.c.hc_mult * engine->model.c.hidden);
+    pthread_mutex_init(&engine->run_lock, NULL);
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = (uint32_t)sizeof(*capabilities);
+    capabilities->abi_version = COLI_SEGMENT_ABI_VERSION;
+    capabilities->flags = COLI_SEGMENT_CAP_SNAPSHOT | COLI_SEGMENT_CAP_RANGE_NATIVE |
+                          COLI_SEGMENT_CAP_MULTI_SESSION | COLI_SEGMENT_CAP_CPU;
+    coli_segment_capability_string(capabilities->engine_id,
+                                   sizeof(capabilities->engine_id), "glm53");
+    coli_segment_capability_string(capabilities->state_schema,
+                                   sizeof(capabilities->state_schema),
+                                   "glm53/mla-latent-kda-conv-dsa-f32-v1");
+    /* Ogni leva che cambia i numeri deve comparire qui: due ospiti costruiti
+     * diversamente si scambierebbero snapshot incompatibili in silenzio. */
+    snprintf(capabilities->numeric_class, sizeof(capabilities->numeric_class),
+             "glm53/q%d-i4g64-experts/f32/cpu-v1", glm53_dense_bits());
+    capabilities->state_dtype = COLI_SEGMENT_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->max_batch_rows = engine->context_tokens;
+    capabilities->max_context_tokens = engine->context_tokens;
+    /* Il totale del modello, non quanti ne possiede questo segment: il
+     * runtime ci confronta layer_end, che e' un indice assoluto. */
+    capabilities->num_layers = (uint32_t)engine->model.c.n_layers;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void glm53_segment_engine_destroy(void *engine_impl) {
+    Glm53SegmentEngine *engine = (Glm53SegmentEngine *)engine_impl;
+    if (!engine) return;
+    pthread_mutex_destroy(&engine->run_lock);
+    model_release(&engine->model);
+    free(engine);
+}
+
+static int glm53_segment_session_create(void *engine_impl, void **session_impl,
+                                        const ColiSegmentSessionOptions *options,
+                                        char *error, size_t error_size) {
+    Glm53SegmentEngine *engine = (Glm53SegmentEngine *)engine_impl;
+    if (!engine || !session_impl)
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment session needs an engine");
+    Glm53SegmentSession *session = calloc(1, sizeof(*session));
+    if (!session)
+        return coli_segment_adapter_error(error, error_size,
+                                          "out of memory creating a GLM-5.3 session");
+    session->engine = engine;
+    session->context_tokens = (options && options->context_tokens)
+                              ? options->context_tokens : engine->context_tokens;
+    if (session->context_tokens > engine->context_tokens)
+        session->context_tokens = engine->context_tokens;
+    session->session = session_open(&engine->model, (int)session->context_tokens);
+    session->position = 0;
+    *session_impl = session;
+    return 0;
+}
+
+static void glm53_segment_session_destroy(void *session_impl) {
+    Glm53SegmentSession *session = (Glm53SegmentSession *)session_impl;
+    if (!session) return;
+    session_close(&session->engine->model, session->session);
+    free(session);
+}
+
+static int glm53_segment_session_run(void *session_impl,
+                                     const ColiSegmentRunRequest *request,
+                                     char *error, size_t error_size) {
+    Glm53SegmentSession *session = (Glm53SegmentSession *)session_impl;
+    if (!session || !request)
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment run needs a request");
+    if (request->position != session->position)
+        return coli_segment_adapter_error(
+            error, error_size, "GLM-5.3 Segment requires contiguous positions");
+    if (request->should_cancel && request->should_cancel(request->cancel_user_data))
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment run cancelled");
+    Glm53SegmentEngine *engine = session->engine;
+    const size_t width = engine->state_width;
+    size_t cells;
+    if (coli_segment_size_mul(request->rows, width, &cells))
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 boundary state overflows");
+    if (request->input_bytes < cells * sizeof(float) ||
+        request->output_bytes < cells * sizeof(float))
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment buffers are too small");
+    if (session->position + request->rows > session->context_tokens)
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment context is full");
+
+    float *streams = malloc(cells * sizeof(float));
+    float *next = malloc(cells * sizeof(float));
+    if (!streams || !next) {
+        free(streams); free(next);
+        return coli_segment_adapter_error(error, error_size,
+                                          "out of memory running GLM-5.3 Segment");
+    }
+    memcpy(streams, request->input, cells * sizeof(float));
+
+    pthread_mutex_lock(&engine->run_lock);
+    float *result = run_layers(&engine->model, session->session, streams, next,
+                               (int)request->rows, (int)session->position,
+                               (int)engine->layer_begin, (int)engine->layer_end);
+    session->session->filled = (int)(session->position + request->rows);
+    pthread_mutex_unlock(&engine->run_lock);
+
+    memcpy(request->output, result, cells * sizeof(float));
+    free(streams); free(next);
+    session->position += request->rows;
+    return 0;
+}
+
+static int glm53_segment_session_snapshot(void *session_impl,
+                                          ColiSegmentWriteFn write_fn,
+                                          void *write_user_data,
+                                          char *error, size_t error_size) {
+    Glm53SegmentSession *session = (Glm53SegmentSession *)session_impl;
+    if (!session || !write_fn)
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment snapshot needs a sink");
+    ColiSegmentStateSpan spans[GLM53_SEGMENT_MAX_SPANS];
+    const size_t count = glm53_segment_spans(session->engine, session, spans,
+                                             GLM53_SEGMENT_MAX_SPANS);
+    size_t bytes = 0;
+    if (coli_segment_spans_size(spans, count, &bytes))
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment state overflows");
+    ColiSegmentSnapshotHeader header;
+    coli_segment_snapshot_header_init(&header, "glm53", session->engine->layer_begin,
+                                      session->engine->layer_end,
+                                      session->context_tokens, session->position,
+                                      bytes,
+                                      coli_segment_spans_hash(spans, count));
+    if (coli_segment_stream_write(write_fn, write_user_data, &header, sizeof(header),
+                                  error, error_size))
+        return -1;
+    return coli_segment_spans_write(spans, count, write_fn, write_user_data,
+                                    error, error_size);
+}
+
+static int glm53_segment_session_restore(void *session_impl,
+                                         ColiSegmentReadFn read_fn,
+                                         void *read_user_data,
+                                         char *error, size_t error_size) {
+    Glm53SegmentSession *session = (Glm53SegmentSession *)session_impl;
+    if (!session || !read_fn)
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment restore needs a source");
+    ColiSegmentStateSpan spans[GLM53_SEGMENT_MAX_SPANS];
+    const size_t count = glm53_segment_spans(session->engine, session, spans,
+                                             GLM53_SEGMENT_MAX_SPANS);
+    size_t bytes = 0;
+    if (coli_segment_spans_size(spans, count, &bytes))
+        return coli_segment_adapter_error(error, error_size,
+                                          "GLM-5.3 Segment state overflows");
+    ColiSegmentSnapshotHeader header;
+    if (coli_segment_stream_read(read_fn, read_user_data, &header, sizeof(header),
+                                 error, error_size))
+        return -1;
+    if (coli_segment_snapshot_header_valid(&header, "glm53",
+                                           session->engine->layer_begin,
+                                           session->engine->layer_end,
+                                           session->context_tokens, bytes,
+                                           error, error_size))
+        return -1;
+    if (coli_segment_spans_restore(spans, count, header.payload_hash, read_fn,
+                                   read_user_data, error, error_size))
+        return -1;
+    session->position = header.position;
+    session->session->filled = (int)header.position;
+    return 0;
+}
+
+static const ColiSegmentAdapter glm53_segment_adapter = {
+    sizeof(ColiSegmentAdapter), COLI_SEGMENT_ABI_VERSION, "glm53",
+    glm53_segment_engine_open, glm53_segment_engine_destroy,
+    glm53_segment_session_create, glm53_segment_session_destroy,
+    glm53_segment_session_run, glm53_segment_session_snapshot,
+    glm53_segment_session_restore, {0}
+};
+
+int coli_glm53_segment_adapter_register(void) {
+    return coli_segment_adapter_register(&glm53_segment_adapter);
+}
+#endif /* COLI_SEGMENT_ADAPTER */
+
+/* ================= edge adapter =================
+ *
+ * I due capi della catena: da una parte i token diventano stato, dall'altra lo
+ * stato torna token. In mezzo ci sono i segment, che di token non sanno nulla.
+ *
+ * Qui servono l'embedding, la norma finale, la testa e il tokenizzatore, e NON
+ * serve nessun layer: si carica esattamente quello.
+ */
+#ifdef COLI_EDGE_ADAPTER
+#include "edge_runtime.h"
+#include "edge_adapters.h"
+#include "edge_adapter_internal.h"
+
+typedef struct {
+    GModel model;
+    Tok tokenizer;
+    int has_tokenizer;
+    uint32_t state_width;
+} Glm53EdgeEngine;
+
+static int glm53_edge_engine_open(void **engine_impl,
+                                  ColiEdgeCapabilities *capabilities,
+                                  const ColiEdgeEngineOptions *options,
+                                  char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options || !options->model_dir)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge needs a model directory");
+    Glm53EdgeEngine *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory opening GLM-5.3 Edge");
+    /* Nessun layer: i capi della catena non ne eseguono. */
+    model_load_range(&engine->model, options->model_dir, 0, 0, 1);
+    engine->state_width = (uint32_t)(engine->model.c.hc_mult * engine->model.c.hidden);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/tokenizer.json", options->model_dir);
+    FILE *probe = fopen(path, "rb");
+    if (probe) {
+        fclose(probe);
+        tok_load(&engine->tokenizer, path);
+        engine->has_tokenizer = 1;
+    }
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = (uint32_t)sizeof(*capabilities);
+    capabilities->abi_version = COLI_EDGE_ABI_VERSION;
+    /* Le bandiere devono corrispondere ai puntatori che l'adapter fornisce:
+     * il runtime rifiuta chi dichiara meno o piu' di quello che ha. Il
+     * tokenizzatore puo' mancare in un checkpoint di sola matematica. */
+    capabilities->flags = COLI_EDGE_CAP_CPU | COLI_EDGE_CAP_GREEDY;
+    if (engine->has_tokenizer)
+        capabilities->flags |= COLI_EDGE_CAP_TOKENIZE | COLI_EDGE_CAP_DETOKENIZE;
+    coli_edge_capability_string(capabilities->engine_id,
+                                sizeof(capabilities->engine_id), "glm53");
+    coli_edge_capability_string(capabilities->state_schema,
+                                sizeof(capabilities->state_schema),
+                                "glm53/mla-latent-kda-conv-dsa-f32-v1");
+    snprintf(capabilities->numeric_class, sizeof(capabilities->numeric_class),
+             "glm53/q%d-i4g64-experts/f32/cpu-v1", glm53_dense_bits());
+    coli_edge_capability_string(capabilities->tokenizer_class,
+                                sizeof(capabilities->tokenizer_class),
+                                engine->has_tokenizer ? "glm53/bpe" : "none");
+    capabilities->state_dtype = COLI_EDGE_DTYPE_F32;
+    capabilities->state_width = engine->state_width;
+    capabilities->vocab_size = (uint32_t)engine->model.c.vocab;
+    capabilities->max_batch_rows = 1024;
+    capabilities->max_context_tokens = 0;   /* lo decide il chiamante */
+    capabilities->num_layers = (uint32_t)engine->model.c.n_layers;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    *engine_impl = engine;
+    return 0;
+}
+
+static void glm53_edge_engine_destroy(void *engine_impl) {
+    Glm53EdgeEngine *engine = (Glm53EdgeEngine *)engine_impl;
+    if (!engine) return;
+    if (engine->has_tokenizer) tok_free(&engine->tokenizer);
+    model_release(&engine->model);
+    free(engine);
+}
+
+static int glm53_edge_tokenize(void *engine_impl, const char *text,
+                               size_t text_bytes, int32_t *token_ids,
+                               size_t token_capacity, size_t *token_count,
+                               char *error, size_t error_size) {
+    Glm53EdgeEngine *engine = (Glm53EdgeEngine *)engine_impl;
+    if (!engine || !engine->has_tokenizer)
+        return coli_edge_adapter_error(error, error_size,
+                                       "this GLM-5.3 checkpoint carries no tokenizer");
+    if (!text || !token_count || text_bytes > (size_t)INT_MAX)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge tokenize got bad arguments");
+    /* Giro di dimensionamento: il chiamante chiede quanti token servono prima
+     * di allocare, e passa un buffer vuoto. Va risposto, non rifiutato.
+     * Il tetto e' un token per byte, che con un vocabolario a livello di byte
+     * e' il caso peggiore vero e non una stima. */
+    const int ceiling = (int)text_bytes + 1;
+    const int room = (token_ids && token_capacity) ? (int)token_capacity : ceiling;
+    int *scratch = malloc((size_t)(room > 0 ? room : 1) * sizeof(int));
+    if (!scratch)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory tokenizing");
+    const int produced = tok_encode(&engine->tokenizer, text, (int)text_bytes,
+                                    scratch, room);
+    if (token_ids && token_capacity)
+        for (int i = 0; i < produced && (size_t)i < token_capacity; i++)
+            token_ids[i] = (int32_t)scratch[i];
+    free(scratch);
+    *token_count = (size_t)produced;
+    return 0;
+}
+
+static int glm53_edge_detokenize(void *engine_impl, const int32_t *token_ids,
+                                 size_t token_count, char *text,
+                                 size_t text_capacity, size_t *text_bytes,
+                                 char *error, size_t error_size) {
+    Glm53EdgeEngine *engine = (Glm53EdgeEngine *)engine_impl;
+    if (!engine || !engine->has_tokenizer)
+        return coli_edge_adapter_error(error, error_size,
+                                       "this GLM-5.3 checkpoint carries no tokenizer");
+    if (!token_ids || !text_bytes || token_count > (size_t)INT_MAX)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge detokenize got bad arguments");
+    int *scratch = malloc(token_count ? token_count * sizeof(int) : sizeof(int));
+    if (!scratch)
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory detokenizing");
+    for (size_t i = 0; i < token_count; i++) scratch[i] = (int)token_ids[i];
+    /* Anche qui il primo giro puo' essere solo per la misura. Un token del
+     * vocabolario piu' lungo limita quanto puo' venire fuori. */
+    char *sink = NULL;
+    size_t room = text_capacity;
+    if (!text || !text_capacity) {
+        room = token_count * 512u + 1u;
+        sink = malloc(room);
+        if (!sink) {
+            free(scratch);
+            return coli_edge_adapter_error(error, error_size,
+                                           "out of memory detokenizing");
+        }
+    }
+    const int written = tok_decode(&engine->tokenizer, scratch, (int)token_count,
+                                   sink ? sink : text, (int)room);
+    free(scratch);
+    free(sink);
+    *text_bytes = (size_t)written;
+    return 0;
+}
+
+/* Token -> stato iniziale: l'embedding entra replicato in ognuno degli
+ * hc_mult flussi residui, che e' esattamente come parte il passaggio. */
+static int glm53_edge_embed(void *engine_impl, const ColiEdgeEmbedRequest *request,
+                            char *error, size_t error_size) {
+    Glm53EdgeEngine *engine = (Glm53EdgeEngine *)engine_impl;
+    if (!engine || !request || !request->token_ids || !request->output)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge embed got bad arguments");
+    const Cfg *c = &engine->model.c;
+    const size_t width = engine->state_width;
+    if (request->output_bytes < (size_t)request->rows * width * sizeof(float))
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge embed output is too small");
+    float *output = (float *)request->output;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        const int32_t token = request->token_ids[row];
+        if (token < 0 || token >= c->vocab)
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM-5.3 token ID is out of range");
+        const float *source = engine->model.embed + (size_t)token * c->hidden;
+        float *state = output + (size_t)row * width;
+        for (int h = 0; h < c->hc_mult; h++)
+            memcpy(state + (size_t)h * c->hidden, source,
+                   (size_t)c->hidden * sizeof(float));
+    }
+    return 0;
+}
+
+/* Stato finale -> token. I flussi si richiudono con una media NON pesata, poi
+ * la norma finale e la testa: le stesse tre righe con cui finisce il
+ * passaggio, perche' un capo che chiudesse diversamente darebbe token diversi
+ * dallo stesso stato. */
+static int glm53_edge_select(void *engine_impl, const ColiEdgeSelectRequest *request,
+                             char *error, size_t error_size) {
+    Glm53EdgeEngine *engine = (Glm53EdgeEngine *)engine_impl;
+    if (!engine || !request || !request->input || !request->token_ids)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge select got bad arguments");
+    const Cfg *c = &engine->model.c;
+    const int H = c->hc_mult, D = c->hidden;
+    const size_t width = engine->state_width;
+    if (request->input_bytes < (size_t)request->rows * width * sizeof(float) ||
+        request->token_capacity < request->rows)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge select buffers are too small");
+    float *collapsed = malloc((size_t)D * sizeof(float));
+    float *normed = malloc((size_t)D * sizeof(float));
+    float *logits = malloc((size_t)c->vocab * sizeof(float));
+    if (!collapsed || !normed || !logits) {
+        free(collapsed); free(normed); free(logits);
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory selecting");
+    }
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(collapsed); free(normed); free(logits);
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM-5.3 Edge select cancelled");
+        }
+        const float *streams = input + (size_t)row * width;
+        for (int d = 0; d < D; d++) {
+            float sum = 0.0f;
+            for (int h = 0; h < H; h++) sum += streams[(size_t)h * D + d];
+            collapsed[d] = sum / H;
+        }
+        rms(normed, collapsed, engine->model.final_norm, D, c->eps);
+        mv(logits, &engine->model.head, normed);
+        const int best = argmax(logits, c->vocab);
+        request->token_ids[row] = (int32_t)best;
+        if (request->scores && request->score_capacity > row)
+            request->scores[row] = logits[best];
+    }
+    free(collapsed); free(normed); free(logits);
+    return 0;
+}
+
+static const ColiEdgeAdapter glm53_edge_adapter = {
+    sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "glm53",
+    glm53_edge_engine_open, glm53_edge_engine_destroy,
+    glm53_edge_tokenize, glm53_edge_detokenize,
+    glm53_edge_embed, glm53_edge_select, {0}
+};
+
+int coli_glm53_edge_adapter_register(void) {
+    return coli_edge_adapter_register(&glm53_edge_adapter);
+}
+#endif /* COLI_EDGE_ADAPTER */

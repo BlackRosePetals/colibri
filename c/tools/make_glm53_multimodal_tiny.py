@@ -38,8 +38,11 @@ HIDDEN = 128
 # Il vocabolario deve contenere il tokenizzatore vero che il fixture porta con
 # se': 256 byte piu' i marcatori di GLM. Il token immagine e' uno di quelli,
 # non un numero scelto a caso, cosi' un prompt scritto a mano puo' nominarlo.
-VOCAB = 320
-IMAGE_TOKEN = None            # risolto dal tokenizzatore in build()
+# Esattamente quanti id definisce il tokenizzatore: 256 byte piu' i
+# marcatori. Un vocabolario piu' largo lascerebbe al modello id che nessuna
+# stringa rappresenta, e la prima cosa che ci inciampa e' la decodifica.
+VOCAB = None                  # risolto dal tokenizzatore in build()
+IMAGE_TOKEN = None
 
 VIS_DEPTH, VIS_HIDDEN, VIS_HEADS, VIS_INTER = 2, 64, 4, 128
 PATCH, TEMPORAL, MERGE, IN_CHANNELS = 4, 2, 2, 3
@@ -189,6 +192,7 @@ def build(output: Path, seed: int) -> int:
     from make_glm53_tokenizer import SPECIALS, build as build_tokenizer
     build_tokenizer(output / "tokenizer.json")
     image_token = 256 + SPECIALS.index("<|image|>")
+    text_config = dict(TEXT_CONFIG, vocab_size=256 + len(SPECIALS))
     n_image = (GRID_H // MERGE) * (GRID_W // MERGE)
     prompt = ([ord(ch) for ch in PROMPT_TEXT_BEFORE]
               + [image_token] * n_image
@@ -203,7 +207,7 @@ def build(output: Path, seed: int) -> int:
         in_channels=IN_CHANNELS, image_size=PATCH * GRID_H,
     )
     config = Glm5NextConfig(
-        text_config=Glm5NextTextConfig(**TEXT_CONFIG),
+        text_config=Glm5NextTextConfig(**text_config),
         vision_config=vision_config,
         image_token_id=image_token,
     )
@@ -257,6 +261,15 @@ def build(output: Path, seed: int) -> int:
             greedy.append(nxt)
             sequence.append(nxt)
 
+        # Una traccia di SOLO TESTO, per i cancelli segment ed edge: quella
+        # pila non ha la torre vision, quindi confrontarla con una risposta
+        # che dipende dall'immagine sarebbe chiederle di indovinare.
+        text_only = [ord(ch) for ch in PROMPT_TEXT_BEFORE + PROMPT_TEXT_AFTER]
+        text_sequence = list(text_only)
+        for _ in range(GREEDY_STEPS):
+            step = model(input_ids=torch.tensor([text_sequence], dtype=torch.long)).logits[0]
+            text_sequence.append(int(step[-1].argmax()))
+
         # Guardia: un'altra immagine deve dare un'altra risposta. Se non
         # cambia nulla, questo fixture non e' in grado di accorgersi di una
         # vision rotta e non va scritto, per quanto passi.
@@ -301,6 +314,10 @@ def build(output: Path, seed: int) -> int:
         # selezione dell'indexer e' passata da un pareggio e il seguito
         # dipende dall'ordine interno di torch.topk, non dal modello.
         "greedy_exact_steps": exact_steps,
+        # Nomi che i test condivisi di segment/edge si aspettano, sulla
+        # traccia senza immagine.
+        "prompt_ids": text_only,
+        "full_ids": text_sequence,
         "last_logits": logits[-1].tolist(),
     }
     (output / "ref.json").write_text(json.dumps(reference, indent=2), encoding="utf-8")

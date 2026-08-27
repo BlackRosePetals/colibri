@@ -48,12 +48,14 @@ static int32_t *read_ids(jval *object, const char *key, int *count) {
 
 static int register_all(void) {
     return coli_glm_segment_adapter_register() ||
+           coli_glm53_segment_adapter_register() ||
            coli_inkling_segment_adapter_register() ||
            coli_kimi_segment_adapter_register() ||
            coli_olmoe_segment_adapter_register() ||
            coli_qwen36_segment_adapter_register() ||
            coli_deepseek_v4_segment_adapter_register() ||
            coli_glm_edge_adapter_register() ||
+           coli_glm53_edge_adapter_register() ||
            coli_inkling_edge_adapter_register() ||
            coli_kimi_edge_adapter_register() ||
            coli_olmoe_edge_adapter_register() ||
