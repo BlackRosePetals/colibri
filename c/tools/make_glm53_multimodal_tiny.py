@@ -24,7 +24,10 @@ from __future__ import annotations
 import argparse
 import json
 from contextlib import contextmanager
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 EXPECTED_TRANSFORMERS = "5.16.1"
 SEED = 1253
@@ -32,8 +35,11 @@ SEED = 1253
 # La torre esce a OUT_HIDDEN e il flusso testuale entra a HIDDEN: il merger e'
 # il pezzo che li fa combaciare, quindi devono essere lo stesso numero.
 HIDDEN = 128
-VOCAB = 128
-IMAGE_TOKEN = 100
+# Il vocabolario deve contenere il tokenizzatore vero che il fixture porta con
+# se': 256 byte piu' i marcatori di GLM. Il token immagine e' uno di quelli,
+# non un numero scelto a caso, cosi' un prompt scritto a mano puo' nominarlo.
+VOCAB = 320
+IMAGE_TOKEN = None            # risolto dal tokenizzatore in build()
 
 VIS_DEPTH, VIS_HIDDEN, VIS_HEADS, VIS_INTER = 2, 64, 4, 128
 PATCH, TEMPORAL, MERGE, IN_CHANNELS = 4, 2, 2, 3
@@ -87,7 +93,8 @@ TEXT_CONFIG = {
 # 8 posizioni, 4 delle quali sono l'immagine, e non all'inizio: se il motore
 # sbagliasse allineamento con un offset costante, un blocco in testa lo
 # nasconderebbe.
-PROMPT = [2, 3, IMAGE_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN, IMAGE_TOKEN, 5, 6]
+PROMPT_TEXT_BEFORE = "gu"     # due byte prima dell'immagine
+PROMPT_TEXT_AFTER = "xy"      # due byte dopo, per vedere se l'allineamento slitta
 GREEDY_STEPS = 4
 
 
@@ -163,7 +170,7 @@ def to_checkpoint_names(tensors, torch):
     return renamed
 
 
-def build(output: Path) -> int:
+def build(output: Path, seed: int) -> int:
     import torch
     import transformers
     from safetensors.torch import save_file
@@ -177,7 +184,17 @@ def build(output: Path) -> int:
               f"found {transformers.__version__}")
         return 2
 
-    torch.manual_seed(SEED)
+    output.mkdir(parents=True, exist_ok=True)
+    # Il tokenizzatore del fixture, e da li' l'id del token immagine.
+    from make_glm53_tokenizer import SPECIALS, build as build_tokenizer
+    build_tokenizer(output / "tokenizer.json")
+    image_token = 256 + SPECIALS.index("<|image|>")
+    n_image = (GRID_H // MERGE) * (GRID_W // MERGE)
+    prompt = ([ord(ch) for ch in PROMPT_TEXT_BEFORE]
+              + [image_token] * n_image
+              + [ord(ch) for ch in PROMPT_TEXT_AFTER])
+
+    torch.manual_seed(seed)
     vision_config = Glm5NextVisionConfig(
         depth=VIS_DEPTH, hidden_size=VIS_HIDDEN, num_heads=VIS_HEADS,
         intermediate_size=VIS_INTER, patch_size=PATCH,
@@ -188,7 +205,7 @@ def build(output: Path) -> int:
     config = Glm5NextConfig(
         text_config=Glm5NextTextConfig(**TEXT_CONFIG),
         vision_config=vision_config,
-        image_token_id=IMAGE_TOKEN,
+        image_token_id=image_token,
     )
     # Pesi dall'init nativo di transformers sotto seme fisso, non riempiti a
     # mano: un riempimento uniforme ignora il fan-in, il segnale si spegne
@@ -204,10 +221,10 @@ def build(output: Path) -> int:
     pixels = torch.linspace(-1.0, 1.0, n_patches * width,
                             dtype=torch.float32).view(n_patches, width)
     grid_thw = torch.tensor([[1, GRID_H, GRID_W]], dtype=torch.long)
-    ids = torch.tensor([PROMPT], dtype=torch.long)
+    ids = torch.tensor([prompt], dtype=torch.long)
 
-    expected_image_tokens = (GRID_H // MERGE) * (GRID_W // MERGE)
-    placeholders = sum(1 for t in PROMPT if t == IMAGE_TOKEN)
+    expected_image_tokens = n_image
+    placeholders = sum(1 for t in prompt if t == image_token)
     if placeholders != expected_image_tokens:
         print(f"il prompt ha {placeholders} segnaposto ma la griglia "
               f"{GRID_H}x{GRID_W} con merge {MERGE} ne produce "
@@ -219,7 +236,7 @@ def build(output: Path) -> int:
                        image_grid_thw=grid_thw).logits[0].float()
         forcing = logits.argmax(-1).tolist()
 
-        sequence = list(PROMPT)
+        sequence = list(prompt)
         greedy = []
         exact_steps = GREEDY_STEPS
         select_k = TEXT_CONFIG["index_topk"] // TEXT_CONFIG["index_kpool"]
@@ -255,7 +272,6 @@ def build(output: Path) -> int:
               "sbagliato passerebbe lo stesso")
         return 2
 
-    output.mkdir(parents=True, exist_ok=True)
     tensors = to_checkpoint_names(
         {name: parameter.detach().contiguous().to(torch.float32)
          for name, parameter in model.state_dict().items()
@@ -273,9 +289,9 @@ def build(output: Path) -> int:
         "source": "transformers",
         "transformers_version": transformers.__version__,
         "torch_version": torch.__version__,
-        "seed": SEED,
-        "prompt": PROMPT,
-        "image_token_id": IMAGE_TOKEN,
+        "seed": seed,
+        "prompt": prompt,
+        "image_token_id": image_token,
         "grid": [GRID_H, GRID_W],
         "patch_shape": list(pixels.shape),
         "image_tokens": expected_image_tokens,
@@ -292,15 +308,40 @@ def build(output: Path) -> int:
             f"; greedy confrontabile solo per {exact_steps} passi su "
             f"{GREEDY_STEPS} (pareggio nella selezione dei pool)")
     print(f"wrote {output} ({len(tensors)} tensors, {expected_image_tokens} "
-          f"token immagine su {len(PROMPT)} posizioni{note})")
+          f"token immagine su {len(prompt)} posizioni{note})")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--seeds", type=int, default=12,
+                        help="quanti semi provare per trovarne uno dove la "
+                             "traccia greedy resta confrontabile fino in fondo")
     arguments = parser.parse_args()
-    return build(arguments.output)
+
+    # I pareggi nella selezione dei pool non sono un difetto da nascondere, ma
+    # un fixture in cui arrivano al primo passo prova quasi niente. Si provano
+    # piu' semi e si tiene il primo che resta confrontabile per intero; se non
+    # ce n'e' nessuno si tiene il migliore, dicendo quale.
+    import json as _json
+    best_seed, best_steps = None, -1
+    for offset in range(arguments.seeds):
+        seed = SEED + offset
+        code = build(arguments.output, seed)
+        if code:
+            continue
+        steps = _json.loads((arguments.output / "ref.json").read_text())["greedy_exact_steps"]
+        if steps > best_steps:
+            best_seed, best_steps = seed, steps
+        if steps == GREEDY_STEPS:
+            return 0
+    if best_seed is None:
+        print(f"nessuno dei {arguments.seeds} semi ha prodotto un fixture valido")
+        return 2
+    print(f"nessun seme su {arguments.seeds} resta confrontabile per intero; "
+          f"tengo {best_seed} con {best_steps} passi su {GREEDY_STEPS}")
+    return build(arguments.output, best_seed)
 
 
 if __name__ == "__main__":

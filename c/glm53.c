@@ -1907,6 +1907,66 @@ static int sample_token(const float *logits, int vocab) {
     return order[0];
 }
 
+/* ---------- slot KV ----------
+ *
+ * Un turno di chat rende tutta la conversazione da capo, quindi il prompt del
+ * secondo turno comincia con quello del primo piu' la risposta che il motore
+ * ha appena dato. Tenere la sessione dello slot e ripartire da dove il prefisso
+ * smette di combaciare fa pagare solo la parte nuova.
+ *
+ * Il riuso vale solo in avanti. Lo stato ricorrente dei layer KDA non si
+ * riavvolge: la cache DSA si potrebbe troncare, essendo posizionale, ma la
+ * ricorrenza no, e fingere il contrario darebbe risposte sbagliate in silenzio.
+ * Se il prompt nuovo non estende quello vecchio, la sessione si rifa'. */
+#define GLM53_MAX_SLOTS 16
+
+typedef struct {
+    GSession *session;
+    int *tokens;                          /* la sequenza che lo slot tiene */
+    int n, cap;
+} KVSlot;
+
+static KVSlot g_slots[GLM53_MAX_SLOTS];
+static int g_n_slots = 0;
+static int g_slot_context = 0;
+
+static void slots_init(const GModel *m) {
+    const char *setting = getenv("KV_SLOTS");
+    g_n_slots = setting ? atoi(setting) : 1;
+    if (g_n_slots < 1) g_n_slots = 1;
+    if (g_n_slots > GLM53_MAX_SLOTS) g_n_slots = GLM53_MAX_SLOTS;
+    const char *context = getenv("GLM53_MAXT");
+    g_slot_context = context ? atoi(context) : 8192;
+    if (g_slot_context < 64) g_slot_context = 64;
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "slot KV: %d da %d posizioni\n", g_n_slots, g_slot_context);
+    (void)m;
+}
+
+static void slot_reset(const GModel *m, KVSlot *slot) {
+    if (slot->session) session_close(m, slot->session);
+    slot->session = NULL;
+    slot->n = 0;
+}
+
+/* Quanti token iniziali lo slot ha gia' in cache e puo' tenere. */
+static int slot_shared(const KVSlot *slot, const int *tokens, int n) {
+    int shared = 0;
+    while (shared < slot->n && shared < n && slot->tokens[shared] == tokens[shared])
+        shared++;
+    return shared;
+}
+
+static void slot_remember(KVSlot *slot, const int *tokens, int n) {
+    if (n > slot->cap) {
+        slot->tokens = realloc(slot->tokens, (size_t)n * sizeof(int));
+        if (!slot->tokens) { fprintf(stderr, "OOM sulla storia dello slot\n"); exit(1); }
+        slot->cap = n;
+    }
+    memcpy(slot->tokens, tokens, (size_t)n * sizeof(int));
+    slot->n = n;
+}
+
 typedef struct {
     unsigned long long id;
     int slot, max_tokens;
@@ -1995,7 +2055,12 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
     if (!q->plen) { serve_line("ERROR %llu EMPTY_PROMPT\n", q->id); return; }
     g_temp = q->temp; g_topp = q->top_p > 0.0f ? q->top_p : 1.0f;
 
-    const int room = 1 << 16;
+    if (q->slot < 0 || q->slot >= g_n_slots) {
+        serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+        return;
+    }
+    KVSlot *slot = &g_slots[q->slot];
+    const int room = g_slot_context;
     int *sequence = malloc((size_t)room * sizeof(int));
     if (!sequence) { serve_line("ERROR %llu BAD_REQUEST\n", q->id); return; }
     int total = tok_encode(tokenizer, q->payload, q->plen, sequence, room);
@@ -2005,18 +2070,41 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         serve_line("ERROR %llu EMPTY_PROMPT\n", q->id);
         return;
     }
+    if (total >= room) {
+        free(sequence);
+        serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+        return;
+    }
 
     const double started = now_s();
     int emitted = 0, limited = 0;
     const int budget = q->max_tokens > 0 ? q->max_tokens : 256;
 
-    /* Il prompt si prefilla una volta; ogni token dopo costa un token. Lo slot
-     * KV della richiesta e' accettato e ignorato: la sessione vive quanto la
-     * richiesta, quindi due turni della stessa conversazione riprefillano.
-     * E' lavoro sprecato, non un errore, e il giorno che gli slot esistono
-     * davvero il protocollo qui non cambia. */
-    GSession *session = session_open(m, total + budget + 1);
-    float *logits = forward_prefill(m, session, sequence, total, NULL, 0, 0);
+    /* Quanto di questo prompt e' gia' nella sessione.
+     *
+     * Il numero che conta e' `filled`, non quanti token lo slot ricorda: sono
+     * diversi, perche' l'ultimo token generato viene emesso al client ma non
+     * rimacinato, quindi resta nella storia e non nella cache. Riprendere da un
+     * punto che la sessione non ha davvero raggiunto darebbe al modello un
+     * contesto sfasato di un token, che e' esattamente il tipo di errore che
+     * non fa rumore.
+     *
+     * Si riusa solo se il prompt nuovo concorda su TUTTE le posizioni in cache
+     * e ne ha almeno una in piu': lo stato ricorrente dei layer KDA non si
+     * riavvolge, quindi una divergenza a meta' cache obbliga a rifare. */
+    const int cached = slot->session ? slot->session->filled : 0;
+    int shared = 0;
+    if (cached > 0 && cached < total && slot_shared(slot, sequence, total) >= cached)
+        shared = cached;
+    if (shared <= 0) {
+        slot_reset(m, slot);
+        slot->session = session_open(m, room);
+        shared = 0;
+    }
+    const int reused = shared;
+    float *logits = forward_prefill(m, slot->session, sequence + shared,
+                                    total - shared, NULL, 0, 0);
+    GSession *session = slot->session;
     int rows = 1;
     for (int step = 0; step < budget; step++) {
         if (total >= room) { limited = 1; break; }
@@ -2034,8 +2122,15 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         rows = 1;
     }
     free(logits);
-    session_close(m, session);
+    /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
+     * davvero macinato: prompt piu' quello che ha generato. */
+    slot_remember(slot, sequence, total);
     const double elapsed = now_s() - started;
+    /* Quanto prefisso lo slot ha risparmiato. La regola di compatibilita' del
+     * protocollo dice che un server ignora le righe che non conosce, quindi
+     * questa non rompe nessun client e da' a chi la vuole un modo di vedere se
+     * il riuso sta funzionando davvero. */
+    serve_line("REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
@@ -2046,6 +2141,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
 static void serve_loop(GModel *m, Tok *tokenizer) {
     coli_serve_binary_mode();
     setvbuf(stdin, NULL, _IONBF, 0);
+    slots_init(m);
     serve_line("\x01\x01READY\x01\x01\n");
     serve_line("STAT 0 0.00 0.0 %.1f\n", rss_gb());
     for (;;) {
