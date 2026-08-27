@@ -5,20 +5,49 @@ Confronta cio' che un utente vede davvero -- i token -- e non solo i numeri
 interni: teacher forcing su ogni posizione, generazione greedy, e i logit
 dell'ultima posizione entro una tolleranza stretta. Un motore puo' avere logit
 quasi giusti e scegliere comunque il token sbagliato, quindi entrambi contano.
+
+Le due domande sono pero' diverse e vanno tenute separate. "Il motore
+implementa il modello" si prova in f32, dove i logit devono coincidere fino
+all'ultima cifra utile. "La quantizzazione conserva le risposte" si prova a bit
+ridotti, dove i logit sono legittimamente diversi e a dover restare identici
+sono i token. Chiedere gli stessi logit a int4 vorrebbe dire chiedere che la
+quantizzazione non quantizzi.
+
+Il confronto coi token dell'oracolo si fa in f32, e il test impone lui la
+precisione al processo figlio invece di ereditarla dall'ambiente: cosi' il
+risultato non dipende da come e' impostata la shell di chi lo lancia. Con
+--bits si puo' rieseguire a precisione ridotta, ma quella e' una misura, non un
+cancello: questi modelli hanno hidden 128, cioe' due soli gruppi per riga, e
+pesi casuali senza struttura. Quanto int4 conservi le risposte si misura sul
+modello vero, dove le righe sono lunghe 4096 e i pesi vogliono dire qualcosa.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+# Quanto puo' spostare i logit ciascuna precisione dei pesi densi. Sono soglie
+# misurate su questo fixture, non tolleranze di comodo: servono ad accorgersi
+# se un giorno la quantizzazione peggiora, non a far passare il test.
+LOGIT_TOLERANCE = {32: 2e-5, 8: 3e-2, 4: 5e-1}
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", type=Path, required=True)
-    parser.add_argument("--logit-tolerance", type=float, default=2e-5)
+    parser.add_argument("--logit-tolerance", type=float, default=None)
+    parser.add_argument("--bits", type=int, default=32,
+                        choices=(4, 8, 32),
+                        help="precisione dei densi; 32 e' il confronto "
+                             "con l'oracolo, il resto e' una misura")
     arguments = parser.parse_args()
+
+    bits = arguments.bits
+    if arguments.logit_tolerance is None:
+        arguments.logit_tolerance = LOGIT_TOLERANCE.get(bits, 5e-1)
 
     reference = json.loads((arguments.fixture / "ref.json").read_text())
     prompt = ",".join(str(token) for token in reference["prompt_ids"])
@@ -28,7 +57,8 @@ def main() -> int:
     result = subprocess.run(
         [arguments.binary, "--model", str(arguments.fixture), "--ids", prompt,
          "--greedy", str(len(expected_greedy)), "--logits"],
-        capture_output=True, text=True, check=True)
+        capture_output=True, text=True, check=True,
+        env={**os.environ, "GLM53_BITS": str(bits)})
 
     lines = {line.split()[0]: line.split()[1:] for line in result.stdout.splitlines() if line.strip()}
     forcing = [int(value) for value in lines["teacher_forcing"]]
@@ -47,7 +77,8 @@ def main() -> int:
         return 1
 
     print(f"PASS GLM-5.3 tiny: {len(forcing)} posizioni teacher-forced esatte, "
-          f"{len(greedy)} token greedy esatti, logit entro {worst:.3g}")
+          f"{len(greedy)} token greedy esatti, densi a {bits} bit, "
+          f"logit entro {worst:.3g}")
     return 0
 
 

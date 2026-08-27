@@ -16,9 +16,18 @@ che non e' specificato. La nostra regola (indice piu' basso) e' deterministica e
 riproducibile; quella di torch cambia fra backend. Da li' in poi la traccia non
 sarebbe un bersaglio legittimo per nessuna implementazione, nemmeno per una
 seconda esecuzione di torch su un'altra macchina.
+
+Il confronto coi token dell'oracolo si fa in f32, e il test impone lui la
+precisione al processo figlio invece di ereditarla dall'ambiente: cosi' il
+risultato non dipende da come e' impostata la shell di chi lo lancia. Con
+--bits si puo' rieseguire a precisione ridotta, ma quella e' una misura, non un
+cancello: questi modelli hanno hidden 128, cioe' due soli gruppi per riga, e
+pesi casuali senza struttura. Quanto int4 conservi le risposte si misura sul
+modello vero, dove le righe sono lunghe 4096 e i pesi vogliono dire qualcosa.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -28,8 +37,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--fixture", type=Path, required=True)
-    parser.add_argument("--logit-tolerance", type=float, default=2e-5)
+    parser.add_argument("--logit-tolerance", type=float, default=None)
+    parser.add_argument("--bits", type=int, default=32,
+                        choices=(4, 8, 32),
+                        help="precisione dei densi; 32 e' il confronto "
+                             "con l'oracolo, il resto e' una misura")
     arguments = parser.parse_args()
+
+    # Vedi test_glm53_tiny.py: in f32 si prova che il motore implementa il
+    # modello, a bit ridotti che la quantizzazione conserva i token.
+    bits = arguments.bits
+    if arguments.logit_tolerance is None:
+        arguments.logit_tolerance = {32: 2e-5, 8: 3e-2, 4: 5e-1}.get(bits, 5e-1)
 
     reference = json.loads((arguments.fixture / "ref.json").read_text())
     prompt = ",".join(str(token) for token in reference["prompt"])
@@ -43,7 +62,8 @@ def main() -> int:
          "--patches", str(arguments.fixture / "patches.f32"),
          "--grid", f"{grid_h}x{grid_w}",
          "--greedy", str(len(expected_greedy)), "--logits"],
-        capture_output=True, text=True, check=True)
+        capture_output=True, text=True, check=True,
+        env={**os.environ, "GLM53_BITS": str(bits)})
 
     lines = {line.split()[0]: line.split()[1:]
              for line in result.stdout.splitlines() if line.strip()}
@@ -73,7 +93,8 @@ def main() -> int:
                f"confrontabili (pareggio nella selezione dei pool)")
     print(f"PASS GLM-5.3 multimodale: {tokens} token immagine, "
           f"{len(forcing)} posizioni teacher-forced esatte, "
-          f"{comparable} token greedy esatti, logit entro {worst:.3g}{skipped}")
+          f"{comparable} token greedy esatti, densi a {bits} bit, "
+          f"logit entro {worst:.3g}{skipped}")
     return 0
 
 

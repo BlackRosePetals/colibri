@@ -67,6 +67,7 @@
 
 #include "json.h"
 #include "st.h"
+#include "quant.h"
 #include "hyper_connections.h"   /* mHC, condiviso con deepseek_v4.c */
 
 /* ---------- config ----------
@@ -576,7 +577,22 @@ int main(int argc, char **argv) {
 #include "sparse_index.h"
 #include "vision_tower.h"
 
-typedef struct { const float *w; int rows, columns; } Mat;
+/* Una matrice residente, nel formato in cui conviene tenerla.
+ *
+ * Il checkpoint porta i densi in BF16 e gli esperti gia' in int4 gs64. Tenere
+ * i densi in f32 vuol dire 39 GB di RAM per il 3% dei parametri, quindi qui si
+ * quantizzano al volo secondo GLM53_BITS. Il formato 4 e' lo stesso
+ * contenitore che scrive tools/convert_glm53.py e che GLM-5.2 usa gia':
+ * `nome` U8 con due valori per byte, `nome.qs` F32 con una scala ogni 64
+ * colonne. */
+typedef struct {
+    int fmt;                              /* 0 = f32, 1 = int8 per riga, 4 = int4 gs64 */
+    const float *f;
+    const int8_t *q8;
+    const uint8_t *q4;
+    const float *s;
+    int rows, columns, gs;
+} Mat;
 
 typedef struct {
     /* comune */
@@ -599,7 +615,8 @@ typedef struct {
 typedef struct {
     Cfg c;
     shards S;
-    const float *embed, *final_norm, *head;
+    const float *embed, *final_norm;
+    Mat head;
     GLayer *layer;
     char prefix[64];
     /* torre vision: presente solo se il checkpoint la porta */
@@ -619,25 +636,133 @@ static const float *load_f32(GModel *m, const char *fmt, ...) {
     return buffer;
 }
 
+/* Bit dei pesi densi residenti: 4, 8 o 32. Il default e' 4 perche' e' quello
+ * che fa stare il modello su una macchina normale; chi vuole la precisione
+ * piena la chiede. Gli esperti non passano di qui: arrivano dal disco gia'
+ * quantizzati e restano com'erano. */
+static int glm53_dense_bits(void) {
+    static int cached = 0;
+    if (cached) return cached;
+    const char *setting = getenv("GLM53_BITS");
+    cached = setting ? atoi(setting) : 4;
+    if (cached != 4 && cached != 8 && cached != 32) {
+        fprintf(stderr, "GLM53_BITS=%s: valori ammessi 4, 8, 32\n", setting);
+        exit(1);
+    }
+    return cached;
+}
+
+/* Quantizza [rows, columns] f32 in int4 con una scala ogni `gs` colonne.
+ * Stessa aritmetica di quant_int4_grouped() in tools/convert_glm53.py, cosi'
+ * un peso quantizzato qui e uno quantizzato dal converter sono lo stesso peso. */
+static void quantize_i4_grouped(const float *w, uint8_t *q4, float *scale,
+                                int rows, int columns, int gs) {
+    const int groups = (columns + gs - 1) / gs;
+    const int packed = (columns + 1) / 2;
+    for (int r = 0; r < rows; r++) {
+        const float *row = w + (size_t)r * columns;
+        uint8_t *dst = q4 + (size_t)r * packed;
+        memset(dst, 0, (size_t)packed);
+        for (int g = 0; g < groups; g++) {
+            const int start = g * gs;
+            const int stop = start + gs < columns ? start + gs : columns;
+            float amax = 0.0f;
+            for (int c = start; c < stop; c++) {
+                const float value = fabsf(row[c]);
+                if (value > amax) amax = value;
+            }
+            float step = amax / 7.0f;
+            if (step < 1e-8f) step = 1e-8f;
+            scale[(size_t)r * groups + g] = step;
+            for (int c = start; c < stop; c++) {
+                int level = (int)lrintf(row[c] / step);
+                if (level < -8) level = -8;
+                if (level > 7) level = 7;
+                const uint8_t nibble = (uint8_t)(level + 8);
+                if (c & 1) dst[c >> 1] |= (uint8_t)(nibble << 4);
+                else       dst[c >> 1] |= nibble;
+            }
+        }
+    }
+}
+
 static Mat load_mat(GModel *m, const char *fmt, ...) {
     char name[512];
     va_list args; va_start(args, fmt); vsnprintf(name, sizeof(name), fmt, args); va_end(args);
     st_tensor *t = st_find(&m->S, name);
     if (!t) { fprintf(stderr, "manca la matrice %s\n", name); exit(1); }
+    Mat mat; memset(&mat, 0, sizeof(mat));
+
+    /* Gia' quantizzato nel checkpoint: si prende com'e', senza passare per
+     * f32. Un giro in f32 costerebbe il picco di RAM che stiamo evitando, e
+     * riquantizzare quello che e' gia' quantizzato perde bit per niente. */
+    if (t->dtype == 3) {                  /* U8/I8 in st.h: il container int4 */
+        char scales[544];
+        snprintf(scales, sizeof(scales), "%s.qs", name);
+        st_tensor *qs = st_find(&m->S, scales);
+        if (!qs) {
+            fprintf(stderr, "%s e' int4 ma manca %s\n", name, scales);
+            exit(1);
+        }
+        /* Le forme non arrivano dal file: si ricavano dai byte e devono
+         * tornare esatte, altrimenti il contenitore non e' quello che dice. */
+        const int64_t values = qs->numel * 64;
+        if (t->nbytes * 2 != values || t->rank != 2) {
+            fprintf(stderr, "%s: %lld byte e %lld scale non sono un int4 gs64\n",
+                    name, (long long)t->nbytes, (long long)qs->numel);
+            exit(1);
+        }
+        mat.rows = (int)t->shape[0];
+        mat.columns = (int)(values / t->shape[0]);
+        if (mat.columns % 64) {
+            fprintf(stderr, "%s: %d colonne non sono multiple di 64\n", name, mat.columns);
+            exit(1);
+        }
+        uint8_t *packed = malloc((size_t)t->nbytes);
+        float *step = malloc((size_t)qs->numel * sizeof(float));
+        if (!packed || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+        st_read_raw(&m->S, name, packed, 1);
+        st_read_f32_cap(&m->S, scales, step, qs->numel, 1);
+        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
+        return mat;
+    }
+
     if (t->rank != 2) { fprintf(stderr, "%s: rank %d, attesa 2\n", name, t->rank); exit(1); }
     float *buffer = malloc((size_t)t->numel * sizeof(float));
-    st_read_f32_cap(&m->S, name, buffer, t->numel, 0);
-    Mat mat = { buffer, (int)t->shape[0], (int)t->shape[1] };
+    if (!buffer) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+    st_read_f32_cap(&m->S, name, buffer, t->numel, 1);
+    mat.rows = (int)t->shape[0];
+    mat.columns = (int)t->shape[1];
+
+    const int bits = glm53_dense_bits();
+    if (bits == 32) { mat.fmt = 0; mat.f = buffer; return mat; }
+    if (bits == 4 && mat.columns % 64 == 0) {
+        const int groups = mat.columns / 64;
+        uint8_t *packed = malloc((size_t)mat.rows * ((mat.columns + 1) / 2));
+        float *step = malloc((size_t)mat.rows * groups * sizeof(float));
+        if (!packed || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+        quantize_i4_grouped(buffer, packed, step, mat.rows, mat.columns, 64);
+        free(buffer);
+        mat.fmt = 4; mat.q4 = packed; mat.s = step; mat.gs = 64;
+        return mat;
+    }
+    /* int8 per riga: e' anche il ripiego quando le colonne non sono multiple
+     * di 64, che capita sulle proiezioni piccole dell'indexer. */
+    int8_t *level = malloc((size_t)mat.rows * mat.columns);
+    float *step = malloc((size_t)mat.rows * sizeof(float));
+    if (!level || !step) { fprintf(stderr, "OOM su %s\n", name); exit(1); }
+    quantize_rows(buffer, level, step, mat.rows, mat.columns, 8);
+    free(buffer);
+    mat.fmt = 1; mat.q8 = level; mat.s = step;
     return mat;
 }
 
 /* out[rows] = W x, con W in layout [rows, columns] come transformers. */
 static void mv(float *out, const Mat *w, const float *x) {
-    for (int r = 0; r < w->rows; r++) {
-        const float *row = w->w + (size_t)r * w->columns;
-        float sum = 0.0f;
-        for (int c = 0; c < w->columns; c++) sum += row[c] * x[c];
-        out[r] = sum;
+    switch (w->fmt) {
+    case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
+    case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
+    default: matmul(out, x, w->f, 1, w->columns, w->rows); break;
     }
 }
 
@@ -871,7 +996,18 @@ static void model_load(GModel *m, const char *dir) {
 
     m->embed = load_f32(m, "%sembed_tokens.weight", P);
     m->final_norm = load_f32(m, "%snorm.weight", P);
-    m->head = st_find(&m->S, "lm_head.weight") ? load_f32(m, "lm_head.weight") : m->embed;
+    /* La testa e' l'unica matrice grande fuori dagli esperti: a vocab 154880
+     * per hidden 4096 sono 2,5 GB in f32, quindi passa dallo stesso
+     * quantizzatore dei densi. Se il checkpoint la lega all'embedding, si
+     * riusa quella tabella cosi' com'e'. */
+    if (st_find(&m->S, "lm_head.weight")) {
+        m->head = load_mat(m, "lm_head.weight");
+    } else {
+        memset(&m->head, 0, sizeof(m->head));
+        m->head.f = m->embed;
+        m->head.rows = m->c.vocab;
+        m->head.columns = m->c.hidden;
+    }
     m->layer = calloc((size_t)m->c.n_layers, sizeof(*m->layer));
 
     for (int i = 0; i < m->c.n_layers; i++) {
@@ -1141,8 +1277,8 @@ static float *forward(GModel *m, const int *tokens, int n,
         rms(normed + (size_t)t * D, collapsed + (size_t)t * D, m->final_norm, D, c->eps);
 
     float *logits = malloc((size_t)n * c->vocab * sizeof(float));
-    Mat head = { m->head, c->vocab, D };
-    for (int t = 0; t < n; t++) mv(logits + (size_t)t * c->vocab, &head, normed + (size_t)t * D);
+    for (int t = 0; t < n; t++)
+        mv(logits + (size_t)t * c->vocab, &m->head, normed + (size_t)t * D);
 
     free(scratch); free(window); free(state);
     free(comb); free(post); free(branch); free(normed); free(collapsed);
