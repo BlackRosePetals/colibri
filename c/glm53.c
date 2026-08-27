@@ -619,6 +619,13 @@ typedef struct {
     Mat head;
     GLayer *layer;
     char prefix[64];
+    /* esperti: o residenti (checkpoint f32) o in streaming (container int4) */
+    int streaming;
+    struct ERef *eref;
+    struct LCache *ecache;
+    int64_t e_len[6], e_at[6], e_slot;
+    uint64_t clock, ebytes;
+    long hits, miss;
     /* torre vision: presente solo se il checkpoint la porta */
     int has_vision;
     ColiVisionTower vision;
@@ -927,8 +934,176 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
 }
 
 /* ---------- FFN: denso oppure MoE ---------- */
-static void ffn_layer(const Cfg *c, const GLayer *l, int index, const float *x,
+/* ================= streaming degli esperti =================
+ *
+ * 288 esperti per 42 layer sparsi, 14,2 MB l'uno in int4 gs64: 171 GB, che
+ * stanno su disco e non in RAM. Per ogni token se ne toccano 8 per layer, e la
+ * stessa manciata torna spesso, quindi ogni layer tiene una cache LRU di slot
+ * e il resto arriva con una lettura quando serve.
+ *
+ * Uno slot e' un blocco unico che contiene i sei pezzi dell'esperto nell'ordine
+ * in cui li vuole il calcolo. Le Mat che ne escono puntano dentro allo slot,
+ * cosi' il codice del MoE non sa da dove arrivi il peso e resta quello di
+ * prima. */
+#define GLM53_EXPERT_PIECES 6
+
+typedef struct ERef {
+    int fd[GLM53_EXPERT_PIECES];
+    int64_t off[GLM53_EXPERT_PIECES];
+    int contig;                           /* i sei pezzi sono consecutivi in un file */
+} ERef;
+
+typedef struct { int eid; uint8_t *base; uint64_t used; } Slot;
+typedef struct LCache { Slot *s; int n, cap; } LCache;
+
+/* Lunghezze e posizioni dei sei pezzi dentro allo slot. Gate e up sono
+ * [moe_inter, hidden], down e' [hidden, moe_inter]: stessi byte, forme
+ * scambiate. */
+static void expert_geometry(GModel *m) {
+    const int64_t hidden = m->c.hidden, inter = m->c.moe_inter;
+    const int64_t packed = inter * hidden / 2;
+    const int64_t scales = inter * hidden / 64 * (int64_t)sizeof(float);
+    const int64_t length[GLM53_EXPERT_PIECES] = { packed, scales, packed, scales, packed, scales };
+    int64_t at = 0;
+    for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+        m->e_len[p] = length[p];
+        m->e_at[p] = at;
+        at += length[p];
+    }
+    m->e_slot = at;
+}
+
+/* Indirizzi su disco di ogni esperto. Le lunghezze dichiarate dal file devono
+ * combaciare con la geometria: un checkpoint che dice altro non e' questo
+ * modello, e leggerlo lo stesso vorrebbe dire calcolare su byte a caso. */
+static void expert_table_init(GModel *m) {
+    const Cfg *c = &m->c;
+    static const char *piece[GLM53_EXPERT_PIECES] = {
+        "gate_proj.weight", "gate_proj.weight.qs",
+        "up_proj.weight",   "up_proj.weight.qs",
+        "down_proj.weight", "down_proj.weight.qs",
+    };
+    m->eref = calloc((size_t)c->n_layers * c->n_experts, sizeof(*m->eref));
+    if (!m->eref) { fprintf(stderr, "OOM sulla tabella degli esperti\n"); exit(1); }
+
+    for (int i = c->first_dense; i < c->n_layers; i++) {
+        for (int e = 0; e < c->n_experts; e++) {
+            ERef *ref = &m->eref[(size_t)i * c->n_experts + e];
+            for (int p = 0; p < GLM53_EXPERT_PIECES; p++) {
+                char name[512];
+                snprintf(name, sizeof(name), "%slayers.%d.mlp.experts.%d.%s",
+                         m->prefix, i, e, piece[p]);
+                st_tensor *t = st_find(&m->S, name);
+                if (!t) { fprintf(stderr, "manca %s\n", name); exit(1); }
+                if (t->nbytes != m->e_len[p]) {
+                    fprintf(stderr, "%s: %lld byte, attesi %lld\n", name,
+                            (long long)t->nbytes, (long long)m->e_len[p]);
+                    exit(1);
+                }
+                ref->fd[p] = t->fd;
+                ref->off[p] = t->off;
+            }
+            /* Sei letture per esperto costano sei code invece di una. Vale la
+             * pena accorgersi quando il file le ha gia' messe in fila. */
+            ref->contig = 1;
+            for (int p = 1; p < GLM53_EXPERT_PIECES; p++)
+                if (ref->fd[p] != ref->fd[0] ||
+                    ref->off[p] != ref->off[p - 1] + m->e_len[p - 1]) { ref->contig = 0; break; }
+        }
+    }
+}
+
+/* Quanti slot per layer: il budget diviso i layer sparsi. Il pavimento e' 1 e
+ * non topk, perche' un pavimento a topk impegnerebbe topk*layer slot comunque,
+ * cioe' molti GB, a dispetto del budget chiesto. */
+static void expert_cache_init(GModel *m) {
+    const Cfg *c = &m->c;
+    const char *setting = getenv("GLM53_EXPERT_GB");
+    double budget = setting ? atof(setting) : 8.0;
+    const int sparse = c->n_layers - c->first_dense;
+    int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
+    if (cap < 1) cap = 1;
+    if (cap > c->n_experts) cap = c->n_experts;
+
+    m->ecache = calloc((size_t)c->n_layers, sizeof(*m->ecache));
+    if (!m->ecache) { fprintf(stderr, "OOM sulla cache degli esperti\n"); exit(1); }
+    for (int i = c->first_dense; i < c->n_layers; i++) {
+        LCache *cache = &m->ecache[i];
+        cache->cap = cap;
+        cache->s = calloc((size_t)cap, sizeof(*cache->s));
+        if (!cache->s) { fprintf(stderr, "OOM sugli slot del layer %d\n", i); exit(1); }
+        for (int j = 0; j < cap; j++) cache->s[j].eid = -1;
+    }
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "esperti: slot da %.1f MB, %d per layer su %d layer sparsi "
+                        "(%.1f GB residenti)\n",
+                m->e_slot / 1e6, cap, sparse, (double)cap * sparse * m->e_slot / 1e9);
+}
+
+static Slot *slot_find(GModel *m, int layer, int eid) {
+    LCache *cache = &m->ecache[layer];
+    for (int j = 0; j < cache->n; j++)
+        if (cache->s[j].eid == eid) {
+            cache->s[j].used = ++m->clock;
+            m->hits++;
+            return &cache->s[j];
+        }
+    return NULL;
+}
+
+static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
+    const ERef *ref = &m->eref[(size_t)layer * m->c.n_experts + eid];
+    if (!slot->base) {
+        slot->base = malloc((size_t)m->e_slot);
+        if (!slot->base) { fprintf(stderr, "OOM su uno slot esperto\n"); exit(1); }
+    }
+    if (ref->contig) {
+        st_pread_full(ref->fd[0], slot->base, m->e_slot, ref->off[0], "expert");
+    } else {
+        for (int p = 0; p < GLM53_EXPERT_PIECES; p++)
+            st_pread_full(ref->fd[p], slot->base + m->e_at[p], m->e_len[p],
+                          ref->off[p], "expert piece");
+    }
+    slot->eid = eid;
+    m->miss++;
+    m->ebytes += (uint64_t)m->e_slot;
+}
+
+/* Lo slot dell'esperto chiesto, letto se non c'e'. La vittima e' quella usata
+ * meno di recente. */
+static Slot *expert_slot(GModel *m, int layer, int eid) {
+    Slot *slot = slot_find(m, layer, eid);
+    if (slot) return slot;
+    LCache *cache = &m->ecache[layer];
+    if (cache->n < cache->cap) slot = &cache->s[cache->n++];
+    else {
+        int lru = 0;
+        for (int j = 1; j < cache->n; j++)
+            if (cache->s[j].used < cache->s[lru].used) lru = j;
+        slot = &cache->s[lru];
+    }
+    expert_read(m, layer, eid, slot);
+    slot->used = ++m->clock;
+    return slot;
+}
+
+/* Le tre matrici di un esperto, che puntano dentro al suo slot. */
+static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, Mat *down) {
+    const int hidden = m->c.hidden, inter = m->c.moe_inter;
+    const Mat shape[3] = {
+        { 4, NULL, NULL, slot->base + m->e_at[0], (const float *)(slot->base + m->e_at[1]),
+          inter, hidden, 64 },
+        { 4, NULL, NULL, slot->base + m->e_at[2], (const float *)(slot->base + m->e_at[3]),
+          inter, hidden, 64 },
+        { 4, NULL, NULL, slot->base + m->e_at[4], (const float *)(slot->base + m->e_at[5]),
+          hidden, inter, 64 },
+    };
+    *gate = shape[0]; *up = shape[1]; *down = shape[2];
+}
+
+static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
+    const Cfg *c = &m->c;
     const int inter = index < c->first_dense ? c->dense_inter : c->moe_inter;
     float *sg = malloc((size_t)(c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter)
                        * sizeof(float));
@@ -971,8 +1146,14 @@ static void ffn_layer(const Cfg *c, const GLayer *l, int index, const float *x,
         }
         for (int k = 0; k < c->topk; k++) {
             float scale = weight[k] / (total + 1e-20f) * c->routed_scale;
-            mlp3(tmp, row, &l->eg[chosen[k]], &l->eu[chosen[k]], &l->ed[chosen[k]],
-                 c->swiglu_limit, sg, su);
+            Mat gate, up, down;
+            if (m->streaming) {
+                Slot *slot = expert_slot(m, index, chosen[k]);
+                expert_mats(m, slot, &gate, &up, &down);
+            } else {
+                gate = l->eg[chosen[k]]; up = l->eu[chosen[k]]; down = l->ed[chosen[k]];
+            }
+            mlp3(tmp, row, &gate, &up, &down, c->swiglu_limit, sg, su);
             for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
         }
     }
@@ -981,6 +1162,9 @@ static void ffn_layer(const Cfg *c, const GLayer *l, int index, const float *x,
 
 /* ---------- caricamento ---------- */
 static void vision_load(GModel *m);
+static void expert_geometry(GModel *m);
+static void expert_table_init(GModel *m);
+static void expert_cache_init(GModel *m);
 
 static void model_load(GModel *m, const char *dir) {
     load_cfg(&m->c, dir);
@@ -1009,6 +1193,22 @@ static void model_load(GModel *m, const char *dir) {
         m->head.columns = m->c.hidden;
     }
     m->layer = calloc((size_t)m->c.n_layers, sizeof(*m->layer));
+
+    /* Streaming o residenti: lo decide il contenitore, non una variabile
+     * d'ambiente. Si guarda il primo esperto del primo layer sparso. */
+    if (m->c.first_dense < m->c.n_layers) {
+        char first[512];
+        snprintf(first, sizeof(first), "%slayers.%d.mlp.experts.0.gate_proj.weight",
+                 P, m->c.first_dense);
+        st_tensor *probe_expert = st_find(&m->S, first);
+        if (!probe_expert) { fprintf(stderr, "manca %s\n", first); exit(1); }
+        m->streaming = probe_expert->dtype == 3;
+    }
+    if (m->streaming) {
+        expert_geometry(m);
+        expert_table_init(m);
+        expert_cache_init(m);
+    }
 
     for (int i = 0; i < m->c.n_layers; i++) {
         GLayer *l = &m->layer[i];
@@ -1077,13 +1277,18 @@ static void model_load(GModel *m, const char *dir) {
             l->rg = load_mat(m, "%slayers.%d.mlp.shared_experts.gate_proj.weight", P, i);
             l->ru = load_mat(m, "%slayers.%d.mlp.shared_experts.up_proj.weight", P, i);
             l->rd = load_mat(m, "%slayers.%d.mlp.shared_experts.down_proj.weight", P, i);
-            l->eg = malloc((size_t)m->c.n_experts * sizeof(Mat));
-            l->eu = malloc((size_t)m->c.n_experts * sizeof(Mat));
-            l->ed = malloc((size_t)m->c.n_experts * sizeof(Mat));
-            for (int e = 0; e < m->c.n_experts; e++) {
-                l->eg[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.gate_proj.weight", P, i, e);
-                l->eu[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.up_proj.weight", P, i, e);
-                l->ed[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.down_proj.weight", P, i, e);
+            /* Gli esperti quantizzati restano su disco: sono il 97% dei byte
+             * e nessuna macchina li tiene in RAM. Un checkpoint f32, come le
+             * fixture degli oracoli, e' piccolo e si carica tutto. */
+            if (!m->streaming) {
+                l->eg = malloc((size_t)m->c.n_experts * sizeof(Mat));
+                l->eu = malloc((size_t)m->c.n_experts * sizeof(Mat));
+                l->ed = malloc((size_t)m->c.n_experts * sizeof(Mat));
+                for (int e = 0; e < m->c.n_experts; e++) {
+                    l->eg[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.gate_proj.weight", P, i, e);
+                    l->eu[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.up_proj.weight", P, i, e);
+                    l->ed[e] = load_mat(m, "%slayers.%d.mlp.experts.%d.down_proj.weight", P, i, e);
+                }
             }
         }
     }
@@ -1257,7 +1462,7 @@ static float *forward(GModel *m, const int *tokens, int n,
                     kda_layer(c, l, normed, n, branch, state, window, scratch);
                 }
             } else {
-                ffn_layer(c, l, i, normed, n, branch);
+                ffn_layer(m, l, i, normed, n, branch);
             }
             for (int t = 0; t < n; t++)
                 coli_hc_post(next + (size_t)t * H * D, branch + (size_t)t * D,
@@ -1332,6 +1537,7 @@ int main(int argc, char **argv) {
     if (!count) { fprintf(stderr, "nessun id nel prompt\n"); return 2; }
 
     GModel model;
+    memset(&model, 0, sizeof(model));     /* contatori e puntatori opzionali */
     model_load(&model, dir);
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
 
@@ -1391,6 +1597,11 @@ int main(int argc, char **argv) {
         printf("\n");
         free(sequence);
     }
+    /* Contatori della cache esperti: servono a un test per accorgersi se lo
+     * streaming e' stato aggirato invece che esercitato. */
+    if (model.streaming)
+        printf("experts hits %ld miss %ld bytes %llu\n",
+               model.hits, model.miss, (unsigned long long)model.ebytes);
     free(logits);
     free(vision);
     free(tokens);
