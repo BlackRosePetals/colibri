@@ -1477,6 +1477,7 @@ int coli_v4_expert_store_open_planned(
 #ifdef COLI_V4_UNIT_MATH
 /* ######## deepseek_v4_math.c ######## */
 #include "deepseek_v4_internal.h"
+#include "hyper_connections.h"
 
 #include <limits.h>
 #include <math.h>
@@ -1491,71 +1492,17 @@ static float sigmoidf_stable(float value) {
     return growth / (1.0f + growth);
 }
 
+/* mHC: la matematica vive in hyper_connections.h, condivisa con gli altri
+ * motori il cui checkpoint porta le stesse hyper-connections (GLM-5.3-Flash usa
+ * le identiche chiavi hc_mult / hc_eps / hc_sinkhorn_iters). Qui restano solo
+ * gli inoltri, cosi' i punti di chiamata dell'amalgama e le dichiarazioni in
+ * deepseek_v4_internal.h non cambiano. */
 int coli_v4_hc_split_sinkhorn(float *pre, float *post, float *comb,
                               const float *mixes, const float scale[3],
                               const float *base, int hc, int iterations,
                               float eps) {
-    if (!pre || !post || !comb || !mixes || !scale || !base ||
-        hc < 1 || iterations < 1 || eps < 0.0f)
-        return -1;
-    for (int index = 0; index < hc; index++) {
-        pre[index] = sigmoidf_stable(
-            mixes[index] * scale[0] + base[index]) + eps;
-        post[index] = 2.0f * sigmoidf_stable(
-            mixes[hc + index] * scale[1] + base[hc + index]);
-    }
-    int matrix_offset = 2 * hc;
-    for (int row = 0; row < hc; row++) {
-        float maximum = -INFINITY;
-        for (int column = 0; column < hc; column++) {
-            int index = matrix_offset + row * hc + column;
-            float value = mixes[index] * scale[2] + base[index];
-            comb[row * hc + column] = value;
-            if (value > maximum) maximum = value;
-        }
-        float sum = 0.0f;
-        for (int column = 0; column < hc; column++) {
-            float value = expf(comb[row * hc + column] - maximum);
-            comb[row * hc + column] = value;
-            sum += value;
-        }
-        for (int column = 0; column < hc; column++)
-            comb[row * hc + column] = comb[row * hc + column] / sum + eps;
-    }
-    float *sums = malloc((size_t)hc * sizeof(*sums));
-    if (!sums) return -1;
-    for (int column = 0; column < hc; column++) {
-        float sum = 0.0f;
-        for (int row = 0; row < hc; row++)
-            sum += comb[row * hc + column];
-        sums[column] = sum;
-    }
-    for (int row = 0; row < hc; row++)
-        for (int column = 0; column < hc; column++)
-            comb[row * hc + column] /= sums[column] + eps;
-
-    for (int iteration = 1; iteration < iterations; iteration++) {
-        for (int row = 0; row < hc; row++) {
-            float sum = 0.0f;
-            for (int column = 0; column < hc; column++)
-                sum += comb[row * hc + column];
-            sums[row] = sum;
-        }
-        for (int row = 0; row < hc; row++)
-            for (int column = 0; column < hc; column++)
-                comb[row * hc + column] /= sums[row] + eps;
-        for (int column = 0; column < hc; column++) {
-            float sum = 0.0f;
-            for (int row = 0; row < hc; row++)
-                sum += comb[row * hc + column];
-            sums[column] = sum;
-        }
-        for (int row = 0; row < hc; row++)
-            for (int column = 0; column < hc; column++)
-                comb[row * hc + column] /= sums[column] + eps;
-    }
-    free(sums);
-    return 0;
+    return coli_hc_split_sinkhorn(pre, post, comb, mixes, scale, base,
+                                  hc, iterations, eps);
 }
 
 int coli_v4_hc_pre(float *output, float *post, float *comb,
@@ -1563,62 +1510,14 @@ int coli_v4_hc_pre(float *output, float *post, float *comb,
                    const float scale[3], const float *base,
                    int hc, int dimension, int iterations,
                    float norm_eps, float hc_eps) {
-    if (!output || !post || !comb || !input || !hc_fn || !scale || !base ||
-        hc < 1 || dimension < 1 || norm_eps < 0.0f)
-        return -1;
-    int flattened = hc * dimension;
-    int mix_count = (2 + hc) * hc;
-    float mean_square = 0.0f;
-    for (int index = 0; index < flattened; index++)
-        mean_square += input[index] * input[index];
-    float inverse_rms = 1.0f / sqrtf(mean_square / flattened + norm_eps);
-    float *mixes = malloc((size_t)mix_count * sizeof(*mixes));
-    float *pre = malloc((size_t)hc * sizeof(*pre));
-    if (!mixes || !pre) {
-        free(mixes);
-        free(pre);
-        return -1;
-    }
-    for (int row = 0; row < mix_count; row++) {
-        float sum = 0.0f;
-        for (int column = 0; column < flattened; column++)
-            sum += hc_fn[(size_t)row * flattened + column] * input[column];
-        mixes[row] = sum * inverse_rms;
-    }
-    if (coli_v4_hc_split_sinkhorn(pre, post, comb, mixes, scale, base,
-                                  hc, iterations, hc_eps) != 0) {
-        free(pre);
-        free(mixes);
-        return -1;
-    }
-    for (int column = 0; column < dimension; column++) {
-        float sum = 0.0f;
-        for (int copy = 0; copy < hc; copy++)
-            sum += pre[copy] * input[copy * dimension + column];
-        output[column] = sum;
-    }
-    free(pre);
-    free(mixes);
-    return 0;
+    return coli_hc_pre(output, post, comb, input, hc_fn, scale, base,
+                       hc, dimension, iterations, norm_eps, hc_eps);
 }
 
 int coli_v4_hc_post(float *output, const float *branch,
                     const float *residual, const float *post,
                     const float *comb, int hc, int dimension) {
-    if (!output || !branch || !residual || !post || !comb ||
-        hc < 1 || dimension < 1)
-        return -1;
-    for (int destination = 0; destination < hc; destination++) {
-        for (int column = 0; column < dimension; column++) {
-            float value = 0.0f;
-            for (int source = 0; source < hc; source++)
-                value += comb[source * hc + destination] *
-                         residual[source * dimension + column];
-            value += post[destination] * branch[column];
-            output[destination * dimension + column] = value;
-        }
-    }
-    return 0;
+    return coli_hc_post(output, branch, residual, post, comb, hc, dimension);
 }
 
 int coli_v4_rmsnorm(float *output, const float *input, const float *weight,
@@ -14028,6 +13927,7 @@ int main(int argc, char **argv) {
     double process_started = spec_now();
     int result = 1;
     V4CliOptions cli;
+    if (argc < 2) { coli_print_launcher_help("DeepSeek V4"); return 1; }
     if (v4_cli_parse(argc, argv, &cli)) {
         v4_cli_usage(stderr, argc ? argv[0] : "deepseek-v4");
         return 2;
