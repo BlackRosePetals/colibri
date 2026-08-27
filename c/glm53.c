@@ -68,6 +68,7 @@
 #include "json.h"
 #include "st.h"
 #include "quant.h"
+#include "tok.h"
 #include "hyper_connections.h"   /* mHC, condiviso con deepseek_v4.c */
 
 /* ---------- config ----------
@@ -1502,22 +1503,57 @@ static int argmax(const float *v, int n) {
     return best;
 }
 
+/* Gli id di fine generazione. GLM ne dichiara piu' di uno (fine turno, fine
+ * testo, fine blocco strumenti) e fermarsi solo sul primo vuol dire vedere il
+ * modello continuare a parlare oltre la sua risposta. */
+static int load_stops(const char *dir, int *out, int max) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/generation_config.json", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END); long size = ftell(f); fseek(f, 0, SEEK_SET);
+    char *text = malloc((size_t)size + 1);
+    if (!text || fread(text, 1, (size_t)size, f) != (size_t)size) {
+        free(text); fclose(f); return 0;
+    }
+    text[size] = 0; fclose(f);
+    char *arena = NULL;
+    jval *root = json_parse(text, &arena);
+    int found = 0;
+    if (root && root->t == J_OBJ) {
+        jval *eos = json_get(root, "eos_token_id");
+        if (eos && eos->t == J_NUM && found < max) out[found++] = (int)eos->num;
+        else if (eos && eos->t == J_ARR)
+            for (int i = 0; i < eos->len && found < max; i++)
+                if (eos->kids[i]->t == J_NUM) out[found++] = (int)eos->kids[i]->num;
+    }
+    free(arena);
+    free(text);
+    return found;
+}
+
 int main(int argc, char **argv) {
-    const char *dir = NULL, *ids = NULL, *patch_file = NULL;
+    const char *dir = NULL, *ids = NULL, *patch_file = NULL, *prompt_text = NULL;
     int greedy = 0, show_logits = 0, grid_h = 0, grid_w = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model") && i + 1 < argc) dir = argv[++i];
         else if (!strcmp(argv[i], "--ids") && i + 1 < argc) ids = argv[++i];
         else if (!strcmp(argv[i], "--greedy") && i + 1 < argc) greedy = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--logits")) show_logits = 1;
+        else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt_text = argv[++i];
         else if (!strcmp(argv[i], "--patches") && i + 1 < argc) patch_file = argv[++i];
         else if (!strcmp(argv[i], "--grid") && i + 1 < argc &&
                  sscanf(argv[++i], "%dx%d", &grid_h, &grid_w) == 2) continue;
         else { fprintf(stderr, "argomento sconosciuto: %s\n", argv[i]); return 2; }
     }
-    if (!dir || !ids) {
-        fprintf(stderr, "uso: %s --model DIR --ids a,b,c [--greedy N] [--logits]\n"
-                        "         [--patches FILE.f32 --grid HxW]\n", argv[0]);
+    if (!dir || (!ids && !prompt_text)) {
+        fprintf(stderr, "uso: %s --model DIR (--prompt TESTO | --ids a,b,c)\n"
+                        "         [--greedy N] [--logits] [--patches FILE.f32 --grid HxW]\n",
+                argv[0]);
+        return 2;
+    }
+    if (ids && prompt_text) {
+        fprintf(stderr, "--prompt e --ids sono due modi di dire la stessa cosa\n");
         return 2;
     }
     if (!!patch_file != (grid_h > 0 && grid_w > 0)) {
@@ -1526,15 +1562,28 @@ int main(int argc, char **argv) {
     }
     int capacity = 1024, count = 0;
     int *tokens = malloc((size_t)capacity * sizeof(int));
-    for (const char *p = ids; *p; ) {
-        char *end;
-        long value = strtol(p, &end, 10);
-        if (end == p) break;
-        if (count == capacity) tokens = realloc(tokens, (size_t)(capacity *= 2) * sizeof(int));
-        tokens[count++] = (int)value;
-        p = (*end == ',') ? end + 1 : end;
+    Tok tokenizer; int has_tokenizer = 0;
+
+    if (prompt_text) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/tokenizer.json", dir);
+        tok_load(&tokenizer, path);
+        has_tokenizer = 1;
+        const int room = 1 << 16;
+        tokens = realloc(tokens, (size_t)room * sizeof(int));
+        capacity = room;
+        count = tok_encode(&tokenizer, prompt_text, (int)strlen(prompt_text), tokens, room);
+    } else {
+        for (const char *p = ids; *p; ) {
+            char *end;
+            long value = strtol(p, &end, 10);
+            if (end == p) break;
+            if (count == capacity) tokens = realloc(tokens, (size_t)(capacity *= 2) * sizeof(int));
+            tokens[count++] = (int)value;
+            p = (*end == ',') ? end + 1 : end;
+        }
     }
-    if (!count) { fprintf(stderr, "nessun id nel prompt\n"); return 2; }
+    if (!count) { fprintf(stderr, "nessun token nel prompt\n"); return 2; }
 
     GModel model;
     memset(&model, 0, sizeof(model));     /* contatori e puntatori opzionali */
@@ -1581,22 +1630,35 @@ int main(int argc, char **argv) {
         printf("\n");
     }
     if (greedy > 0) {
+        int stops[8];
+        const int n_stops = has_tokenizer ? load_stops(dir, stops, 8) : 0;
         int total = count;
         int *sequence = malloc((size_t)(count + greedy) * sizeof(int));
         memcpy(sequence, tokens, (size_t)count * sizeof(int));
-        printf("greedy");
+        if (!has_tokenizer) printf("greedy");
         for (int step = 0; step < greedy; step++) {
             free(logits);
             /* i token immagine restano nel prefisso a ogni passo, quindi la
              * torre si rifornisce identica: non si riesegue e non si sposta */
             logits = forward(&model, sequence, total, vision, n_vision);
             int next = argmax(logits + (size_t)(total - 1) * model.c.vocab, model.c.vocab);
+            int done = 0;
+            for (int i = 0; i < n_stops; i++) if (next == stops[i]) done = 1;
+            if (done) break;
             sequence[total++] = next;
-            printf(" %d", next);
+            if (has_tokenizer) {
+                char piece[512];
+                int written = tok_decode(&tokenizer, &next, 1, piece, sizeof(piece) - 1);
+                fwrite(piece, 1, (size_t)written, stdout);
+                fflush(stdout);
+            } else {
+                printf(" %d", next);
+            }
         }
         printf("\n");
         free(sequence);
     }
+    if (has_tokenizer) tok_free(&tokenizer);
     /* Contatori della cache esperti: servono a un test per accorgersi se lo
      * streaming e' stato aggirato invece che esercitato. */
     if (model.streaming)
