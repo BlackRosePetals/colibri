@@ -1016,8 +1016,9 @@ qwen38-tiny-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny
 
 qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
-	@for bf16 in 0 1; do for cap in 1 4; do \
-		Q38_NATIVE_BF16=$$bf16 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json || exit $$?; \
+	@for batch in 0 1; do for bf16 in 0 1; do for cap in 1 4; do \
+		Q38_PREFILL_BATCH=$$batch Q38_NATIVE_BF16=$$bf16 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json || exit $$?; \
+	done; \
 	done; \
 	done
 
@@ -1112,6 +1113,9 @@ tests/test_qwen38_config$(EXE): tests/test_qwen38_config.c qwen38.c qwen38_core.
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_serve_framing$(EXE): tests/test_qwen38_serve_framing.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
+	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
+
+tests/test_qwen38_prefix$(EXE): tests/test_qwen38_prefix.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
 	$(CC) $(NOCUDA_CFLAGS) $< -o $@ $(NOCUDA_LDFLAGS)
 
 tests/test_qwen38_metrics$(EXE): tests/test_qwen38_metrics.c qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.h compat.h quant.h route_trace.h serve_codec.h tok_unicode.h tok_unicode_o200k.h
@@ -1376,7 +1380,8 @@ $(SEGMENT_BUILD_DIR)/qwen36.o: qwen36.c segment_runtime.h edge_runtime.h \
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN36_NO_MAIN -c qwen36.c -o $@
 
 $(SEGMENT_BUILD_DIR)/qwen38.o: qwen38.c qwen38_core.h segment_runtime.h \
-		segment_adapters.h segment_adapter_internal.h st.h json.h compat.h quant.h \
+		segment_adapters.h segment_adapter_internal.h edge_runtime.h \
+		edge_adapters.h edge_adapter_internal.h st.h json.h compat.h quant.h \
 		qwen38_nfc.h qwen38_nfc_tables.h route_trace.h tok_unicode.h \
 		tok_unicode_o200k.h | $(SEGMENT_BUILD_DIR)
 	$(CC) $(SEGMENT_CPU_CFLAGS) -DQWEN38_NO_MAIN -c qwen38.c -o $@
@@ -1469,12 +1474,14 @@ edge-adapters-real: tests/test_edge_adapters_real$(EXE)
 	@test -n "$(KIMI_EDGE_MODEL)" && test -n "$(KIMI_EDGE_REF)" || { echo "set KIMI_EDGE_MODEL and KIMI_EDGE_REF" >&2; exit 2; }
 	@test -n "$(OLMOE_EDGE_MODEL)" && test -n "$(OLMOE_EDGE_REF)" || { echo "set OLMOE_EDGE_MODEL and OLMOE_EDGE_REF" >&2; exit 2; }
 	@test -n "$(QWEN_EDGE_MODEL)" && test -n "$(QWEN_EDGE_REF)" || { echo "set QWEN_EDGE_MODEL and QWEN_EDGE_REF" >&2; exit 2; }
+	@test -n "$(QWEN38_EDGE_MODEL)" && test -n "$(QWEN38_EDGE_REF)" || { echo "set QWEN38_EDGE_MODEL and QWEN38_EDGE_REF" >&2; exit 2; }
 	@test -n "$(DEEPSEEK_EDGE_MODEL)" && test -n "$(DEEPSEEK_EDGE_REF)" || { echo "set DEEPSEEK_EDGE_MODEL and DEEPSEEK_EDGE_REF" >&2; exit 2; }
 	GLM_SEGMENT_EBITS=16 GLM_SEGMENT_DBITS=16 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) glm "$(GLM_EDGE_MODEL)" "$(GLM_EDGE_REF)" 3
 	INK_SEGMENT_BITS=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) inkling "$(INKLING_EDGE_MODEL)" "$(INKLING_EDGE_REF)" 3
 	COLI_RAM_OVERCOMMIT=1 K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) kimi "$(KIMI_EDGE_MODEL)" "$(KIMI_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) olmoe "$(OLMOE_EDGE_MODEL)" "$(OLMOE_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen36 "$(QWEN_EDGE_MODEL)" "$(QWEN_EDGE_REF)" 3
+	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) qwen38 "$(QWEN38_EDGE_MODEL)" "$(QWEN38_EDGE_REF)" 3
 	OMP_NUM_THREADS=$${OMP_NUM_THREADS:-2} ./tests/test_edge_adapters_real$(EXE) deepseek_v4 "$(DEEPSEEK_EDGE_MODEL)" "$(DEEPSEEK_EDGE_REF)" 3
 
 V4_HOT_TEST_OBJ = COLI_V4_UNIT_EXPERT_STORE_HOT_ROWS16_TEST.o

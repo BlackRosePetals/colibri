@@ -13,6 +13,8 @@
 #define Q38_MAX_EXPERTS 1024
 #define Q38_MAX_TOPK 256
 #define Q38_MAX_PLE_PARTS 512
+#define Q38_PREFILL_BATCH_ROWS 32
+#define Q38_PREFILL_WORKSPACE_BYTES (64u << 20)
 
 typedef struct {
     int hidden, layers, vocab, max_positions, eos_id;
@@ -127,6 +129,7 @@ typedef struct {
     int ple_history_len;
     int range_begin, range_end;
     int native_fp8, native_bf16, expert_prefetch, expert_parallel_reads;
+    int prefill_batch;
     uint64_t resident_weight_bytes;
     double dense_load_s;
     Q38Timers timers;
@@ -646,6 +649,7 @@ static void model_init_range(Model *m,const char *snap,int cap,int bits,
     m->native_bf16=q38_env_bool("Q38_NATIVE_BF16",1);
     m->expert_prefetch=q38_env_bool("Q38_EXPERT_PREFETCH",1);
     m->expert_parallel_reads=q38_env_bool("Q38_EXPERT_PARALLEL_READS",1);
+    m->prefill_batch=q38_env_bool("Q38_PREFILL_BATCH",1);
     q38_load_cfg(&m->c,snap); q38_validate_cfg(&m->c); st_init(&m->S,snap);
     Cfg *c=&m->c; char nm[320];
     if(st_has(&m->S,"model.language_model.embed_tokens.weight")) snprintf(m->prefix,sizeof m->prefix,"model.language_model");
@@ -1207,45 +1211,126 @@ static void q38_ple(Model *m,const int *ids,int S,const float *hyper,float *out)
     q38_tm_add(m,Q38_TM_PLE,phase_started);
 }
 
-static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+/* Choose a context-independent prefill chunk whose private workspace fits the
+ * common target.  Callers provide exact fixed and per-row byte counts; even a
+ * hostile-but-valid geometry gets one row rather than an unbounded allocation. */
+static int q38_bounded_prefill_rows(int requested,uint64_t fixed,
+                                    uint64_t per_row) {
+    int rows=requested<Q38_PREFILL_BATCH_ROWS?requested:Q38_PREFILL_BATCH_ROWS;
+    if(rows<1)return 1;
+    for(;rows>1;rows--)
+        if(per_row<=UINT64_MAX/(uint64_t)rows&&
+           fixed<=UINT64_MAX-per_row*(uint64_t)rows&&
+           fixed+per_row*(uint64_t)rows<=Q38_PREFILL_WORKSPACE_BYTES)
+            return rows;
+    return 1;
+}
+
+/* Batch the four resident DeltaNet input projections and the output projection
+ * in bounded chunks.  The convolution and recurrent update remain strictly
+ * token-causal inside each chunk, so chunk boundaries cannot change state or
+ * floating-point order. */
+static void q38_deltanet(Model *m,Layer *l,int layer,const float *x,int S,
+                         float *out) {
     double phase_started=now_s();
-    Cfg *c=&m->c; int H=c->hidden,VH=c->dn_vheads,KH=c->dn_kheads,KD=c->dn_kdim,VD=c->dn_vdim;
-    int CD=c->dn_conv_dim,CK=c->dn_convk,V=VH*VD,K=KH*KD,rep=VH/KH;
-    float *qkv=falloc(CD),*z=falloc(V),*bb=falloc(VH),*aa=falloc(VH),*conv=falloc(CD);
-    float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD),*core=falloc(V),*norm=falloc(V);
+    Cfg *c=&m->c;
+    int H=c->hidden,VH=c->dn_vheads,KH=c->dn_kheads;
+    int KD=c->dn_kdim,VD=c->dn_vdim,CD=c->dn_conv_dim,CK=c->dn_convk;
+    int V=VH*VD,K=KH*KD,rep=VH/KH;
+    uint64_t row_floats=(uint64_t)CD+2u*(uint64_t)V+2u*(uint64_t)VH;
+    uint64_t fixed_floats=(uint64_t)CD+2u*(uint64_t)VH*(uint64_t)KD+
+                          (uint64_t)V;
+    uint64_t row_bytes=row_floats>UINT64_MAX/sizeof(float)?
+                       UINT64_MAX:row_floats*sizeof(float);
+    uint64_t fixed_bytes=fixed_floats>UINT64_MAX/sizeof(float)?
+                         UINT64_MAX:fixed_floats*sizeof(float);
+    int rows_capacity=m->prefill_batch?
+                      q38_bounded_prefill_rows(S,fixed_bytes,row_bytes):1;
+
+    float *qkv=falloc((int64_t)rows_capacity*CD);
+    float *z=falloc((int64_t)rows_capacity*V);
+    float *bb=falloc((int64_t)rows_capacity*VH);
+    float *aa=falloc((int64_t)rows_capacity*VH);
+    float *norm=falloc((int64_t)rows_capacity*V);
+    float *conv=falloc(CD);
+    float *q=falloc((int64_t)VH*KD),*k=falloc((int64_t)VH*KD);
+    float *core=falloc(V);
     float *rec=m->DN_rec[layer],*ring=m->DN_conv[layer];
-    for(int s=0;s<S;s++){
-        const float *xs=x+(int64_t)s*H;
-        q38_dense_matmul(m,qkv,xs,&l->dn_qkv,1,H,CD);q38_dense_matmul(m,z,xs,&l->dn_z,1,H,V);
-        q38_dense_matmul(m,bb,xs,&l->dn_b,1,H,VH);q38_dense_matmul(m,aa,xs,&l->dn_a,1,H,VH);
-        for(int d=0;d<CD;d++){
-            float a=l->dn_conv[(int64_t)d*CK+CK-1]*qkv[d];float *r=ring+(int64_t)d*(CK-1);
-            for(int j=0;j<CK-1;j++)a+=l->dn_conv[(int64_t)d*CK+j]*r[j];conv[d]=q38_silu(a);
-            for(int j=0;j<CK-2;j++)r[j]=r[j+1];r[CK-2]=qkv[d];
+
+    for(int base=0;base<S;) {
+        int rows=S-base<rows_capacity?S-base:rows_capacity;
+        const float *chunk=x+(int64_t)base*H;
+        q38_dense_matmul(m,qkv,chunk,&l->dn_qkv,rows,H,CD);
+        q38_dense_matmul(m,z,chunk,&l->dn_z,rows,H,V);
+        q38_dense_matmul(m,bb,chunk,&l->dn_b,rows,H,VH);
+        q38_dense_matmul(m,aa,chunk,&l->dn_a,rows,H,VH);
+
+        for(int s=0;s<rows;s++) {
+            float *qkv_row=qkv+(int64_t)s*CD;
+            float *z_row=z+(int64_t)s*V;
+            float *b_row=bb+(int64_t)s*VH;
+            float *a_row=aa+(int64_t)s*VH;
+            for(int d=0;d<CD;d++) {
+                float value=l->dn_conv[(int64_t)d*CK+CK-1]*qkv_row[d];
+                float *history=ring+(int64_t)d*(CK-1);
+                for(int tap=0;tap<CK-1;tap++)
+                    value+=l->dn_conv[(int64_t)d*CK+tap]*history[tap];
+                conv[d]=q38_silu(value);
+                for(int tap=0;tap<CK-2;tap++)history[tap]=history[tap+1];
+                history[CK-2]=qkv_row[d];
+            }
+            const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
+            for(int h=0;h<VH;h++) {
+                float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD;
+                memcpy(qh,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
+                memcpy(kh,ki+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
+                double qsum=1e-6,ksum=1e-6;
+                for(int d=0;d<KD;d++) {
+                    qsum+=(double)qh[d]*qh[d];
+                    ksum+=(double)kh[d]*kh[d];
+                }
+                float qscale=1.f/sqrtf((float)qsum)/sqrtf((float)KD);
+                float kscale=1.f/sqrtf((float)ksum);
+                for(int d=0;d<KD;d++){qh[d]*=qscale;kh[d]*=kscale;}
+            }
+            #pragma omp parallel for schedule(static)
+            for(int h=0;h<VH;h++) {
+                float *state=rec+(int64_t)h*KD*VD;
+                const float *qh=q+(int64_t)h*KD;
+                const float *kh=k+(int64_t)h*KD;
+                const float *vh=vi+(int64_t)h*VD;
+                float alpha=expf(-expf(l->dn_alog[h])*
+                                 q38_softplus(a_row[h]+l->dn_dtbias[h]));
+                float beta=q38_sigmoid(b_row[h]);
+                float delta[512];
+                int64_t state_cells=(int64_t)KD*VD;
+                for(int64_t cell=0;cell<state_cells;cell++)state[cell]*=alpha;
+                for(int value=0;value<VD;value++) {
+                    float previous=0.f;
+                    for(int d=0;d<KD;d++)
+                        previous+=kh[d]*state[(int64_t)d*VD+value];
+                    delta[value]=(vh[value]-previous)*beta;
+                }
+                for(int d=0;d<KD;d++)for(int value=0;value<VD;value++)
+                    state[(int64_t)d*VD+value]+=kh[d]*delta[value];
+                for(int value=0;value<VD;value++) {
+                    float current=0.f;
+                    for(int d=0;d<KD;d++)
+                        current+=qh[d]*state[(int64_t)d*VD+value];
+                    core[(int64_t)h*VD+value]=current;
+                }
+            }
+            float *norm_row=norm+(int64_t)s*V;
+            for(int h=0;h<VH;h++)
+                q38_rmsg(norm_row+(int64_t)h*VD,core+(int64_t)h*VD,
+                         z_row+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
         }
-        const float *qi=conv,*ki=conv+K,*vi=conv+2*K;
-        for(int h=0;h<VH;h++){
-            memcpy(q+(int64_t)h*KD,qi+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
-            memcpy(k+(int64_t)h*KD,ki+(int64_t)(h/rep)*KD,(size_t)KD*sizeof(float));
-            double qs=1e-6,ks=1e-6;for(int d=0;d<KD;d++){qs+=(double)q[(int64_t)h*KD+d]*q[(int64_t)h*KD+d];ks+=(double)k[(int64_t)h*KD+d]*k[(int64_t)h*KD+d];}
-            float qr=1.f/sqrtf((float)qs)/sqrtf((float)KD),kr=1.f/sqrtf((float)ks);
-            for(int d=0;d<KD;d++){q[(int64_t)h*KD+d]*=qr;k[(int64_t)h*KD+d]*=kr;}
-        }
-        #pragma omp parallel for schedule(static)
-        for(int h=0;h<VH;h++){
-            float *state=rec+(int64_t)h*KD*VD;const float *qh=q+(int64_t)h*KD,*kh=k+(int64_t)h*KD,*vh=vi+(int64_t)h*VD;
-            float alpha=expf(-expf(l->dn_alog[h])*q38_softplus(aa[h]+l->dn_dtbias[h]));
-            float beta=q38_sigmoid(bb[h]);float delta[512];
-            int64_t state_cells=(int64_t)KD*VD;
-            for(int64_t z0=0;z0<state_cells;z0++)state[z0]*=alpha;
-            for(int v0=0;v0<VD;v0++){float a=0.f;for(int d=0;d<KD;d++)a+=kh[d]*state[(int64_t)d*VD+v0];delta[v0]=(vh[v0]-a)*beta;}
-            for(int d=0;d<KD;d++)for(int v0=0;v0<VD;v0++)state[(int64_t)d*VD+v0]+=kh[d]*delta[v0];
-            for(int v0=0;v0<VD;v0++){float a=0.f;for(int d=0;d<KD;d++)a+=qh[d]*state[(int64_t)d*VD+v0];core[(int64_t)h*VD+v0]=a;}
-        }
-        for(int h=0;h<VH;h++)q38_rmsg(norm+(int64_t)h*VD,core+(int64_t)h*VD,z+(int64_t)h*VD,l->dn_norm,VD,c->eps,1);
-        q38_dense_matmul(m,out+(int64_t)s*H,norm,&l->dn_out,1,V,H);
+        q38_dense_matmul(m,out+(int64_t)base*H,norm,&l->dn_out,
+                         rows,V,H);
+        base+=rows;
     }
-    free(qkv);free(z);free(bb);free(aa);free(conv);free(q);free(k);free(core);free(norm);
+    free(qkv);free(z);free(bb);free(aa);free(norm);free(conv);
+    free(q);free(k);free(core);
     q38_tm_add(m,Q38_TM_DELTANET,phase_started);
 }
 
@@ -1306,7 +1391,10 @@ static void q38_attention(Model *m,Layer *l,int layer,const float *x,int S,int p
     free(qp);free(kp);free(vp);free(ip);free(heads);free(qidx);free(pool);free(selected);
 }
 
-static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+/* The single-row path is intentionally kept separate from prefill.  Decode is
+ * the latency-sensitive steady state and should not pay for route tables or a
+ * prompt-sized workspace. */
+static void q38_moe_decode(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
     Cfg *c=&m->c;int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
     float *logits=falloc(E),*sg=falloc(SI),*su=falloc(SI),*sh=falloc(SI),*shared=falloc(H);
     float *eg=falloc(I),*eu=falloc(I),*eh=falloc(I),*eo=falloc(H);
@@ -1339,6 +1427,228 @@ static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out)
     }
     rt_trace_end();
     free(logits);free(sg);free(su);free(sh);free(shared);free(eg);free(eu);free(eh);free(eo);
+}
+
+typedef struct {
+    int expert;
+    float gate;
+} Q38RouteAssignment;
+
+/* Pick a prefill size from a fixed workspace budget.  The number of rows is
+ * deliberately bounded independently of the context length: a long prompt
+ * therefore reuses the same route, expert and matmul buffers one chunk at a
+ * time.  A single assignment needs input, gate/up activations and output;
+ * these are the only buffers that scale with the number of routed rows. */
+static int q38_moe_prefill_rows(const Cfg *c,int requested) {
+    int64_t H=c->hidden,I=c->inter,E=c->experts,K=c->topk,SI=c->shared_inter;
+    uint64_t per_assignment=(uint64_t)(2LL*((int64_t)H+I))*sizeof(float)+
+                             sizeof(Q38RouteAssignment)+2*sizeof(int);
+    uint64_t per_row=(uint64_t)E*sizeof(float)+
+                     (uint64_t)(3LL*(int64_t)SI+H+1)*sizeof(float);
+    uint64_t fixed=(uint64_t)E*(4*sizeof(int)+2*sizeof(Slot*));
+    if(fixed<=UINT64_MAX-sizeof(int))fixed+=sizeof(int); /* group_offsets[E] */
+    else fixed=UINT64_MAX;
+    uint64_t assignment_row=(uint64_t)K>UINT64_MAX/per_assignment?
+                            UINT64_MAX:(uint64_t)K*per_assignment;
+    uint64_t total_row=per_row>UINT64_MAX-assignment_row?
+                       UINT64_MAX:per_row+assignment_row;
+    return q38_bounded_prefill_rows(requested,fixed,total_row);
+}
+
+/* Prefill MoE: route a bounded row chunk first, then execute each distinct
+ * expert's assignments as one batched SwiGLU.  Grouping is an I/O optimization
+ * only.  Expert outputs are placed back in assignment order and the final
+ * weighted reduction still visits rank 0..top-k-1 for every row, preserving the
+ * decode path's floating-point accumulation order. */
+static void q38_moe_prefill(Model *m,Layer *l,int layer,const float *x,
+                            int S,float *out) {
+    Cfg *c=&m->c;
+    int H=c->hidden,E=c->experts,K=c->topk,I=c->inter,SI=c->shared_inter;
+    int rows_capacity=q38_moe_prefill_rows(c,S);
+    int64_t max_assign=(int64_t)rows_capacity*K;
+
+    Q38RouteAssignment *routes=(Q38RouteAssignment*)malloc(
+        (size_t)max_assign*sizeof(*routes));
+    int *assignments=(int*)malloc((size_t)max_assign*sizeof(*assignments));
+    int *assignment_positions=(int*)malloc((size_t)max_assign*sizeof(*assignment_positions));
+    int *group_counts=(int*)calloc((size_t)E,sizeof(*group_counts));
+    int *group_offsets=(int*)malloc((size_t)(E+1)*sizeof(*group_offsets));
+    int *group_cursor=(int*)malloc((size_t)E*sizeof(*group_cursor));
+    int *unique=(int*)malloc((size_t)E*sizeof(*unique));
+    Slot **batch_slots=(Slot**)calloc((size_t)E,sizeof(*batch_slots));
+    if(!routes||!assignments||!assignment_positions||!group_counts||
+       !group_offsets||!group_cursor||!unique||!batch_slots){
+        fprintf(stderr,"OOM Qwen3.8 MoE prefill metadata\n");exit(1);
+    }
+
+    float *logits=falloc((int64_t)rows_capacity*E);
+    float *shared_gate=falloc(rows_capacity);
+    float *shared_g=falloc((int64_t)rows_capacity*SI);
+    float *shared_u=falloc((int64_t)rows_capacity*SI);
+    float *shared_hidden=falloc((int64_t)rows_capacity*SI);
+    float *shared_out=falloc((int64_t)rows_capacity*H);
+    float *expert_input=falloc(max_assign*H);
+    float *expert_gate=falloc(max_assign*I);
+    float *expert_up=falloc(max_assign*I);
+    float *routed_out=falloc(max_assign*H);
+
+    for(int base=0;base<S;) {
+        int rows=S-base<rows_capacity?S-base:rows_capacity;
+        int assignment_count=rows*K;
+        memset(group_counts,0,(size_t)E*sizeof(*group_counts));
+
+        /* Route the complete chunk with one resident router matmul.  Selection
+         * intentionally mirrors q38_moe_decode, including rt_router_pick's
+         * deterministic fallback for invalid logits. */
+        q38_dense_matmul(m,logits,x+(int64_t)base*H,&l->router,rows,H,E);
+        for(int s=0;s<rows;s++) {
+            float *probabilities=logits+(int64_t)s*E;
+            float maximum=probabilities[0];
+            for(int e=1;e<E;e++)if(probabilities[e]>maximum)maximum=probabilities[e];
+            double total=0.0;
+            for(int e=0;e<E;e++) {
+                probabilities[e]=expf(probabilities[e]-maximum);
+                total+=probabilities[e];
+            }
+            int selected[Q38_MAX_TOPK];
+            float selected_probability[Q38_MAX_TOPK];
+            for(int rank=0;rank<K;rank++) {
+                int best=-1;float best_value=-1.f;
+                for(int e=0;e<E;e++) {
+                    int used=0;
+                    for(int previous=0;previous<rank;previous++)
+                        if(selected[previous]==e){used=1;break;}
+                    if(!used&&probabilities[e]>best_value){
+                        best_value=probabilities[e];best=e;
+                    }
+                }
+                selected[rank]=rt_router_pick(best,rank,E,layer);
+                selected_probability[rank]=probabilities[selected[rank]];
+            }
+            double top=0.0;
+            for(int rank=0;rank<K;rank++)top+=selected_probability[rank];
+            double denominator=c->norm_topk?top:total;
+            float gates[Q38_MAX_TOPK];
+            for(int rank=0;rank<K;rank++) {
+                gates[rank]=(float)(selected_probability[rank]/denominator);
+                int assignment=s*K+rank;
+                routes[assignment]=(Q38RouteAssignment){selected[rank],gates[rank]};
+                group_counts[selected[rank]]++;
+            }
+            rt_route(layer,base+s,selected,gates,K);
+        }
+
+        /* Prefixing by expert makes every group contiguous while the inverse
+         * map lets the final reduction recover the original row/rank order. */
+        group_offsets[0]=0;
+        int unique_count=0;
+        for(int e=0;e<E;e++) {
+            group_offsets[e+1]=group_offsets[e]+group_counts[e];
+            if(group_counts[e])unique[unique_count++]=e;
+        }
+        memset(group_cursor,0,(size_t)E*sizeof(*group_cursor));
+        for(int assignment=0;assignment<assignment_count;assignment++) {
+            int expert=routes[assignment].expert;
+            int position=group_offsets[expert]+group_cursor[expert]++;
+            assignments[position]=assignment;
+            assignment_positions[assignment]=position;
+        }
+
+        /* One advice range per distinct expert is enough for this chunk. */
+        q38_prefetch_native_fp8_experts(m,layer,unique,unique_count);
+
+        /* Shared expert work is independent across rows and remains resident;
+         * batching it here also keeps its cost out of the routed groups. */
+        double phase_started=now_s();
+        q38_weight_matmul(shared_g,x+(int64_t)base*H,&l->sh_g,rows,H,SI);
+        q38_weight_matmul(shared_u,x+(int64_t)base*H,&l->sh_u,rows,H,SI);
+        for(int s=0;s<rows;s++)
+            for(int j=0;j<SI;j++)
+                shared_hidden[(int64_t)s*SI+j]=
+                    q38_silu(shared_g[(int64_t)s*SI+j])*
+                    shared_u[(int64_t)s*SI+j];
+        q38_weight_matmul(shared_out,shared_hidden,&l->sh_d,rows,SI,H);
+        for(int s=0;s<rows;s++) {
+            const float *xs=x+(int64_t)(base+s)*H;
+            float gate=0.f;
+            for(int d=0;d<H;d++)gate+=xs[d]*l->sh_gate[d];
+            shared_gate[s]=q38_sigmoid(gate);
+        }
+        q38_tm_add(m,Q38_TM_SHARED_EXPERT,phase_started);
+
+        /* A demand-set batch is particularly effective for native FP8: reserve
+         * all slots before workers read the two coalesced ranges.  Other native
+         * layouts use the same grouped matmul loop with the ordinary bounded
+         * LRU loader, so no format loses correctness or caching. */
+        memset(out+(int64_t)base*H,0,(size_t)rows*H*sizeof(float));
+        /* A prompt chunk can route to more distinct experts than the retained
+         * cache can hold.  Load and consume cache-sized groups instead of
+         * declining the complete parallel demand set: every expert is still
+         * loaded once for this chunk, and a later group may safely reuse its
+         * slots because the preceding outputs already live in routed_out. */
+        int load_limit=m->cache[layer].cap;
+        if(load_limit>Q38_MAX_TOPK)load_limit=Q38_MAX_TOPK;
+        if(load_limit<1)load_limit=1;
+        for(int unique_base=0;unique_base<unique_count;) {
+            int load_count=unique_count-unique_base;
+            if(load_count>load_limit)load_count=load_limit;
+            int loaded_batch=load_count>=2&&q38_expert_get_batch(
+                m,layer,unique+unique_base,load_count,batch_slots);
+            for(int offset=0;offset<load_count;offset++) {
+                int e=unique[unique_base+offset];
+                int count=group_counts[e];
+                Slot *expert=loaded_batch?batch_slots[offset]:
+                                          q38_expert_get(m,layer,e);
+                int first=group_offsets[e];
+                for(int a=0;a<count;a++) {
+                    int assignment=assignments[first+a];
+                    int row=assignment/K;
+                    memcpy(expert_input+(int64_t)a*H,
+                           x+(int64_t)(base+row)*H,(size_t)H*sizeof(float));
+                }
+                phase_started=now_s();
+                q38_weight_matmul(expert_gate,expert_input,&expert->gate,
+                                  count,H,I);
+                q38_weight_matmul(expert_up,expert_input,&expert->up,count,H,I);
+                for(int a=0;a<count;a++)for(int j=0;j<I;j++)
+                    expert_gate[(int64_t)a*I+j]=
+                        q38_silu(expert_gate[(int64_t)a*I+j])*
+                        expert_up[(int64_t)a*I+j];
+                q38_weight_matmul(routed_out+(int64_t)first*H,expert_gate,
+                                  &expert->down,count,I,H);
+                q38_tm_add(m,Q38_TM_ROUTED_EXPERT,phase_started);
+            }
+            unique_base+=load_count;
+        }
+
+        /* The grouped execution above is intentionally not the reduction
+         * order.  Replaying the original top-k sequence gives the same result
+         * as the single-row implementation for F32, BF16 and block-FP8. */
+        for(int s=0;s<rows;s++) {
+            float *ys=out+(int64_t)(base+s)*H;
+            for(int rank=0;rank<K;rank++) {
+                int assignment=s*K+rank;
+                const float *expert_output=routed_out+
+                    (int64_t)assignment_positions[assignment]*H;
+                float gate=routes[assignment].gate;
+                for(int d=0;d<H;d++)ys[d]+=gate*expert_output[d];
+            }
+            const float *shared=shared_out+(int64_t)s*H;
+            for(int d=0;d<H;d++)ys[d]+=shared_gate[s]*shared[d];
+        }
+        base+=rows;
+    }
+    rt_trace_end();
+    free(logits);free(shared_gate);free(shared_g);free(shared_u);
+    free(shared_hidden);free(shared_out);free(expert_input);free(expert_gate);
+    free(expert_up);free(routed_out);free(routes);free(assignments);
+    free(assignment_positions);free(group_counts);free(group_offsets);
+    free(group_cursor);free(unique);free(batch_slots);
+}
+
+static void q38_moe(Model *m,Layer *l,int layer,const float *x,int S,float *out) {
+    if(S<=1||!m->prefill_batch)q38_moe_decode(m,l,layer,x,S,out);
+    else q38_moe_prefill(m,l,layer,x,S,out);
 }
 
 static void reset_recurrent(Model *m) {
@@ -1463,13 +1773,15 @@ static void q38_layer_free(Layer *l) {
 static void q38_model_free(Model *m) {
     if(!m) return;
     for(int i=0;i<m->c.layers;i++) {
-        q38_layer_free(&m->L[i]);
+        if(m->L)q38_layer_free(&m->L[i]);
         if(m->cache) {
-            for(int s=0;s<m->cache[i].n;s++){
-                q38_weight_free(&m->cache[i].slots[s].gate);
-                q38_weight_free(&m->cache[i].slots[s].up);
-                q38_weight_free(&m->cache[i].slots[s].down);
-                free(m->cache[i].slots[s].fp8_slab);
+            if(m->cache[i].slots) {
+                for(int s=0;s<m->cache[i].n;s++) {
+                    q38_weight_free(&m->cache[i].slots[s].gate);
+                    q38_weight_free(&m->cache[i].slots[s].up);
+                    q38_weight_free(&m->cache[i].slots[s].down);
+                    free(m->cache[i].slots[s].fp8_slab);
+                }
             }
             free(m->cache[i].slots); free(m->cache[i].by_expert);
         }

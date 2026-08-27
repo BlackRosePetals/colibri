@@ -18,6 +18,7 @@ from family_registry import (
     PlannerUnsupportedError,
     _build_registry,
     expert_contributions,
+    fixed_resident_contribution,
     family_for_config,
     planner_geometry,
     public_metadata,
@@ -192,10 +193,12 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(resolved.family_config["model_type"], "qwen4_exp_text")
         geometry = planner_geometry(resolved, 32)
         self.assertEqual(geometry.configured_experts, 512)
+        live_context = 12 * 32 * (2 * 2 * 256 + 128) * 4
         self.assertEqual(geometry.context_state_bytes,
-                         12 * 32 * (2 * 2 * 256 + 128) * 4)
-        expected_fixed = (36 * (48 * 128 * 128 + 10240 * 3) * 4 +
-                          10240 * 9 * 4 + 2 * 8)
+                         live_context + 32 * 4)
+        live_fixed = (36 * (48 * 128 * 128 + 10240 * 3) * 4 +
+                      10240 * 9 * 4 + 2 * 8)
+        expected_fixed = live_fixed * 2 + 248320 * 4
         self.assertEqual(geometry.fixed_state_bytes, expected_fixed)
         base_row = 4 * 2560 + 2 * 2560 + 4
         gated_residual_row = base_row + 2 * 4 * 2560 + 320
@@ -209,8 +212,20 @@ class FamilyRegistryTest(unittest.TestCase):
         ple_fixed = 2560 + 5 * 4 * 2560 + 2560
         qsa_fixed = 4 * 128 + 128 + 2048 + 4 - 1 + max(
             2 * (32 // 4), 256 + 2048 + 4 - 1)
-        expected_workspace = (32 * max(gated_residual_row, qsa_row, ple_row) +
-                              max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+        legacy_workspace = (
+            32 * max(gated_residual_row, qsa_row, ple_row) +
+            max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+        moe_assignment_bytes = 2 * (2560 + 640) * 4 + 8 + 2 * 4
+        moe_row_bytes = (512 + 3 * 640 + 2560 + 1) * 4 + \
+            10 * moe_assignment_bytes
+        moe_fixed_bytes = 512 * (4 * 4 + 8) + 4
+        moe_chunk_bytes = moe_fixed_bytes + 32 * moe_row_bytes
+        delta_row_bytes = (gdn_width + 2 * 48 * 128 + 2 * 48) * 4
+        delta_fixed_bytes = (gdn_width + 2 * 48 * 128 + 48 * 128) * 4
+        delta_chunk_bytes = delta_fixed_bytes + 32 * delta_row_bytes
+        batched_workspace = 32 * base_row * 4 + max(
+            moe_chunk_bytes, delta_chunk_bytes)
+        expected_workspace = max(legacy_workspace, batched_workspace)
         self.assertEqual(geometry.workspace_bytes, expected_workspace)
 
         family = resolved.descriptor
@@ -257,9 +272,12 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(expert_contributions(
             resolved, prefix + ".down_proj.weight", 512, "F16"),
             ((7, 23, 1024),))
+        # FP8 sidecars are normalized into a fixed per-model scale bank, not
+        # copied into every cache slot.
         self.assertEqual(expert_contributions(
-            resolved, prefix + ".down_proj.weight_scale_inv", 4, "F32"),
-            ((7, 23, 4),))
+            resolved, prefix + ".down_proj.weight_scale_inv", 4, "F32"), ())
+        self.assertEqual(fixed_resident_contribution(
+            resolved, prefix + ".down_proj.weight_scale_inv", 4, "F32"), 4)
         with self.assertRaisesRegex(ValueError, "unsupported dtype/size"):
             expert_contributions(
                 resolved, prefix + ".down_proj.weight_scale_inv", 16, "F32")

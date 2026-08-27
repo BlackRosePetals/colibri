@@ -78,6 +78,12 @@ class FamilyDescriptor:
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
     supports_accelerator: bool = True
+    # Optional model-owned allocations that are neither dense resident
+    # tensors nor per-expert cache entries. Qwen3.8 uses this for the
+    # normalized FP8 scale bank shared by every cache slot. Keeping this
+    # separate from expert_inventory prevents a fixed allocation from
+    # being multiplied by the cache capacity.
+    fixed_resident_inventory: object = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +156,19 @@ def _qwen36_geometry(config, context, _model_dir):
     fixed = (layers - full) * (value_heads * key_dim * value_dim +
                                conv_dim * (conv_k - 1)) * 4
     return PlannerGeometry(kv, fixed, 0, _required_int(config, "num_experts", "qwen36"))
+
+
+_QWEN38_PREFILL_BATCH_ROWS = 32
+_QWEN38_PREFILL_WORKSPACE_BYTES = 64 << 20
+
+
+def _qwen38_bounded_prefill(rows, fixed_bytes, row_bytes):
+    """Mirror q38_bounded_prefill_rows() without context-sized scratch."""
+    selected = min(rows, _QWEN38_PREFILL_BATCH_ROWS)
+    while selected > 1 and fixed_bytes + selected * row_bytes > \
+            _QWEN38_PREFILL_WORKSPACE_BYTES:
+        selected -= 1
+    return selected
 
 
 def _qwen38_geometry(config, context, _model_dir):
@@ -242,6 +261,16 @@ def _qwen38_geometry(config, context, _model_dir):
     fixed += len(ple_ids) * (hc_width * ngram * ple_conv * 4 +
                              (ngram - 1) * 8)
 
+    # The one-slot serve path keeps an exact prompt-prefix checkpoint. QSA rows
+    # remain in their existing append-only cache, while every recurrent/PLE
+    # payload is copied once so decode can mutate the live state without
+    # damaging the reusable prompt. It also retains the prompt token IDs and
+    # final prompt logits. The adapter/runtime base reserve covers allocator and
+    # pointer metadata; these are the complete model-sized payloads.
+    prefix_snapshot = fixed + vocab * 4
+    fixed += prefix_snapshot
+    context_state += context * 4
+
     # Match the peak buffers held concurrently by step(): the persistent
     # hyper/mixed/inject/block rows plus the largest layer-local row set. The
     # base planner reserve still covers allocator and non-scaling overhead.
@@ -266,6 +295,30 @@ def _qwen38_geometry(config, context, _model_dir):
                      head_dim + index_budget + index_ratio - 1))
     workspace = (context * max(gated_residual_row, qsa_row, ple_row) +
                  max(moe_fixed, gdn_fixed, ple_fixed, qsa_fixed)) * 4
+
+    # q38_moe_prefill() and q38_deltanet() batch only a bounded row chunk.
+    # Account their exact simultaneous allocations beside the context-sized
+    # outer hyper/mixed/inject/block rows. Q38RouteAssignment is one int plus
+    # one float (8 bytes), and supported hosts use 64-bit pointers.
+    moe_assignment_bytes = 2 * (hidden + intermediate) * 4 + 8 + 2 * 4
+    moe_row_bytes = (experts + 3 * shared + hidden + 1) * 4 + \
+        topk * moe_assignment_bytes
+    moe_fixed_bytes = experts * (4 * 4 + 8) + 4
+    moe_rows = _qwen38_bounded_prefill(
+        context, moe_fixed_bytes, moe_row_bytes)
+    moe_chunk_bytes = moe_fixed_bytes + moe_rows * moe_row_bytes
+
+    delta_row_bytes = (gdn_conv_width + 2 * value_heads * value_dim +
+                       2 * value_heads) * 4
+    delta_fixed_bytes = (gdn_conv_width +
+                         2 * value_heads * key_dim +
+                         value_heads * value_dim) * 4
+    delta_rows = _qwen38_bounded_prefill(
+        context, delta_fixed_bytes, delta_row_bytes)
+    delta_chunk_bytes = delta_fixed_bytes + delta_rows * delta_row_bytes
+    prefill_workspace = context * base_row * 4 + max(
+        moe_chunk_bytes, delta_chunk_bytes)
+    workspace = max(workspace, prefill_workspace)
     return PlannerGeometry(context_state, fixed, workspace,
                            experts)
 
@@ -563,11 +616,13 @@ def _inkling_expert_inventory(name, size, config, _dtype=None):
 
 
 def _qwen38_expert_inventory(name, size, config, dtype=None):
-    """Index both per-expert FP8 and fused BF16 expert tensor layouts.
+    """Index per-expert FP8 and fused BF16 expert tensor layouts.
 
     Resource planning calls this once per tensor; summing the returned byte
     counts therefore combines gate/up and down tensors for each expert without
-    multiplying either tensor by the expert count a second time.
+    multiplying either tensor by the expert count a second time. FP8 scale
+    sidecars are validated here but accounted for by the fixed resident
+    inventory because the native loader shares their normalized bank.
     """
     match = _QWEN38_EXPERT.fullmatch(name)
     if match:
@@ -592,26 +647,11 @@ def _qwen38_expert_inventory(name, size, config, dtype=None):
         return ((int(match.group(1)), int(match.group(2)), retained),)
     match = _QWEN38_EXPERT_SCALE.fullmatch(name)
     if match:
-        # Slots normalize every supported source scale dtype to F32.  Derive
-        # the retained grid rather than charging the source byte count (the
-        # official sidecars happen to be BF16).
-        hidden = _required_int(config, "hidden_size", "qwen38")
-        intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
-        projection = match.group(3)
-        rows = intermediate if projection != "down_proj" else hidden
-        cols = hidden if projection != "down_proj" else intermediate
-        scale_count = math.ceil(rows / 128) * math.ceil(cols / 128)
-        if dtype is None:
-            if size == scale_count * 4:
-                dtype = "F32"
-            elif size == scale_count * 2:
-                dtype = "BF16"
-        source_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
-        if source_bytes is None or size != scale_count * source_bytes:
-            raise ValueError(f"qwen38: expert scale {name!r} has unsupported "
-                             f"dtype/size {dtype}/{size}")
-        scale_bytes = scale_count * 4
-        return ((int(match.group(1)), int(match.group(2)), scale_bytes),)
+        # The native loader normalizes all scales into one fixed per-layer
+        # bank. They are deliberately excluded from per-slot accounting;
+        # _qwen38_fixed_resident_inventory() accounts for that bank once.
+        _qwen38_scale_bytes(name, size, config, dtype)
+        return ()
     match = _QWEN38_FUSED_EXPERT.fullmatch(name)
     if not match:
         return ()
@@ -632,6 +672,47 @@ def _qwen38_expert_inventory(name, size, config, dtype=None):
     per_expert = (elements * 4 if dtype == "F16" else size) // experts
     layer = int(match.group(1))
     return tuple((layer, expert, per_expert) for expert in range(experts))
+
+
+def _qwen38_scale_bytes(name, size, config, dtype=None):
+    """Validate a Qwen3.8 FP8 scale sidecar and return its retained bytes.
+
+    The source sidecar may be BF16 or F32, while the native engine always
+    retains the decoded values as F32. This helper is shared by the expert
+    inventory and fixed-resident inventory so validation and sizing cannot
+    drift apart.
+    """
+    match = _QWEN38_EXPERT_SCALE.fullmatch(name)
+    if match is None:
+        return 0
+    hidden = _required_int(config, "hidden_size", "qwen38")
+    intermediate = _required_int(config, "moe_intermediate_size", "qwen38")
+    projection = match.group(3)
+    rows = intermediate if projection != "down_proj" else hidden
+    cols = hidden if projection != "down_proj" else intermediate
+    scale_count = math.ceil(rows / 128) * math.ceil(cols / 128)
+    if dtype is None:
+        if size == scale_count * 4:
+            dtype = "F32"
+        elif size == scale_count * 2:
+            dtype = "BF16"
+    source_bytes = {"BF16": 2, "F16": 2, "F32": 4}.get(dtype)
+    if source_bytes is None or size != scale_count * source_bytes:
+        raise ValueError(f"qwen38: expert scale {name!r} has unsupported "
+                         f"dtype/size {dtype}/{size}")
+    return scale_count * 4
+
+
+def _qwen38_fixed_resident_inventory(name, size, config, dtype=None):
+    """Return bytes for the native loader's fixed normalized scale bank.
+
+    A sidecar contributes its normalized F32 footprint exactly once. For a
+    native official checkpoint, summing all sidecars produces the complete
+    bank (layers x experts x three projections), independent of cache slots.
+    For a fallback layout the same charge is conservative: expanded loaders
+    do not retain the bank, but reserving it cannot understate memory.
+    """
+    return _qwen38_scale_bytes(name, size, config, dtype)
 
 
 _QWEN38_NATIVE_MATRIX_SUFFIXES = (
@@ -665,6 +746,10 @@ def _qwen38_resident_inventory(name, size, _config, dtype=None):
     rank-two matrices stay in that two-byte representation; the comparatively
     small norms, gates and convolution vectors still expand through st_read_f32.
     """
+    if _QWEN38_EXPERT_SCALE.fullmatch(name):
+        # Expert scales belong to the fixed normalized bank, not dense
+        # residency. The dedicated inventory hook accounts them once.
+        return 0
     if name.startswith("mtp.") or name.startswith("model.visual."):
         return 0
     if ".ple.ple_embedding.ngram_embedding." in name and name.endswith(".weight"):
@@ -852,6 +937,7 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_qwen38_expert_inventory,
         resident_inventory=_qwen38_resident_inventory,
+        fixed_resident_inventory=_qwen38_fixed_resident_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
         capabilities=FamilyCapabilities(False, False, False, True),
@@ -907,6 +993,8 @@ def _build_registry(families):
                  not callable(family.expert_inventory) or
                 (family.resident_inventory is not None and
                  not callable(family.resident_inventory)) or
+                (family.fixed_resident_inventory is not None and
+                 not callable(family.fixed_resident_inventory)) or
                 not isinstance(family.supports_accelerator, bool) or
                 not isinstance(family.has_gateway_adapter, bool) or
                 not isinstance(family.has_cli_adapter, bool) or
@@ -1038,6 +1126,25 @@ def resident_contribution(resolved, name, size, dtype=None):
         name, size, resolved.family_config, dtype)
     if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
         raise RegistryError(f"invalid resident inventory for {resolved.descriptor.id}")
+    return contribution
+
+
+def fixed_resident_contribution(resolved, name, size, dtype=None):
+    """Return resident bytes that do not belong to dense or cache storage.
+
+    This pool is model-owned and independent of cache capacity. Families
+    without such an allocation return zero.
+    """
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise ValueError("tensor size must be a non-negative integer")
+    if dtype is not None and not isinstance(dtype, str):
+        raise ValueError("tensor dtype must be a string")
+    inventory = resolved.descriptor.fixed_resident_inventory
+    contribution = 0 if inventory is None else inventory(
+        name, size, resolved.family_config, dtype)
+    if isinstance(contribution, bool) or not isinstance(contribution, int) or contribution < 0:
+        raise RegistryError(
+            f"invalid fixed resident inventory for {resolved.descriptor.id}")
     return contribution
 
 

@@ -677,7 +677,10 @@ memInfo.free:                     23.50 GB (97%)
         write_shard(self.model / "model.safetensors", tensors)
         analysis = analyze_model(self.model)
         self.assertEqual(analysis["dense_bytes"], 256)
-        self.assertEqual(analysis["expert_bytes"], 492)
+        # The three native FP8 sidecars are retained once in the normalized
+        # scale bank, not once per cache slot.
+        self.assertEqual(analysis["expert_fixed_bytes"], 12)
+        self.assertEqual(analysis["expert_bytes"], 480)
         # A slot can receive either expert. It must use the larger retained
         # representation, not the median of unlike source dtypes.
         self.assertEqual(analysis["expert_bytes_by_layer"], {0: 384})

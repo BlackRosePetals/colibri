@@ -52,12 +52,14 @@ static int register_all(void) {
            coli_kimi_segment_adapter_register() ||
            coli_olmoe_segment_adapter_register() ||
            coli_qwen36_segment_adapter_register() ||
+           coli_qwen38_segment_adapter_register() ||
            coli_deepseek_v4_segment_adapter_register() ||
            coli_glm_edge_adapter_register() ||
            coli_inkling_edge_adapter_register() ||
            coli_kimi_edge_adapter_register() ||
            coli_olmoe_edge_adapter_register() ||
            coli_qwen36_edge_adapter_register() ||
+           coli_qwen38_edge_adapter_register() ||
            coli_deepseek_v4_edge_adapter_register();
 }
 
@@ -115,17 +117,21 @@ int main(int argc, char **argv) {
     REQUIRE(edge_cap.flags & COLI_EDGE_CAP_GREEDY,
             "real adapter does not expose the model head");
 
-    static const char tokenizer_probe[] = "edge";
+    /* The Qwen3.8 math fixture has a deliberately tiny 64-row vocabulary.
+     * Its fixture tokenizer can still round-trip ASCII punctuation, while the
+     * larger family fixtures retain the more diagnostic multi-byte probe. */
+    const char *tokenizer_probe=!strcmp(family,"qwen38")?"!":"edge";
+    size_t tokenizer_probe_bytes=strlen(tokenizer_probe);
     size_t probe_count = 0, probe_bytes = 0;
     REQUIRE(coli_edge_tokenize(edge, tokenizer_probe,
-                               sizeof(tokenizer_probe) - 1u,
+                               tokenizer_probe_bytes,
                                NULL, 0, &probe_count,
                                error, sizeof(error)) == 0 && probe_count,
             "tokenizer sizing pass failed");
     probe_ids = malloc(probe_count * sizeof(*probe_ids));
     REQUIRE(probe_ids != NULL, "out of memory for tokenizer probe");
     REQUIRE(coli_edge_tokenize(edge, tokenizer_probe,
-                               sizeof(tokenizer_probe) - 1u,
+                               tokenizer_probe_bytes,
                                probe_ids, probe_count, &probe_count,
                                error, sizeof(error)) == 0,
             "tokenizer encode failed");
@@ -139,7 +145,7 @@ int main(int argc, char **argv) {
                                  probe_text, probe_bytes + 1u, &probe_bytes,
                                  error, sizeof(error)) == 0,
             "detokenizer decode failed");
-    REQUIRE(probe_bytes == sizeof(tokenizer_probe) - 1u &&
+    REQUIRE(probe_bytes == tokenizer_probe_bytes &&
             !memcmp(probe_text, tokenizer_probe, probe_bytes),
             "tokenizer round-trip differs");
     free(probe_text); probe_text = NULL;

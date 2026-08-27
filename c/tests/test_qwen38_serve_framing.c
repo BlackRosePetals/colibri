@@ -28,8 +28,15 @@ int main(void){
     FILE *in=input_with("SUBMIT req 0 5 2 0 1\nHello\n");CHECK(in!=NULL);
     ServeReq q={0};
     CHECK(serve_read_req(in,out,&q,NULL)==2);
-    CHECK(!strcmp(q.id,"req")&&q.max_tok==2&&q.plen==5&&!strcmp(q.payload,"Hello"));
+    CHECK(!strcmp(q.id,"req")&&q.slot==0&&q.max_tok==2&&q.plen==5&&!strcmp(q.payload,"Hello"));
     free(q.payload);fclose(in);
+
+    /* The wire codec must consume a valid frame before the one-slot policy
+     * rejects a nonzero cache slot, so the following command remains aligned. */
+    in=input_with("SUBMIT wrong 7 5 1 0 1\nHello\nCANCEL wrong\n");CHECK(in!=NULL);
+    CHECK(serve_read_req(in,out,NULL,NULL)==0);
+    CHECK(serve_read_req(in,out,NULL,"wrong")==3);
+    fclose(in);
 
     in=input_with("STOP req\nCANCEL req\n");CHECK(in!=NULL);
     CHECK(serve_read_req(in,out,NULL,"req")==1);

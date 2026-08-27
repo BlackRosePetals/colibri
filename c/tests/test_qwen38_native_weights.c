@@ -170,8 +170,9 @@ static int write_fp8_fixture(const char *directory,int mixed,int adjacent){
 
 static int init_fixture_model(Model *model,const char *directory,int native_fp8){
     memset(model,0,sizeof(*model));model->c.hidden=2;model->c.inter=3;
-    model->c.experts=2;model->c.layers=1;model->range_begin=0;model->range_end=1;
-    model->native_fp8=native_fp8;model->native_bf16=1;
+    model->c.experts=2;model->c.topk=2;model->c.shared_inter=2;
+    model->c.layers=1;model->range_begin=0;model->range_end=1;
+    model->native_fp8=native_fp8;model->native_bf16=1;model->prefill_batch=1;
     snprintf(model->prefix,sizeof model->prefix,"model");
     st_init(&model->S,directory);
     model->cache=(LCache*)calloc(1,sizeof(*model->cache));
@@ -199,6 +200,39 @@ static void destroy_fixture_model(Model *model){
     if(model->expert_scales)free(model->expert_scales[0].values);
     free(model->expert_scales);free(model->cache);st_destroy(&model->S);
     memset(model,0,sizeof(*model));
+}
+
+static int init_fixture_moe_layer(Model *model){
+    static const float router[4]={1.0f,-1.0f,-1.0f,1.0f};
+    static const float shared_gate[4]={0.25f,-0.5f,0.75f,0.125f};
+    static const float shared_up[4]={-0.25f,0.5f,0.375f,0.625f};
+    static const float shared_down[4]={0.5f,-0.125f,0.25f,0.75f};
+    static const float gate[2]={0.2f,-0.35f};
+    Layer *layer=(Layer*)calloc(1,sizeof(*layer));
+    if(!layer)return -1;
+    q38_weight_reserve(&layer->router,Q38_WEIGHT_F32,2,2);
+    q38_weight_reserve(&layer->sh_g,Q38_WEIGHT_F32,2,2);
+    q38_weight_reserve(&layer->sh_u,Q38_WEIGHT_F32,2,2);
+    q38_weight_reserve(&layer->sh_d,Q38_WEIGHT_F32,2,2);
+    memcpy(layer->router.data,router,sizeof router);
+    memcpy(layer->sh_g.data,shared_gate,sizeof shared_gate);
+    memcpy(layer->sh_u.data,shared_up,sizeof shared_up);
+    memcpy(layer->sh_d.data,shared_down,sizeof shared_down);
+    layer->sh_gate=(float*)malloc(sizeof gate);
+    if(!layer->sh_gate){
+        q38_weight_free(&layer->router);q38_weight_free(&layer->sh_g);
+        q38_weight_free(&layer->sh_u);q38_weight_free(&layer->sh_d);
+        free(layer);return -1;
+    }
+    memcpy(layer->sh_gate,gate,sizeof gate);model->L=layer;
+    return 0;
+}
+
+static void destroy_fixture_moe_layer(Model *model){
+    if(!model->L)return;
+    q38_weight_free(&model->L[0].router);q38_weight_free(&model->L[0].sh_g);
+    q38_weight_free(&model->L[0].sh_u);q38_weight_free(&model->L[0].sh_d);
+    free(model->L[0].sh_gate);free(model->L);model->L=NULL;
 }
 
 static uint8_t fixture_fp8_byte(int expert,int projection,int index){
@@ -367,7 +401,158 @@ cleanup:
     destroy_fixture_model(&model);return result;
 }
 
+static int check_malformed_scale_metadata(const char *directory){
+    Model model;if(init_fixture_model(&model,directory,1))return -1;
+    char name[320];
+    q38_name(&model,name,sizeof name,0,
+             "mlp.experts.0.gate_proj.weight_scale_inv");
+    st_tensor *scale=st_find(&model.S,name);int result=-1;
+    if(scale){
+        int64_t original_bytes=scale->nbytes;
+        scale->nbytes++;
+        uint64_t bytes=0,fixed=0;unsigned kinds=0;
+        if(q38_segment_expert_layout(&model,0,1,&bytes,&fixed,&kinds)&&
+           !q38_prepare_expert_scale_bank(&model,0))result=0;
+        scale->nbytes=original_bytes;
+    }
+    destroy_fixture_model(&model);return result;
+}
+
+static int check_moe_prefill_parity(const char *directory,int native_fp8,
+                                    int cache_capacity){
+    static const float input[6]={0.5f,-0.25f,0.5f,-0.25f,0.5f,-0.25f};
+    Model prefill={0},decode={0};float batched[6],serial[6];int result=-1;
+    if(init_fixture_model(&prefill,directory,native_fp8) ||
+       init_fixture_model(&decode,directory,native_fp8) ||
+       init_fixture_moe_layer(&prefill) || init_fixture_moe_layer(&decode))
+        goto cleanup;
+    prefill.c.norm_topk=1;decode.c.norm_topk=1;
+    if(cache_capacity!=1&&q38_segment_cache_resize(&prefill,cache_capacity))
+        goto cleanup;
+    if(cache_capacity!=1&&q38_segment_cache_resize(&decode,cache_capacity))
+        goto cleanup;
+    prefill.expert_parallel_reads=1;
+    q38_moe(&prefill,prefill.L,0,input,3,batched);
+    for(int row=0;row<3;row++)
+        q38_moe_decode(&decode,decode.L,0,input+(int64_t)row*2,1,
+                       serial+(int64_t)row*2);
+    if(memcmp(batched,serial,sizeof batched)){
+        fprintf(stderr,"prefill parity mismatch native=%d cap=%d:\n",native_fp8,cache_capacity);
+        for(int i=0;i<6;i++)fprintf(stderr," %d %.9g %.9g\n",i,batched[i],serial[i]);
+        goto cleanup;
+    }
+    /* Every row routes to both experts.  The grouped prefill loads each expert
+     * once, even with a one-slot cache; serial decode must reload both experts
+     * for every row.  Native FP8 uses two physical payload ranges per load. */
+    uint64_t reads_per_expert=native_fp8?2:3;
+    uint64_t expected_decode_misses=cache_capacity>=2?2:6;
+    uint64_t expected_decode_reads=expected_decode_misses*reads_per_expert;
+    if(prefill.miss!=2||decode.miss!=expected_decode_misses||
+       prefill.expert_weight_reads!=2*reads_per_expert||
+       decode.expert_weight_reads!=expected_decode_reads){
+        fprintf(stderr,"prefill metrics mismatch native=%d cap=%d: miss %llu/%llu reads %llu/%llu\n",
+                native_fp8,cache_capacity,(unsigned long long)prefill.miss,
+                (unsigned long long)decode.miss,(unsigned long long)prefill.expert_weight_reads,
+                (unsigned long long)decode.expert_weight_reads);
+        goto cleanup;
+    }
+    if(cache_capacity>=2&&
+       (prefill.hits!=0||decode.hits!=4||
+        prefill.expert_parallel_batches!=(native_fp8?1u:0u))){
+        fprintf(stderr,"prefill cache metrics mismatch native=%d cap=%d: hits %llu/%llu batches %llu\n",
+                native_fp8,cache_capacity,(unsigned long long)prefill.hits,
+                (unsigned long long)decode.hits,(unsigned long long)prefill.expert_parallel_batches);
+        goto cleanup;
+    }
+    result=0;
+cleanup:
+    destroy_fixture_moe_layer(&prefill);destroy_fixture_moe_layer(&decode);
+    destroy_fixture_model(&prefill);destroy_fixture_model(&decode);return result;
+}
+
+static int check_mixed_moe_prefill_parity(const char *directory){
+    static const float input[6]={0.5f,-0.25f,0.5f,-0.25f,0.5f,-0.25f};
+    Model prefill={0},decode={0};float batched[6],serial[6];int result=-1;
+    if(init_fixture_model(&prefill,directory,1)||
+       init_fixture_model(&decode,directory,1)||
+       init_fixture_moe_layer(&prefill)||init_fixture_moe_layer(&decode))
+        goto cleanup;
+    prefill.c.norm_topk=1;decode.c.norm_topk=1;
+    q38_moe(&prefill,prefill.L,0,input,3,batched);
+    for(int row=0;row<3;row++)
+        q38_moe_decode(&decode,decode.L,0,input+(int64_t)row*2,1,
+                       serial+(int64_t)row*2);
+    if(!memcmp(batched,serial,sizeof batched)&&prefill.miss==2&&decode.miss==6)
+        result=0;
+cleanup:
+    destroy_fixture_moe_layer(&prefill);destroy_fixture_moe_layer(&decode);
+    destroy_fixture_model(&prefill);destroy_fixture_model(&decode);return result;
+}
+
+static void fill_test_weight(Q38Weight *weight,int rows,int columns,int salt){
+    q38_weight_reserve(weight,Q38_WEIGHT_F32,rows,columns);
+    float *values=(float*)weight->data;
+    for(int index=0;index<rows*columns;index++)
+        values[index]=(float)(((index+1)*(salt+3))%17-8)/16.f;
+}
+
+/* Projection batching must not alter the causal DeltaNet recurrence. Compare
+ * a three-row chunk with three one-row calls, including both retained states. */
+static int check_deltanet_prefill_parity(void){
+    enum { ROWS=3,H=2,VH=1,KH=1,KD=2,VD=2,V=VH*VD,CD=2*KH*KD+V,CK=2 };
+    Cfg config={0};
+    config.hidden=H;config.dn_vheads=VH;config.dn_kheads=KH;
+    config.dn_kdim=KD;config.dn_vdim=VD;config.dn_conv_dim=CD;
+    config.dn_convk=CK;config.eps=1e-6f;
+    Layer layer={0};
+    fill_test_weight(&layer.dn_qkv,CD,H,1);
+    fill_test_weight(&layer.dn_z,V,H,2);
+    fill_test_weight(&layer.dn_b,VH,H,3);
+    fill_test_weight(&layer.dn_a,VH,H,4);
+    fill_test_weight(&layer.dn_out,H,V,5);
+    layer.dn_conv=(float*)malloc((size_t)CD*CK*sizeof(float));
+    layer.dn_dtbias=(float*)malloc(VH*sizeof(float));
+    layer.dn_alog=(float*)malloc(VH*sizeof(float));
+    layer.dn_norm=(float*)malloc(VD*sizeof(float));
+    if(!layer.dn_conv||!layer.dn_dtbias||!layer.dn_alog||!layer.dn_norm)
+        goto fail;
+    for(int index=0;index<CD*CK;index++)
+        layer.dn_conv[index]=(float)((index%7)-3)/16.f;
+    layer.dn_dtbias[0]=0.125f;layer.dn_alog[0]=-0.75f;
+    layer.dn_norm[0]=0.875f;layer.dn_norm[1]=1.125f;
+
+    float recurrence_a[VH*KD*VD]={0},recurrence_b[VH*KD*VD]={0};
+    float convolution_a[CD*(CK-1)]={0},convolution_b[CD*(CK-1)]={0};
+    float *recurrence_rows_a[1]={recurrence_a},*recurrence_rows_b[1]={recurrence_b};
+    float *convolution_rows_a[1]={convolution_a},*convolution_rows_b[1]={convolution_b};
+    Model batched={0},serial={0};
+    batched.c=config;serial.c=config;
+    batched.prefill_batch=1;
+    batched.DN_rec=recurrence_rows_a;serial.DN_rec=recurrence_rows_b;
+    batched.DN_conv=convolution_rows_a;serial.DN_conv=convolution_rows_b;
+    float input[ROWS*H]={0.5f,-0.25f,-0.75f,0.625f,0.125f,0.875f};
+    float output_a[ROWS*H],output_b[ROWS*H];
+    q38_deltanet(&batched,&layer,0,input,ROWS,output_a);
+    for(int row=0;row<ROWS;row++)
+        q38_deltanet(&serial,&layer,0,input+(int64_t)row*H,1,
+                     output_b+(int64_t)row*H);
+    if(memcmp(output_a,output_b,sizeof output_a)||
+       memcmp(recurrence_a,recurrence_b,sizeof recurrence_a)||
+       memcmp(convolution_a,convolution_b,sizeof convolution_a))goto fail;
+
+    q38_weight_free(&layer.dn_qkv);q38_weight_free(&layer.dn_z);
+    q38_weight_free(&layer.dn_b);q38_weight_free(&layer.dn_a);
+    q38_weight_free(&layer.dn_out);free(layer.dn_conv);free(layer.dn_dtbias);
+    free(layer.dn_alog);free(layer.dn_norm);return 0;
+fail:
+    q38_weight_free(&layer.dn_qkv);q38_weight_free(&layer.dn_z);
+    q38_weight_free(&layer.dn_b);q38_weight_free(&layer.dn_a);
+    q38_weight_free(&layer.dn_out);free(layer.dn_conv);free(layer.dn_dtbias);
+    free(layer.dn_alog);free(layer.dn_norm);return -1;
+}
+
 static int check_segment_failure_outputs(void){
+    Model partial={0};partial.c.layers=1;q38_model_free(&partial);
     char error[128];void *output=(void*)(uintptr_t)1;
     ColiSegmentCapabilities capabilities;
     ColiSegmentEngineOptions engine_options={
@@ -439,6 +624,7 @@ int main(void){
     CHECK(check_mixed_layout(mixed_directory,0,72,
           Q38_EXPERT_FP8_EXPANDED|Q38_EXPERT_BF16,
           "qwen38/mixed-expert-arithmetic-06/cpu-v1")==0);
+    CHECK(check_mixed_moe_prefill_parity(mixed_directory)==0);
     path_length=snprintf(path,sizeof path,"%s/model.safetensors",mixed_directory);
     CHECK(path_length>0&&(size_t)path_length<sizeof path);
     CHECK(remove(path)==0);CHECK(rmdir(mixed_directory)==0);
@@ -449,6 +635,11 @@ int main(void){
     CHECK(check_fixture_mode(adjacent_directory,1,1)==0);
     CHECK(check_fixture_mode(adjacent_directory,0,0)==0);
     CHECK(check_parallel_batch(adjacent_directory)==0);
+    CHECK(check_malformed_scale_metadata(adjacent_directory)==0);
+    CHECK(check_moe_prefill_parity(adjacent_directory,1,1)==0);
+    CHECK(check_moe_prefill_parity(adjacent_directory,1,2)==0);
+    CHECK(check_moe_prefill_parity(adjacent_directory,0,1)==0);
+    CHECK(check_deltanet_prefill_parity()==0);
     path_length=snprintf(path,sizeof path,"%s/model.safetensors",adjacent_directory);
     CHECK(path_length>0&&(size_t)path_length<sizeof path);
     CHECK(remove(path)==0);CHECK(rmdir(adjacent_directory)==0);

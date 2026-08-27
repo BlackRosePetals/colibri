@@ -52,6 +52,21 @@ capacity is the first engine positional argument. The canonical FP8 matmul
 decodes values during accumulation rather than materializing three FP32 matrices
 per slot. The launcher defaults to one expert slot per layer.
 
+Prompt execution is expert-major in bounded chunks: it routes up to 32 rows,
+groups their assignments by expert, and consumes cache-sized parallel load
+groups when the complete demand set is larger than the configured LRU. Shared
+expert and DeltaNet projections are batched over the same bounded window;
+DeltaNet convolution and recurrent updates remain token-causal. The private
+chunk workspace is capped at 64 MiB independently of prompt length.
+
+The serve path owns one hybrid prefix slot. When the next prompt begins with
+the exact cached token sequence, QSA K/V/index rows are reused in place and the
+saved DeltaNet/PLE recurrent state is restored before evaluating only the
+extension. An identical prompt also reuses its saved final logits. Mismatched
+or shorter prompts reset every hybrid component rather than guessing at cache
+identity. Decode and cancellation mutate only live state, not the published
+prompt snapshot.
+
 QSA caches the two K/V heads and the indexer's raw key. Complete four-token
 blocks are pooled and scored, the best 512 blocks are retained, and a causal
 tail of up to three tokens is appended. The main 24-head attention then operates
@@ -104,6 +119,9 @@ text class. `Q38_NATIVE_FP8=0` restores the former expanded-FP32 expert cache fo
 numerical/performance A/Bs; `Q38_NATIVE_BF16=0` does the same for resident and
 routed BF16 matrices. Other model types, unsupported scale encodings, and
 incompatible tensor shapes fail during load.
+
+`Q38_PREFILL_BATCH=0` restores row-at-a-time prompt execution for controlled
+A/B diagnosis. It does not change the single-token decode path.
 
 The weights remain covered by the Qwen Community License 1.0 in the downloaded
 checkpoint. They are not redistributed by Colibri.

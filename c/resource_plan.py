@@ -12,7 +12,8 @@ import threading
 from pathlib import Path
 
 from family_registry import (expert_contributions, planner_geometry,
-                             resident_contribution, resolve_model)
+                             fixed_resident_contribution, resident_contribution,
+                             resolve_model)
 
 
 GB = 1_000_000_000
@@ -24,7 +25,7 @@ EXPERT_RE = re.compile(r"(?:model\.)?layers\.(\d+)\.(?:mlp|ffn)\.experts\.(\d+)\
 # sidecar and self-invalidate on any change. Best-effort: any read/write failure falls
 # straight back to a full recompute (see analyze_model). Sits alongside .coli_usage/.coli_ssd.
 _ANALYSIS_CACHE_NAME = ".coli_analysis.json"
-_ANALYSIS_CACHE_VERSION = 6
+_ANALYSIS_CACHE_VERSION = 7
 
 
 def _analysis_signature(shards, config_path):
@@ -99,6 +100,10 @@ def analyze_model(model):
         pass  # missing/corrupt/unreadable cache -> recompute
 
     dense_bytes = 0
+    # Model-owned allocations that are retained once, independently of the
+    # number of per-layer cache slots. Qwen3.8's native FP8 path uses this for
+    # its normalized scale bank; fallback accounting remains conservative.
+    expert_fixed_bytes = 0
     expert_groups = {}
     tensor_names = set()
     for shard in shards:
@@ -122,7 +127,13 @@ def analyze_model(model):
                     key = (layer, expert)
                     expert_groups[key] = expert_groups.get(key, 0) + byte_count
             else:
-                dense_bytes += resident_contribution(resolved, name, size, dtype)
+                fixed_bytes = fixed_resident_contribution(
+                    resolved, name, size, dtype)
+                if fixed_bytes:
+                    expert_fixed_bytes += fixed_bytes
+                else:
+                    dense_bytes += resident_contribution(
+                        resolved, name, size, dtype)
 
     layer_sizes = {}
     for (layer, _), size in expert_groups.items():
@@ -160,6 +171,7 @@ def analyze_model(model):
         "shards": len(shards),
         "model_bytes": model_bytes,
         "dense_bytes": dense_bytes,
+        "expert_fixed_bytes": expert_fixed_bytes,
         "expert_bytes": sum(expert_groups.values()),
         "expert_count": len(expert_groups),
         "expert_layers": len(per_layer),
@@ -853,7 +865,12 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
     max_expert = info["max_expert_bytes"] or typical
     kv_bytes = (geometry.context_state_bytes + geometry.fixed_state_bytes) * kv_slots
     kv_buffer = geometry.workspace_bytes
-    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert + kv_bytes + kv_buffer)
+    # expert_fixed_bytes is retained once per model (currently Qwen3.8's
+    # normalized FP8 scale bank), unlike per_cap_bytes which is paid for
+    # every cache slot. Include it in the resident runtime reservation so the
+    # selected capacity cannot overrun the model's actual allocation.
+    runtime_bytes = int(1.2 * GB + 2.5 * GB + 64 * max_expert +
+                        info["expert_fixed_bytes"] + kv_bytes + kv_buffer)
     per_cap = info["per_cap_bytes"]
     configured_experts = geometry.configured_experts
 
@@ -973,6 +990,7 @@ def build_plan(model, ram_gb=0, context=4096, gpu_indices=None, vram_gb=0,
             "ram": {"role": "resident+warm-experts", "available_bytes": available_memory,
                     "budget_bytes": ram_budget, "dense_bytes": info["dense_bytes"],
                     "runtime_bytes": runtime_bytes,
+                    "expert_fixed_bytes": info["expert_fixed_bytes"],
                     "sequence_state_bytes": geometry.context_state_bytes,
                     "fixed_state_bytes": geometry.fixed_state_bytes,
                     "workspace_bytes": geometry.workspace_bytes,

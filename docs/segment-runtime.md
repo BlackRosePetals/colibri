@@ -85,6 +85,10 @@ sizes and context bounds before calling the adapter.
 Positions and model-specific ordering rules remain adapter-owned. A failed or
 cancelled run must not be reported as committed by the distributed caller.
 Network-level idempotency and duplicate request handling belong above this ABI.
+Cancellation is cooperative, not asynchronous: an adapter may check only at a
+model-safe boundary, and Qwen3.8 currently checks before entering a complete
+Segment run. Callers that need prompt-time interruption should terminate or
+migrate the worker and retry from the last published snapshot.
 
 ## Snapshot contract
 
