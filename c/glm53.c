@@ -712,12 +712,26 @@ static Mat load_mat(GModel *m, const char *fmt, ...) {
             fprintf(stderr, "%s e' int4 ma manca %s\n", name, scales);
             exit(1);
         }
-        /* Le forme non arrivano dal file: si ricavano dai byte e devono
-         * tornare esatte, altrimenti il contenitore non e' quello che dice. */
+        /* Il contenitore e' piatto: 4.194.304 byte di nibble e 131.072 scale,
+         * senza righe ne' colonne scritte da nessuna parte. Va benissimo per
+         * gli esperti, che passano dallo streaming e prendono la forma dalla
+         * config (moe_inter x hidden, e il down al contrario). Qui invece la
+         * forma servirebbe e non c'e': tirarla a indovinare da un solo numero
+         * vorrebbe dire calcolare su una matrice trasposta senza accorgersene.
+         *
+         * Con il converter di oggi questo caso non si presenta, perche' tutto
+         * cio' che non e' esperto resta BF16 e la precisione la sceglie
+         * GLM53_BITS a load time. Se un domani si quantizzasse anche il resto,
+         * la strada e' quella di kimi_k3: la forma la passa il chiamante. */
         const int64_t values = qs->numel * 64;
-        if (t->nbytes * 2 != values || t->rank != 2) {
+        if (t->nbytes * 2 != values) {
             fprintf(stderr, "%s: %lld byte e %lld scale non sono un int4 gs64\n",
                     name, (long long)t->nbytes, (long long)qs->numel);
+            exit(1);
+        }
+        if (t->rank != 2) {
+            fprintf(stderr, "%s: contenitore int4 piatto fuori dagli esperti; "
+                            "la forma non e' nel file e non si indovina\n", name);
             exit(1);
         }
         mat.rows = (int)t->shape[0];
