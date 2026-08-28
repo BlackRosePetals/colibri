@@ -1297,6 +1297,7 @@ def chat_attached(a, base, model_id):
         request = {"model":model_id,"messages":msgs,"stream":True,
                    "max_tokens":ngen_for(a,interactive=True)}
         if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
+        if getattr(a,"think",None) is not None: request["enable_thinking"]=a.think
         body=json.dumps(request).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
@@ -1965,6 +1966,10 @@ def main():
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
     common.add_argument("--effort", choices=("minimal","low","medium","high","xhigh"),
                         default=None)   # quanto il modello riflette prima di rispondere
+    # --think / --no-think: se riflettere del tutto. Spento, il prompt chiude
+    # subito il blocco e la risposta arriva alla prima parola.
+    common.add_argument("--think", action="store_true", default=None)
+    common.add_argument("--no-think", dest="think", action="store_false")
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     common.add_argument("--cluster-workers", default=os.environ.get("CLUSTER_WORKERS"),
                         help="comma-separated expert workers, host:port,...")

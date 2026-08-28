@@ -114,8 +114,12 @@ def main() -> int:
         for effort, passed in EFFORTS.items():
             expected = reference(template_text, messages=case["messages"],
                                  tools=case.get("tools"), reasoning_effort=passed)
+            # Il confronto col template e' sul ragionamento ACCESO, che e'
+            # l'unica forma che il template conosce: per lui il modello ragiona
+            # sempre e il prompt di generazione apre <think>.
             produced = openai_server.render_chat_for_arch(
-                case["messages"], reasoning_effort=effort, tools=case.get("tools"))
+                case["messages"], enable_thinking=True,
+                reasoning_effort=effort, tools=case.get("tools"))
             if produced != expected:
                 print(f"FAIL {name} (reasoning_effort={effort!r})")
                 for position, (left, right) in enumerate(zip(produced, expected)):
@@ -130,8 +134,25 @@ def main() -> int:
                 return 1
             checked += 1
 
+    # Il ragionamento spento e' una nostra aggiunta: il template non ha quella
+    # forma perche' non prevede di spegnerlo. Non e' pero' inventata -- e'
+    # quello che il template stesso scrive davanti a un turno passato senza
+    # ragionamento -- e va comunque verificata, perche' l'unica cosa che la
+    # tiene giusta e' questo controllo.
+    off = openai_server.render_chat_for_arch(
+        [{"role": "user", "content": "ciao"}], enable_thinking=False)
+    on = openai_server.render_chat_for_arch(
+        [{"role": "user", "content": "ciao"}], enable_thinking=True)
+    if not off.endswith("<|assistant|><think></think>"):
+        print(f"FAIL: col ragionamento spento il prompt finisce con {off[-40:]!r}")
+        return 1
+    if off[:-len("</think>")] != on:
+        print("FAIL: acceso e spento differiscono per piu' della chiusura del blocco")
+        return 1
+
     print(f"PASS GLM-5.3 chat template: {checked} rese identiche a "
-          f"chat_template.jinja, strumenti e livelli di ragionamento compresi")
+          f"chat_template.jinja, strumenti e livelli di ragionamento compresi, "
+          f"piu' la forma col ragionamento spento")
     return 0
 
 

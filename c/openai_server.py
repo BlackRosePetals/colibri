@@ -1586,8 +1586,17 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
-    # Il prompt di generazione APRE il blocco di ragionamento e non lo chiude.
-    prompt.append("<|assistant|><think>")
+    # Il prompt di generazione apre il blocco di ragionamento; con il
+    # ragionamento spento lo chiude subito.
+    #
+    # Il template ufficiale conosce solo la prima forma, perche' per lui il
+    # modello ragiona sempre. La seconda pero' non e' inventata: e' esattamente
+    # quello che il template scrive davanti a un turno passato che ragionamento
+    # non ne aveva (<think></think> seguito dal contenuto), quindi e' uno stato
+    # su cui il modello e' stato addestrato e non una posizione mai vista.
+    # Chi vuole il comportamento ufficiale non tocca niente: acceso e' il caso
+    # che combacia col template, ed e' quello che il test confronta.
+    prompt.append("<|assistant|><think>" if enable_thinking else "<|assistant|><think></think>")
     return "".join(prompt)
 
 
@@ -1617,16 +1626,12 @@ ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, no
 def starts_in_reasoning(enable_thinking):
     """Se l'uscita del modello comincia DENTRO al blocco di ragionamento.
 
-    Dipende da come il prompt lo ha lasciato. GLM-5.2 lo chiude quando il
-    ragionamento e' spento, quindi quello che torna e' risposta pura. GLM-5.3
-    lo apre sempre, perche' cosi' fa il suo template ufficiale: il modello
-    ragiona comunque e chiude lui con </think>. Partire in modalita' risposta
-    su GLM-5.3 significa incollare il ragionamento davanti alla risposta, che
-    e' esattamente quello che si vedeva.
-
-    Per questa famiglia il livello si regola con reasoning_effort, non con un
-    interruttore acceso/spento."""
-    return True if ARCH == "glm53" else enable_thinking
+    Dipende da come il prompt lo ha lasciato, e ogni famiglia lo lascia come
+    dice il suo interruttore: acceso apre il blocco e il modello lo chiude da
+    solo, spento lo chiude gia' il prompt e quello che torna e' risposta pura.
+    Se le due cose non concordano il ragionamento finisce incollato davanti
+    alla risposta, che e' il difetto che questa funzione esiste per non avere."""
+    return enable_thinking
 
 
 class ThinkingStreamSplit:
