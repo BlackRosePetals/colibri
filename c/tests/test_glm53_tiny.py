@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Il motore GLM-5.3 contro l'oracolo tiny generato da transformers.
+"""Il motore GLM-5.3 contro un oracolo tiny di solo testo, generato da fuori.
+
+Il fixture NON e' prodotto da questo repository: e' un secondo parere, scritto
+da qualcun altro a partire dallo stesso transformers, e vale esattamente perche'
+non l'abbiamo scritto noi. Chi non ce l'ha si vede un SKIP; la stessa copertura,
+riproducibile qui, e' in tests/test_glm53_multimodal_tiny.py, il cui fixture lo
+genera tools/make_glm53_multimodal_tiny.py.
 
 Confronta cio' che un utente vede davvero -- i token -- e non solo i numeri
 interni: teacher forcing su ogni posizione, generazione greedy, e i logit
@@ -49,6 +55,16 @@ def main() -> int:
     if arguments.logit_tolerance is None:
         arguments.logit_tolerance = LOGIT_TOLERANCE.get(bits, 5e-1)
 
+    if not (arguments.fixture / "ref.json").exists():
+        # Questo fixture arriva da fuori: e' un oracolo generato
+        # indipendentemente dal nostro, e vale proprio perche' non l'abbiamo
+        # scritto noi. Chi non ce l'ha non ha verificato niente, e dirlo e'
+        # meglio di un traceback che sembra un difetto del motore.
+        print(f"SKIP: manca {arguments.fixture}/ref.json; questo oracolo non e' "
+              f"generato dal repository. Per la stessa copertura, riproducibile, "
+              f"usa tools/make_glm53_multimodal_tiny.py e "
+              f"tests/test_glm53_multimodal_tiny.py")
+        return 0
     reference = json.loads((arguments.fixture / "ref.json").read_text())
     prompt = ",".join(str(token) for token in reference["prompt_ids"])
     expected_forcing = reference["teacher_forcing_ids"]

@@ -55,6 +55,13 @@ def main() -> int:
     parser.add_argument("--dequantized", type=Path, required=True,
                         help="fixture con quegli stessi valori in f32")
     arguments = parser.parse_args()
+    if not (arguments.quantized / "ref.json").exists():
+        # Un traceback su un file che manca fa sembrare rotto il
+        # motore; chi arriva per la prima volta non puo' distinguere
+        # le due cose. Il generatore vuole transformers 5.16.1.
+        print(f"SKIP: manca {arguments.quantized}; generalo con\n"
+              f"  python3 tools/make_glm53_streaming_pair.py --fixture <mm> --output <dir>")
+        return 0
 
     reference = json.loads((arguments.quantized / "ref.json").read_text())
     grid_h, grid_w = reference.get("grid", (0, 0))

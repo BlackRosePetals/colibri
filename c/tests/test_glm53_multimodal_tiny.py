@@ -43,6 +43,13 @@ def main() -> int:
                         help="precisione dei densi; 32 e' il confronto "
                              "con l'oracolo, il resto e' una misura")
     arguments = parser.parse_args()
+    if not (arguments.fixture / "ref.json").exists():
+        # Un traceback su un file che manca fa sembrare rotto il
+        # motore; chi arriva per la prima volta non puo' distinguere
+        # le due cose. Il generatore vuole transformers 5.16.1.
+        print(f"SKIP: manca {arguments.fixture}; generalo con\n"
+              f"  python3 tools/make_glm53_multimodal_tiny.py --output <dir>")
+        return 0
 
     # Vedi test_glm53_tiny.py: in f32 si prova che il motore implementa il
     # modello, a bit ridotti che la quantizzazione conserva i token.
