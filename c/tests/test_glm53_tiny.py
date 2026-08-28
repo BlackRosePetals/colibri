@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Il motore GLM-5.3 contro un oracolo tiny di solo testo, generato da fuori.
+"""Il motore GLM-5.3 contro l'oracolo tiny di solo testo.
 
-Il fixture NON e' prodotto da questo repository: e' un secondo parere, scritto
-da qualcun altro a partire dallo stesso transformers, e vale esattamente perche'
-non l'abbiamo scritto noi. Chi non ce l'ha si vede un SKIP; la stessa copertura,
-riproducibile qui, e' in tests/test_glm53_multimodal_tiny.py, il cui fixture lo
-genera tools/make_glm53_multimodal_tiny.py.
+Il fixture lo produce tools/make_glm53_tiny.py, che e' un secondo parere: e'
+scritto da un'altra mano a partire dallo stesso Glm5NextTextModel, e vale
+esattamente perche' non l'abbiamo scritto noi. Copre KDA, DSA, mHC, l'FFN
+denso, il MoE routed, l'indexer, l'attenzione sparsa e i dati del contratto
+FP8.
 
 Confronta cio' che un utente vede davvero -- i token -- e non solo i numeri
 interni: teacher forcing su ogni posizione, generazione greedy, e i logit
@@ -56,14 +56,10 @@ def main() -> int:
         arguments.logit_tolerance = LOGIT_TOLERANCE.get(bits, 5e-1)
 
     if not (arguments.fixture / "ref.json").exists():
-        # Questo fixture arriva da fuori: e' un oracolo generato
-        # indipendentemente dal nostro, e vale proprio perche' non l'abbiamo
-        # scritto noi. Chi non ce l'ha non ha verificato niente, e dirlo e'
-        # meglio di un traceback che sembra un difetto del motore.
-        print(f"SKIP: manca {arguments.fixture}/ref.json; questo oracolo non e' "
-              f"generato dal repository. Per la stessa copertura, riproducibile, "
-              f"usa tools/make_glm53_multimodal_tiny.py e "
-              f"tests/test_glm53_multimodal_tiny.py")
+        # Un traceback su un file che manca fa sembrare rotto il motore.
+        print(f"SKIP: manca {arguments.fixture}/ref.json; generalo con\n"
+              f"  pip install -r tools/requirements-glm53-tiny.txt\n"
+              f"  python3 tools/make_glm53_tiny.py --output {arguments.fixture}")
         return 0
     reference = json.loads((arguments.fixture / "ref.json").read_text())
     prompt = ",".join(str(token) for token in reference["prompt_ids"])
