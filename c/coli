@@ -1290,7 +1290,9 @@ def chat_attached(a, base, model_id):
         if msg in (":q",":quit","exit"): break
         if not msg.strip(): continue
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
-        msgs.append({"role":"user","content":message_with_images(msg)})
+        payload = message_with_images(msg)
+        if payload is None: continue          # percorso sbagliato: gia' detto
+        msgs.append({"role":"user","content":payload})
         # Il livello di ragionamento e' una leva di tempo, non di gusto: su un
         # motore che streamma gli esperti da disco, "max" vuol dire centinaia
         # di token di riflessione prima della prima parola di risposta.
@@ -1403,43 +1405,71 @@ def kv_resume_notice(model_dir):
     except (OSError, struct.error): pass
 
 IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
+# Un percorso che finisce in un'estensione di immagine, nelle due forme che
+# capita di incollare: Windows (C:\Users\...) e POSIX (/home/...  ~/foto.png).
+#
+# Il confine e' l'ESTENSIONE, non lo spazio: le cartelle di Windows si chiamano
+# "Nuova cartella" e spezzare sugli spazi le taglierebbe a meta'. E non si passa
+# da shlex, che in modalita' POSIX mangia le barre rovesciate e va in errore su
+# un apostrofo -- cioe' su una frase italiana su due.
+_ESTENSIONI = "|".join(suffix[1:] for suffix in IMAGE_SUFFIXES)
+IMAGE_PATH = re.compile(
+    r"(?:[A-Za-z]:\\|~?/|\./)[^\"'<>|?*\n]*?\.(?:" + _ESTENSIONI + r")\b",
+    re.IGNORECASE)
+
+
+def to_local_path(token):
+    """Il percorso come lo vede questa macchina.
+
+    Un percorso Windows incollato da Esplora risorse dentro WSL indica un file
+    che da qui si chiama /mnt/<lettera>/...: senza tradurlo non esiste."""
+    token = token.strip().strip('"').strip("'")
+    if re.fullmatch(r"[A-Za-z]:\\.*", token, re.S):
+        if sys.platform == "win32":
+            return token
+        return f"/mnt/{token[0].lower()}/" + token[2:].replace("\\", "/").lstrip("/")
+    return os.path.expanduser(token)
+
 
 def message_with_images(text):
     """Un percorso incollato diventa un'immagine, il resto resta testo.
 
     Chi scrive in chat non ha voglia di comporre JSON: incolla il percorso, o
-    ce lo trascina sopra e il terminale glielo mette fra virgolette. Qui si
-    riconoscono i pezzi della riga che sono davvero file che esistono e hanno
-    l'estensione di un'immagine, e si costruisce il messaggio a parti che il
-    gateway gia' capisce. Se non ce ne sono, il messaggio resta la stringa di
-    prima e nessun percorso di codice cambia.
+    ce lo trascina sopra e il terminale glielo mette fra virgolette.
 
-    Il controllo e' che il file ESISTA: senza, una frase che nomina "foto.png"
-    diventerebbe una richiesta con un'immagine che non c'e'."""
+    Restituisce None quando qualcosa SEMBRA un'immagine e il file non c'e',
+    dopo averlo detto. Il silenzio qui costa caro: si aspetta la risposta per
+    minuti e solo alla fine si scopre che il modello non ha ricevuto nulla."""
     if not text.strip():
         return text
-    try:
-        tokens = shlex.split(text, posix=True)
-    except ValueError:
-        # Un apostrofo o una virgoletta spaiata: e' prosa, non un percorso
-        # quotato. Meglio lasciarla passare come testo che rifiutare la riga.
-        return text
-    pieces, found = [], []
-    for token in tokens:
-        candidate = os.path.expanduser(token)
-        if candidate.lower().endswith(IMAGE_SUFFIXES) and os.path.isfile(candidate):
-            found.append(candidate)
-        else:
-            pieces.append(token)
+
+    found, rest = [], text
+    for match in IMAGE_PATH.finditer(text):
+        raw = match.group(0)
+        candidate = to_local_path(raw)
+        if not os.path.isfile(candidate):
+            print(f"  {C.yel}✗ non trovo{C.r} {raw}"
+                  + (f"\n    da qui si chiamerebbe {candidate}" if candidate != raw else ""))
+            return None
+        found.append(candidate)
+        rest = rest.replace(raw, " ", 1)
+
     if not found:
         return text
+    if len(found) > 1:
+        # Il motore ne tiene una in sospeso per volta. Dirlo adesso costa un
+        # secondo; scoprirlo dal server dopo il prefill ne costa centinaia.
+        print(f"  {C.yel}✗ una immagine per messaggio{C.r}: ne hai indicate "
+              f"{len(found)}")
+        return None
     content = []
-    remaining = " ".join(pieces).strip()
-    if remaining:
-        content.append({"type":"text","text":remaining})
+    rest = " ".join(rest.split()).strip()
+    if rest:
+        content.append({"type":"text","text":rest})
     for path in found:
         content.append({"type":"image_url","image_url":{"url":path}})
     return content
+
 
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load
