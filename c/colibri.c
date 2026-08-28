@@ -6115,8 +6115,9 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
         #pragma omp parallel for if(g_cuda_ndev>1) schedule(static)
         for(int di=0;di<g_cuda_ndev;di++) if(dev_nc[di]&&dev_ok[di]==0){
             double td=g_prof?now_s():0;
-            dev_ok[di]=coli_cuda_expert_group(dev_g[di],dev_u[di],dev_d[di],dev_rows[di],dev_nc[di],
-                group_y+(int64_t)dev_off[di]*D,group_x+(int64_t)dev_off[di]*D);
+            dev_ok[di]=coli_cuda_expert_group_pinned(dev_g[di],dev_u[di],dev_d[di],
+                dev_rows[di],dev_nc[di],group_y+(int64_t)dev_off[di]*D,
+                group_x+(int64_t)dev_off[di]*D,spec_pinned());
             if(g_prof)dev_time[di]=now_s()-td;
         }
         for(int di=0;di<g_cuda_ndev;di++){
@@ -6176,7 +6177,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     int shared_min=getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")?
         atoi(getenv("COLI_CUDA_SHARED_W4A16_MIN_ROWS")):32;
     if(shared_min<16)shared_min=16;
-    if(shared_cuda==0&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
+    if(shared_cuda==0&&!spec_pinned()&&S>=shared_min&&!l->shared_w4a16_failed&&!omp_in_parallel()&&g_cuda_enabled&&
        l->sh_gate.fmt==2&&l->sh_up.fmt==2&&l->sh_down.fmt==2&&
        getenv("COLI_CUDA_SHARED_W4A16")&&atoi(getenv("COLI_CUDA_SHARED_W4A16"))&&
        qt_cuda_upload(&l->sh_gate)&&qt_cuda_upload(&l->sh_up)&&qt_cuda_upload(&l->sh_down)){
