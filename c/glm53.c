@@ -69,6 +69,10 @@
 #include "st.h"
 #include "quant.h"
 #include "tok.h"
+#ifdef COLI_VULKAN
+#include "backend_vulkan.h"
+static int g_vk_ready = 0;
+#endif
 #include "compat.h"
 #include <time.h>
 #ifndef _WIN32
@@ -598,6 +602,7 @@ typedef struct {
     const uint8_t *q4;
     const float *s;
     int rows, columns, gs;
+    void *vk;                             /* ColiVkTensor*, caricata alla prima uso */
 } Mat;
 
 typedef struct {
@@ -894,8 +899,26 @@ static void mv_rows(float *out, const Mat *w, const float *x, int row0, int rows
     }
 }
 
-/* out[rows] = W x, con W in layout [rows, columns] come transformers. */
+/* out[rows] = W x, con W in layout [rows, columns] come transformers.
+ *
+ * Con COLI_VK=1 le matrici RESIDENTI passano dal backend Vulkan: si caricano
+ * sul device alla prima chiamata e restano li'. Gli esperti no, e non e' una
+ * dimenticanza: arrivano dal disco a ogni uso, quindi caricarli costerebbe
+ * quanto leggerli e il device non ci guadagnerebbe niente. Quelli vogliono un
+ * livello residente in VRAM, che e' un'altra cosa.
+ *
+ * Il campo `vk` e' una cache dentro a una matrice che il resto del codice
+ * tratta come sola lettura: da qui il cast, che riguarda solo lui. */
 static void mv(float *out, const Mat *w, const float *x) {
+#ifdef COLI_VULKAN
+    if (g_vk_ready && (w->fmt == 1 || w->fmt == 4)) {
+        Mat *mutable_w = (Mat *)w;
+        if (coli_vk_matmul((ColiVkTensor **)&mutable_w->vk, out, x,
+                           w->fmt == 4 ? (const void *)w->q4 : (const void *)w->q8,
+                           w->s, w->fmt, 1, w->columns, w->rows, w->gs))
+            return;
+    }
+#endif
     switch (w->fmt) {
     case 4: matmul_i4_grouped(out, x, w->q4, w->s, 1, w->columns, w->rows, w->gs); break;
     case 1: matmul_q(out, x, w->q8, w->s, 1, w->columns, w->rows); break;
@@ -1182,10 +1205,41 @@ static void expert_table_init(GModel *m) {
 /* Quanti slot per layer: il budget diviso i layer sparsi. Il pavimento e' 1 e
  * non topk, perche' un pavimento a topk impegnerebbe topk*layer slot comunque,
  * cioe' molti GB, a dispetto del budget chiesto. */
+/* Quanta RAM il sistema dice di poter dare adesso. MemAvailable e non MemFree:
+ * la seconda ignora la page cache riutilizzabile e farebbe stimare molto meno
+ * di quello che c'e'. */
+static double memory_available_gb(void) {
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0.0;
+    char line[256];
+    double gb = 0.0;
+    while (fgets(line, sizeof(line), f)) {
+        long kb;
+        if (sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { gb = kb / 1048576.0; break; }
+    }
+    fclose(f);
+    return gb;
+}
+
 static void expert_cache_init(GModel *m) {
     const Cfg *c = &m->c;
     const char *setting = getenv("GLM53_EXPERT_GB");
-    double budget = setting ? atof(setting) : 8.0;
+    /* Il default si misura: quello che resta libero dopo i pesi residenti,
+     * meno un margine per lo stato della conversazione, i temporanei del
+     * prefill e il resto del sistema. Un numero fisso sbaglia in entrambi i
+     * versi -- su una macchina piccola va in OOM, su una grande lascia RAM
+     * inutilizzata mentre il disco fa tutto il lavoro, che e' esattamente
+     * quello che e' successo alla prima esecuzione vera. */
+    double budget;
+    if (setting) budget = atof(setting);
+    else {
+        const double free_now = memory_available_gb();
+        budget = free_now - 3.0;
+        if (budget < 1.0) budget = 1.0;
+        if (getenv("GLM53_VERBOSE"))
+            fprintf(stderr, "budget esperti: %.1f GB (%.1f disponibili, 3 di margine)\n",
+                    budget, free_now);
+    }
     const int from = c->first_dense > m->layer_begin ? c->first_dense : m->layer_begin;
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
@@ -1233,7 +1287,16 @@ static void expert_read(GModel *m, int layer, int eid, Slot *slot) {
                           ref->off[p], "expert piece");
     }
     slot->eid = eid;
+    /* expert_read gira dentro a un ciclo parallelo: i contatori sono condivisi
+     * e senza questo sarebbero una corsa, cioe' numeri sbagliati proprio nel
+     * posto in cui si va a guardare per capire se il riuso funziona. */
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
     m->miss++;
+#ifdef _OPENMP
+#pragma omp atomic
+#endif
     m->ebytes += (uint64_t)m->e_slot;
 }
 
@@ -1269,63 +1332,174 @@ static void expert_mats(const GModel *m, const Slot *slot, Mat *gate, Mat *up, M
     *gate = shape[0]; *up = shape[1]; *down = shape[2];
 }
 
+/* Il MoE, in due tempi.
+ *
+ * Prima si decide: per ogni token del blocco quali esperti servono e con che
+ * peso. Poi si legge: l'UNIONE di quegli esperti, in parallelo, perche' una
+ * lettura da 14,2 MB e' tempo in cui il disco lavora e la CPU no, e farne una
+ * per volta e' stato il collo della prima esecuzione vera (2976 letture in
+ * fila). Poi si calcola.
+ *
+ * Fare l'unione paga due volte: le letture vanno insieme, e un esperto che
+ * serve a piu' token del blocco si legge una volta sola. */
 static void ffn_layer(GModel *m, const GLayer *l, int index, const float *x,
                       int tokens, float *out) {
     const Cfg *c = &m->c;
-    const int inter = index < c->first_dense ? c->dense_inter : c->moe_inter;
-    float *sg = malloc((size_t)(c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter)
-                       * sizeof(float));
-    float *su = malloc((size_t)(c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter)
-                       * sizeof(float));
-    float *tmp = malloc((size_t)c->hidden * sizeof(float));
+    const int wide = c->dense_inter > c->moe_inter ? c->dense_inter : c->moe_inter;
+
+    if (index < c->first_dense) {                 /* layer denso: nessun router */
+        float *sg = malloc((size_t)wide * sizeof(float));
+        float *su = malloc((size_t)wide * sizeof(float));
+        for (int t = 0; t < tokens; t++)
+            mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
+                 &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
+        free(su); free(sg);
+        return;
+    }
+
+    const int topk = c->topk;
+    int *chosen = malloc((size_t)tokens * topk * sizeof(int));
+    float *weight = malloc((size_t)tokens * topk * sizeof(float));
     float *score = malloc((size_t)c->n_experts * sizeof(float));
-    (void)inter;
+    if (!chosen || !weight || !score) { fprintf(stderr, "OOM nel router\n"); exit(1); }
+
+    /* --- primo tempo: il router, per ogni token --- */
     for (int t = 0; t < tokens; t++) {
         const float *row = x + (size_t)t * c->hidden;
-        float *dst = out + (size_t)t * c->hidden;
-        if (index < c->first_dense) {
-            mlp3(dst, row, &l->dg, &l->du, &l->dd, c->swiglu_limit, sg, su);
-            continue;
-        }
-        /* esperto condiviso, sempre attivo */
-        mlp3(dst, row, &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
-        /* router: sigmoide sui logit; la selezione usa score+bias, il PESO usa
-         * lo score puro -- la distinzione e' sottile e sbagliarla cambia quali
-         * esperti contano quanto. */
         for (int e = 0; e < c->n_experts; e++) {
             const float *w = l->router + (size_t)e * c->hidden;
             float sum = 0.0f;
             for (int d = 0; d < c->hidden; d++) sum += w[d] * row[d];
             score[e] = sigmoidf_(sum);
         }
-        int chosen[64];
-        float weight[64], total = 0.0f;
-        for (int k = 0; k < c->topk; k++) {
+        /* la selezione usa score+bias, il PESO usa lo score puro: la
+         * distinzione e' sottile e sbagliarla cambia quali esperti contano
+         * quanto. */
+        int *mine = chosen + (size_t)t * topk;
+        float *mine_w = weight + (size_t)t * topk;
+        float total = 0.0f;
+        for (int k = 0; k < topk; k++) {
             int best = -1; float value = -INFINITY;
             for (int e = 0; e < c->n_experts; e++) {
                 int used = 0;
-                for (int j = 0; j < k; j++) if (chosen[j] == e) { used = 1; break; }
+                for (int j = 0; j < k; j++) if (mine[j] == e) { used = 1; break; }
                 float choice = score[e] + (l->rbias ? l->rbias[e] : 0.0f);
                 if (!used && choice > value) { value = choice; best = e; }
             }
-            chosen[k] = best;
-            weight[k] = score[best];
-            total += weight[k];
+            mine[k] = best;
+            mine_w[k] = score[best];
+            total += mine_w[k];
         }
-        for (int k = 0; k < c->topk; k++) {
-            float scale = weight[k] / (total + 1e-20f) * c->routed_scale;
-            Mat gate, up, down;
-            if (m->streaming) {
-                Slot *slot = expert_slot(m, index, chosen[k]);
-                expert_mats(m, slot, &gate, &up, &down);
-            } else {
-                gate = l->eg[chosen[k]]; up = l->eu[chosen[k]]; down = l->ed[chosen[k]];
+        for (int k = 0; k < topk; k++)
+            mine_w[k] = mine_w[k] / (total + 1e-20f) * c->routed_scale;
+    }
+    free(score);
+
+    /* --- secondo e terzo tempo, a blocchi che stanno in cache ---
+     *
+     * L'unione di un blocco di prefill puo' superare gli slot che il layer
+     * possiede: con 13 slot e sette token si arriva a 56 esperti distinti. Se
+     * si assegnassero comunque, due esperti finirebbero sullo stesso slot e il
+     * secondo sovrascriverebbe il primo mentre il primo e' ancora in uso, il
+     * che non da' errore, da' numeri sbagliati. Quindi si lavora a blocchi
+     * grandi al piu' quanto la cache: si legge il blocco in parallelo, si
+     * applica a tutti i token, si passa al prossimo. */
+    float *sg = malloc((size_t)wide * sizeof(float));
+    float *su = malloc((size_t)wide * sizeof(float));
+    float *tmp = malloc((size_t)c->hidden * sizeof(float));
+    if (!sg || !su || !tmp) { fprintf(stderr, "OOM nel MoE\n"); exit(1); }
+
+    /* l'esperto condiviso e' sempre attivo e non passa dalla cache */
+    for (int t = 0; t < tokens; t++)
+        mlp3(out + (size_t)t * c->hidden, x + (size_t)t * c->hidden,
+             &l->rg, &l->ru, &l->rd, c->swiglu_limit, sg, su);
+
+    if (!m->streaming) {
+        for (int t = 0; t < tokens; t++)
+            for (int k = 0; k < topk; k++) {
+                const int eid = chosen[(size_t)t * topk + k];
+                mlp3(tmp, x + (size_t)t * c->hidden, &l->eg[eid], &l->eu[eid], &l->ed[eid],
+                     c->swiglu_limit, sg, su);
+                const float scale = weight[(size_t)t * topk + k];
+                float *dst = out + (size_t)t * c->hidden;
+                for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
             }
-            mlp3(tmp, row, &gate, &up, &down, c->swiglu_limit, sg, su);
-            for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+        free(tmp); free(su); free(sg); free(weight); free(chosen);
+        return;
+    }
+
+    /* unione dei distinti, nell'ordine in cui compaiono */
+    int *union_ids = malloc((size_t)tokens * topk * sizeof(int));
+    int n_union = 0;
+    if (!union_ids) { fprintf(stderr, "OOM sull'unione\n"); exit(1); }
+    for (int i = 0; i < tokens * topk; i++) {
+        int seen = 0;
+        for (int j = 0; j < n_union; j++) if (union_ids[j] == chosen[i]) { seen = 1; break; }
+        if (!seen) union_ids[n_union++] = chosen[i];
+    }
+
+    LCache *cache = &m->ecache[index];
+    const int block = cache->cap;
+    int *slot_of = malloc((size_t)block * sizeof(int));
+    int *to_read = malloc((size_t)block * sizeof(int));
+    if (!slot_of || !to_read) { fprintf(stderr, "OOM sugli slot\n"); exit(1); }
+
+    for (int base = 0; base < n_union; base += block) {
+        const int here = base + block <= n_union ? block : n_union - base;
+        int reads = 0;
+        for (int i = 0; i < here; i++) {
+            const int eid = union_ids[base + i];
+            Slot *hit = slot_find(m, index, eid);
+            if (hit) { slot_of[i] = (int)(hit - cache->s); continue; }
+            Slot *victim;
+            if (cache->n < cache->cap) victim = &cache->s[cache->n++];
+            else {
+                int lru = 0;
+                for (int j = 1; j < cache->n; j++)
+                    if (cache->s[j].used < cache->s[lru].used) lru = j;
+                victim = &cache->s[lru];
+            }
+            /* prenotato subito: cosi' la scelta successiva non lo ripesca */
+            victim->used = ++m->clock;
+            victim->eid = -1;
+            slot_of[i] = (int)(victim - cache->s);
+            to_read[reads++] = i;
+        }
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1)
+#endif
+        for (int r = 0; r < reads; r++) {
+            const int i = to_read[r];
+            expert_read(m, index, union_ids[base + i], &cache->s[slot_of[i]]);
+        }
+
+        /* Un esperto per volta, e per ognuno tutti i token che lo hanno
+         * scelto. Nell'ordine opposto i suoi 12,6 MB di pesi verrebbero
+         * ripercorsi da capo per ogni token, e a questa taglia la banda di
+         * memoria e' quanto costa davvero il calcolo. */
+        for (int i = 0; i < here; i++) {
+            const int eid = union_ids[base + i];
+            Slot *slot = &cache->s[slot_of[i]];
+            slot->used = ++m->clock;
+            Mat gate, up, down;
+            expert_mats(m, slot, &gate, &up, &down);
+            for (int t = 0; t < tokens; t++) {
+                float scale = 0.0f;
+                for (int k = 0; k < topk; k++)
+                    if (chosen[(size_t)t * topk + k] == eid) {
+                        scale = weight[(size_t)t * topk + k];
+                        break;
+                    }
+                if (scale == 0.0f) continue;          /* non lo ha scelto */
+                mlp3(tmp, x + (size_t)t * c->hidden, &gate, &up, &down,
+                     c->swiglu_limit, sg, su);
+                float *dst = out + (size_t)t * c->hidden;
+                for (int d = 0; d < c->hidden; d++) dst[d] += scale * tmp[d];
+            }
         }
     }
-    free(score); free(tmp); free(su); free(sg);
+    free(to_read); free(slot_of); free(union_ids);
+    free(tmp); free(su); free(sg); free(weight); free(chosen);
 }
 
 /* ---------- caricamento ---------- */
@@ -1390,7 +1564,6 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
     if (m->streaming) {
         expert_geometry(m);
         expert_table_init(m);
-        expert_cache_init(m);
     }
 
     for (int i = layer_begin; i < layer_end; i++) {
@@ -1481,6 +1654,28 @@ static void model_load_range(GModel *m, const char *dir, int layer_begin,
         }
     }
     vision_load(m);
+#ifdef COLI_VULKAN
+    /* Il device si apre dopo i pesi: se non c'e', il motore continua sulla CPU
+     * senza dire niente di piu' di una riga, perche' Vulkan qui e' un'opzione
+     * e non un requisito. */
+    if (getenv("COLI_VULKAN") && atoi(getenv("COLI_VULKAN"))) {
+        /* Il backend vuole il file qmatmul.spv e da li' ricava i fratelli.
+         * COLI_VK_SHADERS puo' essere il file o la cartella che lo contiene,
+         * come nel resto del progetto; senza, si guarda accanto al binario. */
+        char spv[1024];
+        const char *given = getenv("COLI_VK_SHADERS");
+        if (given && strstr(given, ".spv")) snprintf(spv, sizeof(spv), "%s", given);
+        else snprintf(spv, sizeof(spv), "%s/qmatmul.spv", given ? given : "shaders");
+        g_vk_ready = coli_vk_init(spv) && coli_vk_available();
+        fprintf(stderr, g_vk_ready
+                ? "Vulkan: attivo sulle matrici residenti\n"
+                : "Vulkan: nessun device utilizzabile (%s), resto su CPU\n", spv);
+    }
+#endif
+    /* La cache si dimensiona qui, non prima: quanto si puo' spendere dipende
+     * da quanto hanno gia' preso i pesi, e prima del ciclo sui layer non
+     * l'avevano ancora preso. */
+    if (m->streaming) expert_cache_init(m);
 }
 
 /* ---------- vision ----------
@@ -2369,7 +2564,9 @@ int main(int argc, char **argv) {
 
     GModel model;
     memset(&model, 0, sizeof(model));     /* contatori e puntatori opzionali */
+    const double load_start = now_s();
     model_load(&model, dir);
+    const double load_seconds = now_s() - load_start;
     if (getenv("GLM53_VERBOSE")) cfg_report(&model.c);
 
     float *vision = NULL;
@@ -2403,7 +2600,11 @@ int main(int argc, char **argv) {
     /* Una sola sessione per tutta la generazione: il prompt si prefilla una
      * volta e ogni token dopo costa un token, non tutto il prefisso. */
     GSession *session = session_open(&model, count + (greedy > 0 ? greedy : 0) + 1);
+    const double prefill_start = now_s();
     float *logits = forward_prefill(&model, session, tokens, count, vision, n_vision, 1);
+    if (getenv("GLM53_VERBOSE"))
+        fprintf(stderr, "caricamento %.1fs, prefill %d token in %.1fs\n",
+                load_seconds, count, now_s() - prefill_start);
     printf("teacher_forcing");
     for (int t = 0; t < count; t++)
         printf(" %d", argmax(logits + (size_t)t * model.c.vocab, model.c.vocab));
@@ -2417,6 +2618,11 @@ int main(int argc, char **argv) {
     if (greedy > 0) {
         int stops[8];
         const int n_stops = has_tokenizer ? load_stops(dir, stops, 8) : 0;
+        /* Il costo per token misurato qui e non ricavato per sottrazione dal
+         * tempo totale: caricamento e prefill costano quanto costano, e
+         * confonderli col decode ha gia' fatto sbagliare un confronto. */
+        const double decode_start = now_s();
+        int produced = 0;
         /* `rows` dice quante righe ha l'ultimo blocco di logit: il prefill ne
          * restituisce una per posizione, un passo incrementale una sola. In
          * entrambi i casi quella che serve e' l'ultima. */
@@ -2441,8 +2647,13 @@ int main(int argc, char **argv) {
              * gia' dato i suoi embedding durante il prefill. */
             logits = forward_span(&model, session, &next, 1, NULL, 0);
             rows = 1;
+            produced++;
         }
         printf("\n");
+        const double spent = now_s() - decode_start;
+        if (produced)
+            printf("decode %d token in %.1fs = %.3f tok/s (%.1f s/token)\n",
+                   produced, spent, produced / spent, spent / produced);
     }
     if (has_tokenizer) tok_free(&tokenizer);
     /* Contatori della cache esperti: servono a un test per accorgersi se lo
