@@ -2293,6 +2293,27 @@ static void slot_remember(KVSlot *slot, const int *tokens, int n) {
     slot->n = n;
 }
 
+/* Un'immagine annunciata prima della richiesta a cui appartiene.
+ *
+ * Il protocollo porta testo; le patch sono binarie e grosse, quindi arrivano
+ * con un frame loro (IMAGE) subito prima del SUBMIT con lo stesso id. Il
+ * motore la tiene da parte finche' quella richiesta non arriva, e se arriva
+ * un'altra immagine prima la vecchia si butta: tenere quella sbagliata
+ * vorrebbe dire rispondere sulla foto precedente senza dirlo. */
+typedef struct {
+    unsigned long long id;
+    float *patches;
+    int grid_h, grid_w;
+} PendingImage;
+
+static PendingImage g_pending = {0, NULL, 0, 0};
+
+static void pending_clear(void) {
+    free(g_pending.patches);
+    g_pending.patches = NULL;
+    g_pending.id = 0;
+}
+
 typedef struct {
     unsigned long long id;
     int slot, max_tokens;
@@ -2354,6 +2375,28 @@ static int serve_read_req(ServeReq *q, char *verb, size_t verb_size) {
     if (sscanf(header, "%15s", verb) != 1) { verb[0] = 0; return 1; }
     if (!strcmp(verb, "STOP") || !strcmp(verb, "CANCEL")) {
         sscanf(header, "%*s %llu", &q->id);
+        return 1;
+    }
+    if (!strcmp(verb, "IMAGE")) {
+        unsigned long long id; int bytes, grid_h, grid_w;
+        if (sscanf(header, "IMAGE %llu %d %d %d", &id, &bytes, &grid_h, &grid_w) != 4 ||
+            bytes < 0 || bytes > (1 << 28) || grid_h < 1 || grid_w < 1) {
+            strcpy(verb, "BAD_FRAME");
+            return 1;
+        }
+        pending_clear();
+        float *patches = malloc((size_t)bytes);
+        if (!patches || fread(patches, 1, (size_t)bytes, stdin) != (size_t)bytes) {
+            free(patches);
+            strcpy(verb, "BAD_FRAME");
+            return 1;
+        }
+        (void)fgetc(stdin);                       /* il '\n' di chiusura */
+        g_pending.id = id;
+        g_pending.patches = patches;
+        g_pending.grid_h = grid_h;
+        g_pending.grid_w = grid_w;
+        q->id = id;
         return 1;
     }
     if (strcmp(verb, "SUBMIT")) return 1;
@@ -2427,9 +2470,34 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         slot->session = session_open(m, room);
         shared = 0;
     }
+    /* L'immagine annunciata per QUESTA richiesta, se c'e'. Il prefisso in
+     * cache non la riguarda: la torre ha gia' dato i suoi embedding quando
+     * quei token sono stati macinati, e i segnaposto stanno nel prompt. Se il
+     * riuso salta i token immagine, gli embedding da consumare sono quelli
+     * delle posizioni nuove, quindi il riuso si annulla quando c'e' un'immagine
+     * -- costa un prefill in piu' ed e' l'unica cosa che non puo' sbagliare. */
+    float *vision = NULL;
+    int n_vision = 0;
+    if (g_pending.patches && g_pending.id == q->id) {
+        if (!m->has_vision) {
+            pending_clear();
+            free(sequence);
+            serve_line("ERROR %llu BAD_REQUEST\n", q->id);
+            return;
+        }
+        if (shared) {                             /* niente riuso con un'immagine */
+            slot_reset(m, slot);
+            slot->session = session_open(m, room);
+            shared = 0;
+        }
+        vision = vision_encode(m, g_pending.patches, g_pending.grid_h,
+                               g_pending.grid_w, &n_vision);
+        pending_clear();
+    }
+
     const int reused = shared;
     float *logits = forward_prefill(m, slot->session, sequence + shared,
-                                    total - shared, NULL, 0, 0);
+                                    total - shared, vision, n_vision, 0);
     GSession *session = slot->session;
     int rows = 1;
     for (int step = 0; step < budget; step++) {
@@ -2448,6 +2516,7 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
         rows = 1;
     }
     free(logits);
+    free(vision);
     /* La sessione resta allo slot per il turno dopo, con la sequenza che ha
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
@@ -2476,6 +2545,8 @@ static void serve_loop(GModel *m, Tok *tokenizer) {
         if (!strcmp(verb, "SUBMIT")) {
             serve_one(m, tokenizer, &q);
             free(q.payload);
+        } else if (!strcmp(verb, "IMAGE")) {
+            /* annunciata: nessuna risposta, la si usa al SUBMIT che segue */
         } else if (!strcmp(verb, "BAD_FRAME")) {
             serve_line("ERROR %llu BAD_FRAME\n", q.id);
         } else if (!strcmp(verb, "CANCEL")) {

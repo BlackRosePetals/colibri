@@ -24,7 +24,7 @@ Configuration through environment variables or flags (also valid after the subco
   --topp P           adaptive expert top-p             --topk N   fixed top-k
   --ngen N           maximum response tokens           --cap N    cache slots/layer
 """
-import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct
+import os, sys, subprocess, argparse, json, time, signal, shutil, threading, re, codecs, tempfile, textwrap, struct, shlex
 
 # input() only gets line editing and UP/DOWN history once the readline module
 # has been LOADED — without it the terminal's arrow-key escape sequences are
@@ -1290,7 +1290,7 @@ def chat_attached(a, base, model_id):
         if msg in (":q",":quit","exit"): break
         if not msg.strip(): continue
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
-        msgs.append({"role":"user","content":msg})
+        msgs.append({"role":"user","content":message_with_images(msg)})
         body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
                          "max_tokens":ngen_for(a,interactive=True)}).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
@@ -1395,6 +1395,45 @@ def kv_resume_notice(model_dir):
         print(f"  {C.dgray}  it steers tone, language and topic. :reset clears it · "
               f"KVSAVE=0 disables saving · delete {p} to start clean{C.r}")
     except (OSError, struct.error): pass
+
+IMAGE_SUFFIXES = (".png",".jpg",".jpeg",".webp",".bmp",".gif",".tif",".tiff")
+
+def message_with_images(text):
+    """Un percorso incollato diventa un'immagine, il resto resta testo.
+
+    Chi scrive in chat non ha voglia di comporre JSON: incolla il percorso, o
+    ce lo trascina sopra e il terminale glielo mette fra virgolette. Qui si
+    riconoscono i pezzi della riga che sono davvero file che esistono e hanno
+    l'estensione di un'immagine, e si costruisce il messaggio a parti che il
+    gateway gia' capisce. Se non ce ne sono, il messaggio resta la stringa di
+    prima e nessun percorso di codice cambia.
+
+    Il controllo e' che il file ESISTA: senza, una frase che nomina "foto.png"
+    diventerebbe una richiesta con un'immagine che non c'e'."""
+    if not text.strip():
+        return text
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        # Un apostrofo o una virgoletta spaiata: e' prosa, non un percorso
+        # quotato. Meglio lasciarla passare come testo che rifiutare la riga.
+        return text
+    pieces, found = [], []
+    for token in tokens:
+        candidate = os.path.expanduser(token)
+        if candidate.lower().endswith(IMAGE_SUFFIXES) and os.path.isfile(candidate):
+            found.append(candidate)
+        else:
+            pieces.append(token)
+    if not found:
+        return text
+    content = []
+    remaining = " ".join(pieces).strip()
+    if remaining:
+        content.append({"type":"text","text":remaining})
+    for path in found:
+        content.append({"type":"image_url","image_url":{"url":path}})
+    return content
 
 def cmd_chat(a):
     # ATTACH: a running `coli serve` beats a private engine every time — the load

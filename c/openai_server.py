@@ -1369,6 +1369,90 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
     return "".join(prompt)
 
 
+# ---- immagini per GLM-5.3 ------------------------------------------------------------
+# Il modello vede l'immagine come una sequenza di segnaposto <|image|>, uno per
+# token che la torre produrra': (griglia_h/2) x (griglia_w/2). Il numero non e'
+# negoziabile -- il motore rifiuta se non combacia con gli embedding che riceve --
+# quindi si preprocessa PRIMA di rendere il prompt e si espande il segnaposto al
+# numero giusto. Cosi' il renderer non deve sapere niente di immagini.
+GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
+    "<|begin_of_image|>", "<|image|>", "<|end_of_image|>")
+
+
+def _image_bytes_from_url(url):
+    """data: URI, file:// o percorso sul disco -> i byte dell'immagine."""
+    if not isinstance(url, str) or not url:
+        raise APIError(400, "image_url.url must be a non-empty string.", "messages")
+    if url.startswith("data:"):
+        head, _, payload = url.partition(",")
+        if "base64" not in head:
+            raise APIError(400, "only base64 data: URIs are supported.", "messages")
+        import base64
+        try:
+            return base64.b64decode(payload, validate=True)
+        except Exception:
+            raise APIError(400, "image_url.url is not valid base64.", "messages")
+    if url.startswith("http://") or url.startswith("https://"):
+        # Scaricare da un URL che arriva in una richiesta vorrebbe dire far fare
+        # al server una chiamata di rete decisa da chi la manda. Non si fa.
+        raise APIError(400, "remote image URLs are not fetched; send the image "
+                            "as a base64 data: URI or a path on this machine.",
+                       "messages")
+    path = url[7:] if url.startswith("file://") else url
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError as problem:
+        raise APIError(400, f"cannot read image {path}: {problem}", "messages")
+
+
+def expand_glm53_images(messages, model_dir):
+    """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
+
+    Restituisce (messaggi riscritti, patch). I messaggi tornano con contenuto
+    testuale puro, quindi il renderer li tratta come qualunque altro turno."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_image(data, model_dir)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(GLM53_IMAGE_OPEN + GLM53_IMAGE * tokens + GLM53_IMAGE_CLOSE)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
+def _preprocess_image(data, model_dir):
+    """L'immagine nelle patch che la torre vuole. Il lavoro sta in
+    tools/glm53_image.py, verificato contro il processore ufficiale."""
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from glm53_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir)
+
+
 GLM53_TOOL_PREAMBLE = (
     "<|system|>\n# Tools\n\n"
     "You may call one or more functions to assist with the user query.\n\n"
@@ -2240,6 +2324,7 @@ class Engine:
             family = (resolve_model(model).descriptor if config.exists()
                       else family_by_id(ARCH))
         arch = family.id
+        self.model_dir = str(model)
         child_env = dict(env or os.environ, SNAP=str(model), SERVE="1", SERVE_BATCH="1",
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
@@ -2426,7 +2511,7 @@ class Engine:
 
     def generate(self, prompt, max_tokens, temperature, top_p, on_text, cache_slot=0,
                  cancelled=None, grammar=None, stopped=None, on_accept=None, audio=None,
-                 on_tool=None):
+                 on_tool=None, image=None):
         if isinstance(cache_slot, bool) or not isinstance(cache_slot, int) or not 0 <= cache_slot < self.kv_slots:
             raise APIError(400, "Invalid cache slot.", "cache_slot")
         payload = prompt.encode("utf-8")
@@ -2491,6 +2576,16 @@ class Engine:
             with self.write_lock:
                 if self.process.poll() is not None:
                     raise RuntimeError("colibri engine is not running")
+                # Le patch sono binarie e grosse: viaggiano in un frame loro,
+                # annunciato subito prima del SUBMIT a cui appartengono. Deve
+                # partire dentro lo stesso lock, o un'altra richiesta potrebbe
+                # infilarsi in mezzo e prendersi l'immagine di questa.
+                if image is not None:
+                    patches, grid_h, grid_w = image
+                    blob = patches.tobytes() if hasattr(patches, "tobytes") else patches
+                    self.process.stdin.write(
+                        f"IMAGE {request_id} {len(blob)} {grid_h} {grid_w}\n".encode()
+                        + blob + b"\n")
                 self.process.stdin.write(header + payload + xpayload + b"\n")
                 self.process.stdin.flush()
         except Exception:
@@ -3122,7 +3217,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return {"type": "error", "error": {"type": error.error_type, "message": error.message}}
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
-                   enable_thinking=False, audio=None):
+                   enable_thinking=False, audio=None, image=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -3186,7 +3281,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    **({"audio": audio} if audio else {}))
+                    **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 sideband.finish()
                 text = "".join(output)
@@ -3367,7 +3463,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=generation_stopped,
                     **({"on_tool": sideband.feed} if sideband.enabled else {}),
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 sideband.finish()
                 if think:
@@ -3398,7 +3495,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 stats = self.server.engine.generate(
                     prompt, maximum, temperature, top_p, stop_filter.feed, cache_slot,
                     self.client_disconnected, grammar=grammar, stopped=stop_filter.stopped,
-                    on_accept=start_stream, **({"audio": audio} if audio else {}))
+                    on_accept=start_stream, **({"audio": audio} if audio else {}),
+                    **({"image": image} if image is not None else {}))
                 stop_filter.finish()
                 if content_split:
                     content_split.close()
@@ -3467,11 +3565,24 @@ class APIHandler(BaseHTTPRequestHandler):
         tools = body.get("tools") or body.get("functions") or None
         tool_choice = body.get("tool_choice")
         audio_clips = [] if ARCH == "inkling" else None
-        prompt = render_chat_for_arch(body.get("messages"), enable_thinking, reasoning_effort,
+        messages = body.get("messages")
+        # Le immagini diventano segnaposto PRIMA del rendering: il renderer
+        # tratta poi turni di solo testo, e il conto dei segnaposto e quello
+        # degli embedding non possono divergere.
+        image = None
+        if ARCH == "glm53":
+            messages, images = expand_glm53_images(
+                messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
                                       tools, tool_choice, audio_out=audio_clips)
         self.generation(body, prompt, request_id, True, tools, tool_choice,
                         enable_thinking=enable_thinking,
-                        audio=b"".join(audio_clips) if audio_clips else None)
+                        audio=b"".join(audio_clips) if audio_clips else None,
+                        image=image)
 
     # ---- Anthropic /v1/messages (#343) ----------------------------------------------------
     ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use"}
