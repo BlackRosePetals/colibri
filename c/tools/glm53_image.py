@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -142,6 +143,16 @@ def preprocess(source, model_dir=None):
     std = tuple(settings.get("image_std", STD))
     min_tokens = settings.get("min_image_tokens", MIN_TOKENS)
     max_tokens = settings.get("max_image_tokens", MAX_TOKENS)
+    # Il tetto del checkpoint e' 8000 token per immagine, che su una macchina
+    # che streamma gli esperti da disco vuol dire un prefill lunghissimo per
+    # una foto qualunque. GLM53_MAX_IMAGE_TOKENS lo abbassa: l'immagine viene
+    # rimpicciolita, non tagliata, quindi si perde dettaglio e non pezzi.
+    override = os.environ.get("GLM53_MAX_IMAGE_TOKENS")
+    if override:
+        try:
+            max_tokens = max(min_tokens, int(override))
+        except ValueError:
+            pass
     patch = settings.get("patch_size", PATCH)
     merge = settings.get("merge_size", MERGE)
     temporal = settings.get("temporal_patch_size", TEMPORAL)

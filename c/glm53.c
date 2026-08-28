@@ -1133,6 +1133,9 @@ static void mla_layer(const Cfg *c, const GLayer *l, const float *x, int tokens,
  * in cui li vuole il calcolo. Le Mat che ne escono puntano dentro allo slot,
  * cosi' il codice del MoE non sa da dove arrivi il peso e resta quello di
  * prima. */
+/* Slot per layer chiesti dalla riga di comando; 0 = decide il budget misurato. */
+static int g_cap_override = 0;
+
 #define GLM53_EXPERT_PIECES 6
 
 typedef struct ERef {
@@ -1244,6 +1247,7 @@ static void expert_cache_init(GModel *m) {
     int sparse = m->layer_end - from;
     if (sparse < 0) sparse = 0;
     int cap = (int)((budget * 1e9) / ((double)m->e_slot * (sparse > 0 ? sparse : 1)));
+    if (g_cap_override > 0) cap = g_cap_override;      /* scelta esplicita: vince */
     if (cap < 1) cap = 1;
     if (cap > c->n_experts) cap = c->n_experts;
 
@@ -2521,11 +2525,14 @@ static void serve_one(GModel *m, Tok *tokenizer, ServeReq *q) {
      * davvero macinato: prompt piu' quello che ha generato. */
     slot_remember(slot, sequence, total);
     const double elapsed = now_s() - started;
-    /* Quanto prefisso lo slot ha risparmiato. La regola di compatibilita' del
-     * protocollo dice che un server ignora le righe che non conosce, quindi
-     * questa non rompe nessun client e da' a chi la vuole un modo di vedere se
-     * il riuso sta funzionando davvero. */
-    serve_line("REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
+    /* Quanto prefisso lo slot ha risparmiato.
+     *
+     * Su STDERR, non nel protocollo. La specifica dice che un server ignora le
+     * righe che non conosce, ma questo progetto ha scelto il contrario apposta
+     * e lo mette per iscritto in un test: una riga sconosciuta uccide il
+     * dispatcher, cosi' un motore non puo' parlare a un server che non lo
+     * capisce. La regola vera e' quella del test, non quella del documento. */
+    fprintf(stderr, "REUSE %llu %d %d\n", q->id, reused, prompt_tokens);
     serve_line("DONE %llu STAT %d %.2f %.1f %.1f %d %d\n", q->id, emitted,
                elapsed > 0 ? emitted / elapsed : 0.0,
                m->miss + m->hits ? 100.0 * m->hits / (double)(m->hits + m->miss) : 0.0,
@@ -2572,6 +2579,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--patches") && i + 1 < argc) patch_file = argv[++i];
         else if (!strcmp(argv[i], "--grid") && i + 1 < argc &&
                  sscanf(argv[++i], "%dx%d", &grid_h, &grid_w) == 2) continue;
+        else if (argv[i][0] >= '0' && argv[i][0] <= '9') {
+            /* Capienza posizionale: e' cosi' che il gateway lancia ogni motore
+             * (openai_server.py, Engine.__init__). Zero vuol dire "decidila
+             * tu", che qui e' il budget misurato dalla RAM disponibile. */
+            const int cap = atoi(argv[i]);
+            if (cap > 0) g_cap_override = cap;
+        }
         else { fprintf(stderr, "argomento sconosciuto: %s\n", argv[i]); return 2; }
     }
     /* SERVE=1 e SNAP=<dir>: il motore non e' piu' una CLI ma il capo di una

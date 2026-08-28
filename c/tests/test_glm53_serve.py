@@ -16,17 +16,33 @@ che nessuno ha fatto.
 """
 import argparse
 import os
+import tempfile
 import subprocess
 import sys
 from pathlib import Path
+
+
+NOTES = tempfile.mktemp(suffix=".glm53.stderr")
+
+
+def reuse_reported():
+    """Quanti token di prefisso il motore dice di aver riusato."""
+    try:
+        text = open(NOTES, "r", errors="replace").read()
+    except OSError:
+        return 0
+    return sum(int(line.split()[2]) for line in text.splitlines()
+               if line.startswith("REUSE "))
 
 
 def engine(binary, fixture, extra=None):
     environment = {**os.environ, "SERVE": "1", "SERVE_BATCH": "1",
                    "SNAP": str(fixture), "GLM53_BITS": "32"}
     environment.update(extra or {})
+    # stderr in un file: il riuso del prefisso si racconta li', perche' nel
+    # protocollo una riga in piu' farebbe cadere il gateway (di proposito).
     return subprocess.Popen([binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, env=environment)
+                            stderr=open(NOTES, "wb"), env=environment)
 
 
 def read_line(stream):
@@ -61,19 +77,17 @@ def collect(process, request_id):
     """I DATA fino al DONE della richiesta, o l'ERROR che li sostituisce.
 
     Restituisce anche quanto prefisso lo slot ha riusato, se il motore lo dice."""
-    pieces, reused = [], None
+    pieces = []
     while True:
         line = read_line(process.stdout)
-        if line.startswith("REUSE "):
-            reused = int(line.split()[2])
-        elif line.startswith("DATA "):
+        if line.startswith("DATA "):
             _, got_id, count = line.split()
             if int(got_id) != request_id:
                 raise AssertionError(f"DATA per {got_id}, atteso {request_id}")
             payload = process.stdout.read(int(count) + 1)      # payload piu' '\n'
             pieces.append(payload[:int(count)])
         elif line.startswith("DONE ") or line.startswith("ERROR "):
-            return b"".join(pieces), line, reused
+            return b"".join(pieces), line, reuse_reported()
 
 
 def cli_answer(binary, fixture, prompt, tokens):

@@ -525,7 +525,10 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM53_EXPERT),
         config_section="text_config",
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "GLM53_MAXT"),
+        # implicit_cap 0, non 8: questo motore dimensiona la cache degli
+        # esperti dalla RAM disponibile, quindi "nessuna scelta esplicita"
+        # deve arrivargli come 0 e non come otto slot per layer.
+        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 0, "GLM53_MAXT"),
         capabilities=COMMON_CAP,
         has_gateway_adapter=True,
         has_cli_adapter=True,
