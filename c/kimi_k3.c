@@ -1143,7 +1143,13 @@ static void model_init_range(Model *m, const char *snap, int layer_begin,
           g_k3_val_layer=-1;
         } else {
           const char *ofn=getenv("K3_VALIDATE_OUT");
-          if(!ofn) ofn="/tmp/k3_val";
+          /* CWD-relative, not a /tmp path: same rule as test_stops.c and
+             test_pipe_block.c, since the windows job builds native .exe
+             files that resolve Windows paths and /tmp is not one. The
+             chosen path is printed on both the success and the failure
+             branch below, so a caller relying on the old default is told
+             where the dump went. */
+          if(!ofn) ofn="k3_val";
           g_k3_val_fp=fopen(ofn,"w");
           if(!g_k3_val_fp){
             fprintf(stderr,"[K3-VAL] cannot open %s (%s) — disabled\n",ofn,strerror(errno));
