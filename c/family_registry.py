@@ -72,6 +72,11 @@ class FamilyDescriptor:
     config_section: str
     limits: FamilyLimits
     capabilities: FamilyCapabilities
+    # Quanto pesano in RAM i pesi densi rispetto a come stanno su disco.
+    # Vale 1.0 per chi li carica cosi' come sono; un motore che li riquantizza
+    # a load time pesa meno, e senza questo il pianificatore direbbe che il
+    # modello non ci sta quando invece ci sta.
+    dense_load_ratio: object = None      # callable(bytes_su_disco) -> bytes in RAM
     has_gateway_adapter: bool = False
     has_cli_adapter: bool = False
     tune_prompt_template: str = "{prompt}"
@@ -230,6 +235,23 @@ def _kimi_geometry(config, context, _model_dir):
 # Il default di GLM53_PREFILL_CHUNK in glm53.c. Se cambia li', cambia qui:
 # e' una costante con due consumatori.
 _GLM53_PREFILL_CHUNK = 128
+
+
+def _glm53_dense_in_ram(on_disk_bytes):
+    """I densi di GLM-5.3 non restano come sul disco.
+
+    Il checkpoint li porta in BF16 e il motore li quantizza al caricamento
+    secondo GLM53_BITS (default 4), che e' int4 con una scala ogni 64 colonne:
+    0,5625 byte per parametro contro i 2 del file. Contarli come stanno su
+    disco fa dire al pianificatore che manca RAM per un solo esperto per layer,
+    quando ce ne stanno diciassette."""
+    import os
+    try:
+        bits = int(os.environ.get("GLM53_BITS", "4"))
+    except ValueError:
+        bits = 4
+    per_parameter = {4: 0.5625, 8: 1.0, 32: 4.0}.get(bits, 0.5625)
+    return int(on_disk_bytes * per_parameter / 2.0)      # il file e' BF16
 
 
 def _glm53_geometry(config, context, _model_dir):
@@ -521,6 +543,7 @@ FAMILIES = (
         cli_adapter="glm53",
         gateway_adapter="glm53",
         planner_id="glm53_hybrid",
+        dense_load_ratio=_glm53_dense_in_ram,
         planner_geometry=_glm53_geometry,
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_GLM53_EXPERT),
