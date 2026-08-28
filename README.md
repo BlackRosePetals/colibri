@@ -18,8 +18,9 @@ parameters** — on consumer and heterogeneous hardware, in pure C with zero
 engine dependencies, by treating storage, RAM, and VRAM as a single inference
 hierarchy (AI memory multitiering).
 
-Six families run today: **GLM-5.2** (744B), **Inkling** (975B), **Kimi K3**
-(2.8T), **DeepSeek V4 Flash** (284B), **Qwen3.6** (35B-A3B) and **OLMoE** (7B) —
+Seven families run today: **GLM-5.2** (744B), **GLM-5.3-Flash** (321B, with
+vision), **Inkling** (975B), **Kimi K3** (2.8T), **DeepSeek V4 Flash** (284B),
+**Qwen3.6** (35B-A3B) and **OLMoE** (7B) —
 one C file each, the same `coli chat` / `coli serve` / `coli web` front end.
 [Full roster ↓](#other-supported-models)
 
@@ -404,6 +405,7 @@ the model's `config.json`):
 > |---|---|---|---|
 > | **OLMoE** | ~7 GB (int8 container) | 8 GB | not needed |
 > | **GLM-5.2** | ~372 GB | 16 GB min, 24 GB comfortable | not needed |
+> | **GLM-5.3-Flash** | ~195 GB converted | 25 GB (12 GB weights at int4 + expert cache) | not needed |
 > | **Inkling** | ~469 GB | 25 GB with the int4 dense container, ~120 GB without | not needed |
 > | **Kimi K3** | ~1.6 TB | 32 GB+ | not needed |
 > | **DeepSeek V4 Flash** | ~167 GB | 16 GB min, 32 GB comfortable | optional; any NVIDIA card from the GTX 10 series up (Pascal/Turing via `CUDA_ARCH=portable-pre-ampere NO_TC=1`, best on RTX 50) makes prefill 5-10x and decode ~2.5x faster |
