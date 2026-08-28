@@ -296,6 +296,23 @@ ifneq ($(LINUX),)
 NVCCFLAGS += -Xcompiler=-include,$(CURDIR)/glibc_c23_math_compat.h
 endif
 endif
+# CUDA 13.1 host_config.h accepts only Visual Studio 2019-2022 and refuses
+# anything newer outright, so on a box with VS Build Tools 18 (MSVC 19.50)
+# EVERY nvcc target fails at the first #include with C1189 -- cuda-test,
+# cuda-dll, all of it. nvcc offers -allow-unsupported-compiler to override the
+# check, but there was no way to get one flag in: NVCCFLAGS is the only handle
+# and replacing it wholesale discards $(CUDA_GENCODE), the -ccbin set above and
+# the -Xcompiler warning form that Windows specifically needs -- the same
+# argument that made NVCC_STD a variable rather than a rewrite.
+#
+# Defaults to 0: nvcc's own wording is "may cause compilation failure or
+# incorrect run time execution", so an unsupported host compiler is the
+# builder's decision to make explicitly, not a default this Makefile makes for
+# them. Any result produced with it set should say so.
+NVCC_ALLOW_UNSUPPORTED ?= 0
+ifeq ($(NVCC_ALLOW_UNSUPPORTED),1)
+NVCCFLAGS += -allow-unsupported-compiler
+endif
 # HIP=1 builds the SAME backend for AMD GPUs via ROCm: backend_cuda.cu is
 # compiled unchanged through backend_gpu_compat.h (one source, two vendors,
 # like compat.h does for Windows). HIP_ARCH=native targets the GPU in this
