@@ -1614,6 +1614,21 @@ def render_chat_for_arch(messages, enable_thinking=False, reasoning_effort=None,
 ANTHROPIC_LOCAL_SIGNATURE = "colibri-local"  # opaque compatibility metadata, not a crypto proof
 
 
+def starts_in_reasoning(enable_thinking):
+    """Se l'uscita del modello comincia DENTRO al blocco di ragionamento.
+
+    Dipende da come il prompt lo ha lasciato. GLM-5.2 lo chiude quando il
+    ragionamento e' spento, quindi quello che torna e' risposta pura. GLM-5.3
+    lo apre sempre, perche' cosi' fa il suo template ufficiale: il modello
+    ragiona comunque e chiude lui con </think>. Partire in modalita' risposta
+    su GLM-5.3 significa incollare il ragionamento davanti alla risposta, che
+    e' esattamente quello che si vedeva.
+
+    Per questa famiglia il livello si regola con reasoning_effort, non con un
+    interruttore acceso/spento."""
+    return True if ARCH == "glm53" else enable_thinking
+
+
 class ThinkingStreamSplit:
     """Split GLM's reasoning marker without leaking markers across stream chunks."""
     MARKERS = (THINK_OPEN, THINK_CLOSE)
@@ -1667,7 +1682,7 @@ class ThinkingStreamSplit:
 def split_thinking_reply(text, enable_thinking=True):
     """Return the marker-free (thinking, answer) portions of one GLM reply."""
     thinking, answer = [], []
-    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=enable_thinking)
+    split = ThinkingStreamSplit(thinking.append, answer.append, initial_thinking=starts_in_reasoning(enable_thinking))
     split.feed(text)
     split.finish()
     return "".join(thinking), "".join(answer)
@@ -3448,7 +3463,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # #597: keep GLM reasoning out of the tool-call buffer — a think splitter sends it
                 # to reasoning_content and passes only the answer text on to feed_content/parser.
                 think = (ThinkingStreamSplit(emit_reasoning, feed_content,
-                                             initial_thinking=enable_thinking)
+                                             initial_thinking=starts_in_reasoning(enable_thinking))
                          if glm_think else None)
                 def emit_tools(chunk):
                     if dbg_echo:
@@ -3484,7 +3499,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     content_split = splitter
                 elif glm_think:                            # GLM <think> reasoning → reasoning_content
                     content_split = ThinkingStreamSplit(emit_reasoning, emit,
-                                                        initial_thinking=enable_thinking)
+                                                        initial_thinking=starts_in_reasoning(enable_thinking))
                 else:
                     content_split = None
                 def emit_plain(chunk):
@@ -3810,8 +3825,11 @@ class APIHandler(BaseHTTPRequestHandler):
                                            emit_thinking if enable_thinking else None,
                                            close_thinking if enable_thinking else None)
             else:
+                # Anche qui: su GLM-5.3 il blocco e' aperto dal prompt, quindi
+                # lo splitter serve pure col ragionamento "spento", o il
+                # pensiero finisce incollato davanti alla risposta.
                 split = (ThinkingStreamSplit(emit_thinking, emit_answer, close_thinking)
-                         if enable_thinking else None)
+                         if starts_in_reasoning(enable_thinking) else None)
 
             def on_text(chunk):
                 raw.append(chunk)

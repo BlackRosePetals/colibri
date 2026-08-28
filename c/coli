@@ -1291,8 +1291,13 @@ def chat_attached(a, base, model_id):
         if not msg.strip(): continue
         if msg==":reset": msgs=[]; print(f"  {C.dim}✦ new conversation{C.r}\n"); continue
         msgs.append({"role":"user","content":message_with_images(msg)})
-        body=json.dumps({"model":model_id,"messages":msgs,"stream":True,
-                         "max_tokens":ngen_for(a,interactive=True)}).encode()
+        # Il livello di ragionamento e' una leva di tempo, non di gusto: su un
+        # motore che streamma gli esperti da disco, "max" vuol dire centinaia
+        # di token di riflessione prima della prima parola di risposta.
+        request = {"model":model_id,"messages":msgs,"stream":True,
+                   "max_tokens":ngen_for(a,interactive=True)}
+        if getattr(a,"effort",None): request["reasoning_effort"]=a.effort
+        body=json.dumps(request).encode()
         req=urllib.request.Request(base.rstrip("/")+"/v1/chat/completions", data=body,
                                    headers={"Content-Type":"application/json"})
         if a.api_key: req.add_header("Authorization", f"Bearer {a.api_key}")
@@ -1958,6 +1963,8 @@ def main():
     # clamps to it and the control silently does nothing above 1024 (#889).
     common.add_argument("--ngen", type=int, default=None)  # rete di sicurezza: la fine vera la decidono gli stop token
     common.add_argument("--topp", type=float, default=0); common.add_argument("--topk", type=int, default=0)
+    common.add_argument("--effort", choices=("minimal","low","medium","high","xhigh"),
+                        default=None)   # quanto il modello riflette prima di rispondere
     common.add_argument("--temp", type=float, default=None)  # temperatura token (0=greedy, default 1.0+nucleus .95)
     common.add_argument("--cluster-workers", default=os.environ.get("CLUSTER_WORKERS"),
                         help="comma-separated expert workers, host:port,...")
