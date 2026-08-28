@@ -348,7 +348,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     int o = 0;
     for (int i=0;i<n;i++){
         unsigned char c = s[i];
-        if (c == '"'){ if(o+2<outsz){ out[o++]='"'; out[o++]='"'; } }
+        if (c == '"'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='"'; } }
         else if (c == '\\'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='\\'; } }
         else if (c == '\n'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='n'; } }
         else if (c == '\r'){ if(o+2<outsz){ out[o++]='\\'; out[o++]='r'; } }
