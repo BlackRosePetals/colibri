@@ -3070,7 +3070,8 @@ static int glm53_edge_engine_open(void **engine_impl,
     /* Le bandiere devono corrispondere ai puntatori che l'adapter fornisce:
      * il runtime rifiuta chi dichiara meno o piu' di quello che ha. Il
      * tokenizzatore puo' mancare in un checkpoint di sola matematica. */
-    capabilities->flags = COLI_EDGE_CAP_CPU | COLI_EDGE_CAP_GREEDY;
+    capabilities->flags = COLI_EDGE_CAP_CPU | COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_LOGITS;
     if (engine->has_tokenizer)
         capabilities->flags |= COLI_EDGE_CAP_TOKENIZE | COLI_EDGE_CAP_DETOKENIZE;
     coli_edge_capability_string(capabilities->engine_id,
@@ -3199,6 +3200,61 @@ static int glm53_edge_embed(void *engine_impl, const ColiEdgeEmbedRequest *reque
     return 0;
 }
 
+/* Lo stato finale come logit interi, senza scegliere.
+ *
+ * E' la stessa trasformazione di glm53_edge_select fino all'ultimo passo: chi
+ * vuole campionare a modo suo ha bisogno della distribuzione, non del vincitore,
+ * e temperatura e generatore sono politica di chi serve, non matematica del
+ * modello. Le due funzioni condividono la chiusura proprio perche' non possano
+ * scostarsi: un argmax che guardasse numeri diversi da questi darebbe un token
+ * che la distribuzione non spiega. */
+static int glm53_edge_final(const Glm53EdgeEngine *engine, const float *streams,
+                            float *logits, float *collapsed, float *normed) {
+    const Cfg *c = &engine->model.c;
+    const int H = c->hc_mult, D = c->hidden;
+    for (int d = 0; d < D; d++) {
+        float sum = 0.0f;
+        for (int h = 0; h < H; h++) sum += streams[(size_t)h * D + d];
+        collapsed[d] = sum / H;
+    }
+    rms(normed, collapsed, engine->model.final_norm, D, c->eps);
+    mv(logits, &engine->model.head, normed);
+    return 0;
+}
+
+static int glm53_edge_logits(void *engine_impl, const ColiEdgeLogitsRequest *request,
+                             char *error, size_t error_size) {
+    Glm53EdgeEngine *engine = (Glm53EdgeEngine *)engine_impl;
+    if (!engine || !request || !request->input || !request->logits)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge logits got bad arguments");
+    const Cfg *c = &engine->model.c;
+    const size_t width = engine->state_width;
+    if (request->input_bytes < (size_t)request->rows * width * sizeof(float) ||
+        request->logits_capacity < (size_t)request->rows * (size_t)c->vocab)
+        return coli_edge_adapter_error(error, error_size,
+                                       "GLM-5.3 Edge logits buffers are too small");
+    float *collapsed = malloc((size_t)c->hidden * sizeof(float));
+    float *normed = malloc((size_t)c->hidden * sizeof(float));
+    if (!collapsed || !normed) {
+        free(collapsed); free(normed);
+        return coli_edge_adapter_error(error, error_size, "out of memory for logits");
+    }
+    const float *input = (const float *)request->input;
+    for (uint32_t row = 0; row < request->rows; row++) {
+        if (request->should_cancel &&
+            request->should_cancel(request->cancel_user_data)) {
+            free(collapsed); free(normed);
+            return coli_edge_adapter_error(error, error_size,
+                                           "GLM-5.3 Edge logits cancelled");
+        }
+        glm53_edge_final(engine, input + (size_t)row * width,
+                         request->logits + (size_t)row * c->vocab, collapsed, normed);
+    }
+    free(collapsed); free(normed);
+    return 0;
+}
+
 /* Stato finale -> token. I flussi si richiudono con una media NON pesata, poi
  * la norma finale e la testa: le stesse tre righe con cui finisce il
  * passaggio, perche' un capo che chiudesse diversamente darebbe token diversi
@@ -3232,14 +3288,7 @@ static int glm53_edge_select(void *engine_impl, const ColiEdgeSelectRequest *req
             return coli_edge_adapter_error(error, error_size,
                                            "GLM-5.3 Edge select cancelled");
         }
-        const float *streams = input + (size_t)row * width;
-        for (int d = 0; d < D; d++) {
-            float sum = 0.0f;
-            for (int h = 0; h < H; h++) sum += streams[(size_t)h * D + d];
-            collapsed[d] = sum / H;
-        }
-        rms(normed, collapsed, engine->model.final_norm, D, c->eps);
-        mv(logits, &engine->model.head, normed);
+        glm53_edge_final(engine, input + (size_t)row * width, logits, collapsed, normed);
         const int best = argmax(logits, c->vocab);
         request->token_ids[row] = (int32_t)best;
         if (request->scores && request->score_capacity > row)
@@ -3253,7 +3302,7 @@ static const ColiEdgeAdapter glm53_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "glm53",
     glm53_edge_engine_open, glm53_edge_engine_destroy,
     glm53_edge_tokenize, glm53_edge_detokenize,
-    glm53_edge_embed, glm53_edge_select, {0}
+    glm53_edge_embed, glm53_edge_select, glm53_edge_logits, {0}
 };
 
 int coli_glm53_edge_adapter_register(void) {
