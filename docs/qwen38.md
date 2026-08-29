@@ -76,6 +76,56 @@ only on those original tokens. The native model limit is 262,144 tokens;
 `Q38_MAXT` defaults to 8,192 and may raise the server limit up to that native
 ceiling when the required RAM is available.
 
+## Memory and speed
+
+The 185.5 GB on disk is not a RAM requirement. What must be resident is the
+dense set: the DeltaNet and QSA projections, norms, gated-residual mixers,
+embedding, shared experts and LM head. In native BF16 that is 9.2 GiB (9.9 GB),
+and the engine prints it at load. Everything else is sized by a knob or by the
+prompt:
+
+| | |
+|---|---|
+| resident weights (native BF16) | 9.2 GiB, fixed |
+| routed-expert cache | 4.7 MiB per slot per layer over 48 layers: cap 16 is 3.5 GiB, cap 32 is 7.0 GiB, cap 64 is 14.1 GiB |
+| FP8 scale bank | 28 MiB, fixed; every expert's block scales stay resident so a miss is one FP8 read |
+| context state | 54 KiB per token, allocated for the whole `Q38_MAXT` ceiling before `READY`: 432 MiB at the 8,192 default |
+| recurrent and PLE state, prefix snapshot, cached logits | 226 MiB, fixed |
+| prompt and decode workspace | at most 1.1 GiB peak, independent of context length |
+| PLE n-gram table (51B parameters) | 0; sixteen 160-byte row reads per token |
+| routed experts on disk | 120.8 GB, streamed |
+
+`coli plan --model <dir> --ram <GB> --ctx 8192 --gpu none` prints this
+accounting for a budget and chooses the expert cap from it.
+
+Measured on the official checkpoint on an Intel Core i9-14900K (24 physical
+cores, OpenMP 24), 61 GiB RAM, Samsung 990 EVO on ext4, GCC 15.2, Linux 7.0,
+default 8,192 context, native FP8 and BF16; the engine reports RSS in binary
+units. Peak RSS for an eleven-token prompt plus one generated token was
+12.9 GiB at cap 16, 16.5 GiB at cap 32 and 21.5 GiB at cap 64, with TTFT
+within 0.6 s across the three. Cap 32 is the short-request knee on this disk;
+it fits a 24 GB machine, and cap 64 wants 32 GB. A 16 GB machine is below the
+floor once the cache, context bank and workspace are added.
+
+A full `tools/datapoint.py` campaign at `8563799` at cap 32: one persistent
+`SERVE=1` engine, page cache evicted before load, greedy decoding, 128
+completion tokens per request; one cold request, one warm-identical repeat of
+it, then four different prompts in fixed rotation as the primary workload.
+Engine load 11.2 s; cold and buffered `iobench` 2.26 and 2.55 GB/s:
+
+| phase | prompt tok | request s | TTFT s | decode tok/s | hit | RSS |
+|---|---:|---:|---:|---:|---:|---:|
+| cold | 31 | 129.5 | 20.6 | 1.17 | 58.8% | 16.6 GiB |
+| warm-identical (exact prefix reuse; upper bound) | 31 | 107.7 | 0.01 | 1.18 | 63.8% | 16.6 GiB |
+| rotating prompts, median of four (primary) | 35 to 40 | 140.2 | 23.8 | 1.09 | 53.8% | 16.6 GiB |
+
+Of the 140 s median request, 96 s was synchronous expert disk service, 17 s
+expert matmul, 14 s attention and 2.6 s LM head. One decode token routes ten
+of 512 experts in each of 48 layers, 4.7 MiB each: 2.2 GiB of expert weights
+when nothing is cached and roughly half that at the cap-32 hit rate, so at this
+cache size the engine spends about two thirds of every request waiting on the
+disk, and the planner labels cold expert reads as the expected bottleneck.
+
 ## Performance telemetry
 
 Every served request reports its own routed-expert cache hit rate; persistent
