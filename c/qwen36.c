@@ -2606,7 +2606,13 @@ int main(int argc, char **argv) {
         if (getenv("ENC_DEBUG") && np <= 300) { fprintf(stderr, "[enc] prompt ids: "); for (int i=0;i<np;i++) fprintf(stderr, "%d ", prompt[i]); fprintf(stderr, "\n"); }
     }
 
-    Model m; model_init(&m, snap, cap, bits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; model_init(&m, snap, cap, bits);
     g_expert_gs = m.c.expert_gs;
     if (g_expert_gs) fprintf(stderr, "[qwen36] group-scaled experts: gs=%d\n", g_expert_gs);
     fprintf(stderr, "resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
