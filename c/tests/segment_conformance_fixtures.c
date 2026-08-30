@@ -364,7 +364,7 @@ DECLARE_OPEN_WRAPPER(kimi, 3)
 DECLARE_OPEN_WRAPPER(olmoe, 4)
 DECLARE_OPEN_WRAPPER(qwen36, 5)
 DECLARE_OPEN_WRAPPER(qwen38, 6)
-DECLARE_OPEN_WRAPPER(deepseek_v4, 6)
+DECLARE_OPEN_WRAPPER(deepseek_v4, 7)
 
 #define FIXTURE_ADAPTER(name)                                                  \
     {                                                                          \
