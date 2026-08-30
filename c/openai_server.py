@@ -529,6 +529,8 @@ def parse_arch_tool_calls(reply, tools, tool_reply=None):
             _sideband_text, calls = parse_k3_tool_calls(tool_reply, tools)
             return reply.strip(), calls
         return parse_k3_tool_calls(reply, tools)  # compatibility with pre-#1147 engines
+    if ARCH == "qwen38":
+        return parse_qwen38_tool_calls(reply, tools)
     return parse_tool_calls(reply, tools)
 
 
@@ -1201,14 +1203,127 @@ def render_chat_qwen(messages, enable_thinking=False, reasoning_effort=None, too
     return "".join(parts)
 
 
+# Qwen3.8 declares and emits tool calls in an XML-ish form of its own, not the
+# JSON block GLM uses and not DeepSeek's DSML -- so it needs its own renderer and
+# its own parser. Both sides are transcribed from chat_template.jinja rather than
+# paraphrased, because a tool preamble the model has not seen verbatim is a
+# different prompt: the declaration is what teaches it the syntax it must emit.
+#
+#   <tool_call>
+#   <function=NAME>
+#   <parameter=KEY>
+#   VALUE
+#   </parameter>
+#   </function>
+#   </tool_call>
+QWEN38_TOOL_PREAMBLE = ("\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>")
+
+
+def _qwen38_tool_block(tools):
+    """The `# Tools` system section, byte-identical to the template's."""
+    lines = ["# Tools\n\nYou have access to the following functions:\n\n<tools>"]
+    for tool in tools:
+        lines.append("\n" + json.dumps(tool, ensure_ascii=False, separators=(", ", ": ")))
+    lines.append("\n</tools>")
+    lines.append(QWEN38_TOOL_PREAMBLE)
+    return "".join(lines)
+
+
+def _qwen38_tool_calls(tool_calls, has_content, index):
+    """Render assistant tool_calls. The template separates the FIRST call from
+    preceding content with a blank line only when that content is non-empty, and
+    every later call with a single newline; getting that wrong changes the prompt
+    the model is conditioned on."""
+    out = []
+    for position, call in enumerate(tool_calls or []):
+        if not isinstance(call, dict):
+            raise APIError(400, "Each tool call must be an object.",
+                           f"messages.{index}.tool_calls.{position}")
+        fn = call.get("function", call)
+        if not isinstance(fn, dict):
+            raise APIError(400, "`function` must be an object.",
+                           f"messages.{index}.tool_calls.{position}.function")
+        name = fn.get("name")
+        if not isinstance(name, str) or not name:
+            raise APIError(400, "`function.name` must be a non-empty string.",
+                           f"messages.{index}.tool_calls.{position}.function.name")
+        lead = ("\n\n" if has_content else "") if position == 0 else "\n"
+        out.append(f"{lead}<tool_call>\n<function={name}>\n")
+        args = fn.get("arguments", "")
+        if isinstance(args, str) and args:
+            try:
+                args = json.loads(args)
+            except (TypeError, ValueError):
+                raise APIError(400, "`function.arguments` must be a JSON object.",
+                               f"messages.{index}.tool_calls.{position}.function.arguments")
+        if isinstance(args, dict):
+            for key, value in args.items():
+                # The template stringifies a str as-is and tojson's everything
+                # else, so a string argument must NOT gain quotes here.
+                rendered = value if isinstance(value, str) else json.dumps(
+                    value, ensure_ascii=False, separators=(", ", ": "))
+                out.append(f"<parameter={key}>\n{rendered}\n</parameter>\n")
+        out.append("</function>\n</tool_call>")
+    return "".join(out)
+
+
+QWEN38_CALL_RE = re.compile(
+    r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
+QWEN38_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
+
+
+def parse_qwen38_tool_calls(reply, tools=None):
+    """Parse Qwen3.8's XML-ish calls back into OpenAI `tool_calls`.
+
+    Values are returned as strings, which is what the template feeds in: it
+    writes a str argument unquoted, so the original type is not recoverable from
+    the text alone. Where the declared schema says a parameter is not a string we
+    re-read it as JSON, which restores numbers and booleans without guessing at
+    anything the schema did not promise."""
+    schema = {}
+    for tool in (tools or []):
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        params = (fn.get("parameters") or {}).get("properties") or {}
+        if isinstance(params, dict):
+            schema[fn.get("name")] = params
+    calls = []
+    for match in QWEN38_CALL_RE.finditer(reply or ""):
+        name = match.group(1).strip()
+        args = {}
+        for key, raw in QWEN38_PARAM_RE.findall(match.group(2)):
+            key = key.strip()
+            declared = (schema.get(name) or {}).get(key) or {}
+            kind = declared.get("type") if isinstance(declared, dict) else None
+            if kind in (None, "string"):
+                args[key] = raw
+            else:
+                try:
+                    args[key] = json.loads(raw)
+                except (TypeError, ValueError):
+                    args[key] = raw
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {"name": name,
+                         "arguments": json.dumps(args, ensure_ascii=False)},
+        })
+    text = QWEN38_CALL_RE.sub("", reply or "")
+    if not calls and tools and "<tool_call>" in (reply or ""):
+        sys.stderr.write("[api] qwen38 tool markers present but no call parsed -- "
+                         "possibly truncated or mangled output\n")
+        sys.stderr.flush()
+    return text.strip(), calls
+
+
 def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, tools=None,
                        tool_choice=None):
     """Text-only Qwen3.8 chat-template subset with native reasoning hints."""
     if not isinstance(messages, list) or not messages:
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
-    if tools or tool_choice not in (None, "none"):
-        raise APIError(400, "Tool use is not wired up for the qwen38 engine yet.",
-                       "tools", "unsupported_parameter")
+    if tool_choice in ("none",):
+        tools = None                              # the client forbade them: do not offer any
+    if tools is not None and not isinstance(tools, list):
+        raise APIError(400, "`tools` must be an array.", "tools")
 
     instruction = ""
     if enable_thinking:
@@ -1235,18 +1350,26 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
     first_role = first.get("role") if isinstance(first, dict) else None
     if first_role == "developer":
         first_role = "system"
+    system_text = ""
+    start = 0
     if first_role == "system":
         raw = first.get("content")
-        text = content_text(raw, "messages.0.content").strip() if raw is not None else ""
+        system_text = content_text(raw, "messages.0.content").strip() if raw is not None else ""
+        start = 1
+    if tools:
+        # With tools the template builds ONE system turn in a fixed order:
+        # reasoning instruction, then the tool block, then the user's own system
+        # text last -- not the other way round.
+        head = (instruction + "\n\n") if instruction else ""
+        block = head + _qwen38_tool_block(tools)
+        if system_text:
+            block += "\n\n" + system_text
+        parts.append(f"<|im_start|>system\n{block}<|im_end|>\n")
+    elif system_text or instruction:
+        text = system_text
         if instruction:
             text = instruction + ("\n\n" + text if text else "")
         parts.append(f"<|im_start|>system\n{text}<|im_end|>\n")
-        start = 1
-    elif instruction:
-        parts.append(f"<|im_start|>system\n{instruction}<|im_end|>\n")
-        start = 0
-    else:
-        start = 0
 
     for index, message in enumerate(messages[start:], start=start):
         if not isinstance(message, dict):
@@ -1254,7 +1377,7 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         role = message.get("role")
         if role == "developer":
             role = "system"
-        if role not in ("system", "user", "assistant"):
+        if role not in ("system", "user", "assistant", "tool"):
             raise APIError(400, f"Unsupported role {role!r}.", f"messages.{index}.role")
         if role == "system" and index != 0:
             raise APIError(400, "System message must be at the beginning.",
@@ -1262,12 +1385,32 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
         raw = message.get("content")
         text = (content_text(raw, f"messages.{index}.content").strip()
                 if raw is not None else "")
+        if role == "tool":
+            # Consecutive tool results share ONE user turn: the opening tag is
+            # written only when the previous message was not a tool, and the
+            # closing one only when the next is not. Emitting a turn per result
+            # would be a different conversation shape.
+            prev = messages[index - 1].get("role") if index > 0 and isinstance(
+                messages[index - 1], dict) else None
+            nxt = messages[index + 1].get("role") if index + 1 < len(messages) and isinstance(
+                messages[index + 1], dict) else None
+            if prev != "tool":
+                parts.append("<|im_start|>user")
+            parts.append(f"\n<tool_response>\n{text}\n</tool_response>")
+            if nxt != "tool":
+                parts.append("<|im_end|>\n")
+            continue
         if role == "assistant":
             reasoning = message.get("reasoning_content", "")
             if not isinstance(reasoning, str):
                 raise APIError(400, "`reasoning_content` must be a string.",
                                f"messages.{index}.reasoning_content")
-            text = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
+            calls = message.get("tool_calls")
+            rendered = f"<think>\n{reasoning.strip()}\n</think>\n\n{text}"
+            if calls:
+                rendered += _qwen38_tool_calls(calls, bool(text.strip()), index)
+            parts.append(f"<|im_start|>assistant\n{rendered}<|im_end|>\n")
+            continue
         parts.append(f"<|im_start|>{role}\n{text}<|im_end|>\n")
 
     parts.append("<|im_start|>assistant\n")
