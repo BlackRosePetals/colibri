@@ -30,7 +30,8 @@ COLI_MODEL=~/Models/Qwen3.8-Flash-Next-FP8 ./c/coli chat
 `coli serve` and `coli web` use the same text-only gateway path. Qwen3.8 thinks
 by default; `reasoning_effort` accepts `low`, `medium`, `high`, and `xhigh`, and
 `enable_thinking: false` emits the model's official empty thinking prefix.
-Tools, image content, audio, and grammar constraints are rejected explicitly.
+Tools, audio and grammar constraints are rejected explicitly, and so are
+images -- for now, see **Vision** below.
 
 The official FP8 repository is about 185.5 GB in decimal units (roughly 173
 GiB). The default CPU engine keeps resident BF16 matrices in their native
@@ -177,3 +178,43 @@ A/B diagnosis. It does not change the single-token decode path.
 
 The weights remain covered by the Qwen Community License 1.0 in the downloaded
 checkpoint. They are not redistributed by Colibri.
+
+## Vision
+
+The released checkpoint is multimodal and the engine already reads its
+`model.language_model` prefix, so the vision tensors are present and reachable.
+The tower itself is not implemented yet; images are still refused rather than
+silently dropped.
+
+What exists today is the half that decides whether vision is *correct* rather
+than nearly correct: `tools/qwen38_image.py`, pinned against the official
+`Qwen2VLImageProcessor` in `tests/test_qwen38_image.py`.
+
+```
+python3 tests/test_qwen38_image.py --config <model>/preprocessor_config.json
+```
+
+Neither needs the weights. The reference processor is built from
+`preprocessor_config.json` alone, which is 390 bytes, so the preprocessing can be
+developed and verified without the 185 GB.
+
+Measured against it on eight shapes: **geometry and patch order identical**, and
+pixels bit-identical wherever no resampling happens (0.0000 on 256x256 and
+640x480), 0.0157 worst case where it does, which is Pillow's bicubic against
+torchvision's. A wrong patch order would show as a discrepancy near 1, not 0.01.
+
+Two things differ from GLM-5.3's tower and are the reason this is its own file:
+
+**The resolution is dynamic.** GLM-5.3 fits everything onto a 448 canvas and
+pads. Qwen keeps the aspect ratio and picks a canvas whose *area* falls inside
+`[shortest_edge, longest_edge]`, so there is no padding but the token count
+depends on the image. A 1080p photo becomes **2040 tokens**, which on a
+disk-streaming engine is a prefill nobody will sit through -- the same reason
+`GLM53_MAX_IMAGE_TOKENS` exists, and `preprocess(max_tokens=...)` is the same
+lever here. It shrinks rather than crops: what is lost is detail, not pieces.
+
+**Normalisation is 0.5/0.5**, not the CLIP constants.
+
+The tower is 27 blocks, hidden 1152, 16 heads, patch 16, spatial merge 2,
+projecting to 2560. The prompt side is already documented by the template, which
+splices images as `<|vision_start|><|image_pad|><|vision_end|>`.
