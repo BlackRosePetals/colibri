@@ -16061,7 +16061,8 @@ static inline __m256 v4_fp8_decode8(__m256i codes) {
         _mm256_slli_epi32(_mm256_add_epi32(exp, _mm256_set1_epi32(120)), 23),
         _mm256_slli_epi32(man, 20));
     __m256 nval = _mm256_castsi256_ps(nbits);
-    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(ldexpf(1.0f, -9)));
+    float man_factor = 1.0f / (float)(1 << 9);
+    __m256 sval = _mm256_mul_ps(_mm256_cvtepi32_ps(man), _mm256_set1_ps(man_factor));
     __m256 is_sub = _mm256_castsi256_ps(_mm256_cmpeq_epi32(exp, _mm256_setzero_si256()));
     __m256i sbits = _mm256_or_si256(
         _mm256_castps_si256(_mm256_blendv_ps(nval, sval, is_sub)), sgn);
@@ -17667,7 +17668,7 @@ static int deepseek_v4_edge_engine_open(
     capabilities->abi_version = COLI_EDGE_ABI_VERSION;
     capabilities->flags = COLI_EDGE_CAP_TOKENIZE |
                           COLI_EDGE_CAP_DETOKENIZE |
-                          COLI_EDGE_CAP_GREEDY |
+                          COLI_EDGE_CAP_GREEDY | COLI_EDGE_CAP_LOGITS |
                           COLI_EDGE_CAP_CPU;
     coli_edge_capability_string(capabilities->engine_id,
                                 sizeof(capabilities->engine_id),
@@ -17882,11 +17883,65 @@ static int deepseek_v4_edge_select(void *engine_impl,
     return 0;
 }
 
+static int deepseek_v4_edge_logits(void *engine_impl,
+                                   const ColiEdgeLogitsRequest *request,
+                                   char *error, size_t error_size) {
+    DeepSeekV4EdgeEngine *engine = engine_impl;
+    const ColiSafetensorsTensor *head =
+        coli_st_find(engine->index, "head.weight");
+    if (!head || head->dtype != COLI_ST_BF16)
+        return coli_edge_adapter_error(error, error_size,
+                                       "DeepSeek V4 Edge head is unavailable");
+    int hidden = engine->config.hidden_size;
+    int vocab = engine->config.vocab_size;
+    int shard = coli_st_tensor_shard(engine->index, head);
+    enum { TILE_ROWS = 64 };
+    uint16_t *raw = malloc((size_t)TILE_ROWS * hidden * sizeof(*raw));
+    float *final = malloc((size_t)hidden * sizeof(*final));
+    if (!raw || !final) {
+        free(final); free(raw);
+        return coli_edge_adapter_error(error, error_size,
+                                       "out of memory running DeepSeek V4 logits");
+    }
+    const float *input = request->input;
+    for (uint32_t batch_row = 0; batch_row < request->rows; batch_row++) {
+        deepseek_v4_edge_final_hidden(
+            engine, final, input + (size_t)batch_row * engine->state_width);
+        float *logits = request->logits + (size_t)batch_row * vocab;
+        for (int start = 0; start < vocab; start += TILE_ROWS) {
+            if (request->should_cancel &&
+                request->should_cancel(request->cancel_user_data)) {
+                free(final); free(raw);
+                return coli_edge_adapter_error(
+                    error, error_size, "DeepSeek V4 Edge logits cancelled");
+            }
+            int rows = vocab - start < TILE_ROWS ? vocab - start : TILE_ROWS;
+            size_t bytes = (size_t)rows * hidden * sizeof(*raw);
+            if (coli_st_read_at(
+                    engine->index, shard,
+                    (uint64_t)head->off +
+                        (uint64_t)start * hidden * sizeof(*raw),
+                    bytes, raw)) {
+                free(final); free(raw);
+                return coli_edge_adapter_error(
+                    error, error_size, "DeepSeek V4 Edge head read failed");
+            }
+            #pragma omp parallel for schedule(static)
+            for (int row = 0; row < rows; row++)
+                logits[start + row] = deepseek_v4_edge_head_dot(
+                    raw + (size_t)row * hidden, final, hidden);
+        }
+    }
+    free(final); free(raw);
+    return 0;
+}
+
 static const ColiEdgeAdapter deepseek_v4_edge_adapter = {
     sizeof(ColiEdgeAdapter), COLI_EDGE_ABI_VERSION, "deepseek_v4",
     deepseek_v4_edge_engine_open, deepseek_v4_edge_engine_destroy,
     deepseek_v4_edge_tokenize, deepseek_v4_edge_detokenize,
-    deepseek_v4_edge_embed, deepseek_v4_edge_select, {0}
+    deepseek_v4_edge_embed, deepseek_v4_edge_select,
+    deepseek_v4_edge_logits, {0}
 };
 
 int coli_deepseek_v4_edge_adapter_register(void) {

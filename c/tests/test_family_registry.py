@@ -993,6 +993,10 @@ class FamilyRegistryTest(unittest.TestCase):
     def test_tuning_replay_prompts_are_registry_owned(self):
         prompt = "hello {world}"
         expected = {
+            # GLM-5.3 apre il ragionamento e non lo chiude: il suo
+            # chat_template.jinja mette <think> dopo <|assistant|> e basta,
+            # dove GLM-5.2 metteva <think></think>.
+            "glm53": "[gMASK]<sop><|user|>hello {world}<|assistant|><think>",
             "glm": "[gMASK]<sop><|user|>hello {world}<|assistant|><think></think>",
             "inkling": "<|user|>hello {world}<|assistant|>",
             "kimi": "K3CHAT1\nM user 13\nhello {world}G 0\n\n",
@@ -1088,6 +1092,19 @@ class FamilyRegistryTest(unittest.TestCase):
                     self.assertIn(family.build_target,
                                   re.search(r'ENGINES="([^"]+)"', ci).group(1).split())
                     self.assertIn(f"cp c/{family.engine_artifact}", release)
+                    # Copiarlo non basta: va anche COSTRUITO. Il contratto
+                    # verificava solo meta', e con quella meta' la v1.9.0 e'
+                    # uscita col nome di GLM-5.3-Flash e senza il suo binario,
+                    # esattamente come la v1.5.0 con DeepSeek V4 (#858). Un
+                    # `cp` di un file che nessuno ha compilato fallisce a
+                    # release gia' pubblicata, cioe' nel momento peggiore.
+                    build_step = re.search(r"for t in ([a-z0-9_ ]+); do",
+                                           release)
+                    self.assertIsNotNone(build_step,
+                                         "release.yml: build loop not found")
+                    self.assertIn(family.build_target, build_step.group(1).split(),
+                                  f"{family.id}: release.yml copies "
+                                  f"c/{family.engine_artifact} but never builds it")
                     self.assertIn(f"$(LIBEXECDIR)/{family.engine_artifact}", makefile)
                 else:
                     self.assertIn("deepseek-v4", ci)
