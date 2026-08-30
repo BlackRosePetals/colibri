@@ -91,7 +91,7 @@ static int hexnib(char c){
  * pre-tokenize + per-piece ByteLevel map + BPE merges. */
 typedef struct { char **keys; int *vals; int *used; int cap; } SMap;
 static unsigned shash(const char *s){ unsigned h=2166136261u; while(*s){ h^=(unsigned char)*s++; h*=16777619u; } return h; }
-static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc(cap,sizeof(char*)); m->vals=malloc(cap*sizeof(int)); m->used=calloc(cap,sizeof(int)); }
+static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc((size_t)cap,sizeof(char*)); m->vals=malloc((size_t)cap*sizeof(int)); m->used=calloc((size_t)cap,sizeof(int)); }
 static void smap_put(SMap *m,const char *k,int v){ if(!k)return; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0){m->vals[h]=v;return;} h=(h+1)&(m->cap-1);} m->used[h]=1; m->keys[h]=(char*)k; m->vals[h]=v; }
 static int smap_get(SMap *m,const char *k){ if(!m||!m->cap||!k)return -1; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0)return m->vals[h]; h=(h+1)&(m->cap-1);} return -1; }
 
@@ -1311,7 +1311,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
-        m->cache[i].slots = calloc(cap, sizeof(Slot));
+        m->cache[i].slots = calloc((size_t)cap, sizeof(Slot));
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
