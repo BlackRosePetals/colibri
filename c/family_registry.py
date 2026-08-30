@@ -907,7 +907,13 @@ FAMILIES = (
         # implicit_cap 0, non 8: questo motore dimensiona la cache degli
         # esperti dalla RAM disponibile, quindi "nessuna scelta esplicita"
         # deve arrivargli come 0 e non come otto slot per layer.
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 0, "GLM53_MAXT"),
+        # L'interattivo era 1024, uguale al default non interattivo: l'unica
+        # famiglia che ragiona a cui non era stato alzato. Su un modello che
+        # riflette prima di rispondere quel tetto non e' una rete di sicurezza,
+        # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
+        # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
+        # le famiglie con lo stesso contesto massimo di 1048576.
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 0, "GLM53_MAXT"),
         # tools=True: this family DOES render and parse tool calls. It used to
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
@@ -963,7 +969,13 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_inkling_expert_inventory,
         config_section="text_config",
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "CTX_MAX"),
+        # L'interattivo era 1024, uguale al default non interattivo: l'unica
+        # famiglia che ragiona a cui non era stato alzato. Su un modello che
+        # riflette prima di rispondere quel tetto non e' una rete di sicurezza,
+        # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
+        # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
+        # le famiglie con lo stesso contesto massimo di 1048576.
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "CTX_MAX"),
         capabilities=FamilyCapabilities(False, False, True, True),
         has_gateway_adapter=True,
         tune_prompt_template="<|user|>{prompt}<|assistant|>",
@@ -991,7 +1003,13 @@ FAMILIES = (
         planner_unsupported_reason="",
         expert_inventory=_individual_expert_inventory(_KIMI_EXPERT),
         config_section="text_config",
-        limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "K3_MAXT"),
+        # L'interattivo era 1024, uguale al default non interattivo: l'unica
+        # famiglia che ragiona a cui non era stato alzato. Su un modello che
+        # riflette prima di rispondere quel tetto non e' una rete di sicurezza,
+        # e' una ghigliottina che cade DENTRO al blocco di pensiero e chiude il
+        # turno senza risposta (#1278). 16384 e' il valore che hanno gia' tutte
+        # le famiglie con lo stesso contesto massimo di 1048576.
+        limits=FamilyLimits(8192, 1048576, 1024, 16384, 1, 8, "K3_MAXT"),
         # tools=True: this family DOES render and parse tool calls. It used to
         # share COMMON_CAP, which says otherwise -- the flag is descriptive
         # (it only feeds the capability dict) so nothing broke, but a client
