@@ -908,7 +908,11 @@ FAMILIES = (
         # esperti dalla RAM disponibile, quindi "nessuna scelta esplicita"
         # deve arrivargli come 0 e non come otto slot per layer.
         limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 0, "GLM53_MAXT"),
-        capabilities=COMMON_CAP,
+        # tools=True: this family DOES render and parse tool calls. It used to
+        # share COMMON_CAP, which says otherwise -- the flag is descriptive
+        # (it only feeds the capability dict) so nothing broke, but a client
+        # reading it programmatically was told the opposite of the truth.
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         has_cli_adapter=True,
         # Dal chat_template.jinja del checkpoint: nessun a capo, e <think>
@@ -988,7 +992,11 @@ FAMILIES = (
         expert_inventory=_individual_expert_inventory(_KIMI_EXPERT),
         config_section="text_config",
         limits=FamilyLimits(8192, 1048576, 1024, 1024, 1, 8, "K3_MAXT"),
-        capabilities=COMMON_CAP,
+        # tools=True: this family DOES render and parse tool calls. It used to
+        # share COMMON_CAP, which says otherwise -- the flag is descriptive
+        # (it only feeds the capability dict) so nothing broke, but a client
+        # reading it programmatically was told the opposite of the truth.
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         tune_prompt_template="K3CHAT1\nM user {prompt_len}\n{prompt}G 0\n\n",
     ),
@@ -1070,7 +1078,7 @@ FAMILIES = (
         fixed_resident_inventory=_qwen38_fixed_resident_inventory,
         config_section="text_config",
         limits=FamilyLimits(8192, 262144, 1024, 8192, 1, 1, "Q38_MAXT"),
-        capabilities=FamilyCapabilities(False, False, False, True),
+        capabilities=FamilyCapabilities(True, False, False, True),
         has_gateway_adapter=True,
         # Like Qwen3.6, direct `coli run` is intentionally not exposed until
         # an engine-specific CLI prompt path exists; chat/serve use the gateway.

@@ -19,7 +19,7 @@ from openai_server import (APIError, APIHandler, APIServer, ClientCancelled,
                            READY, Engine, InklingStreamSplit, StopFilter, ThinkingStreamSplit,
                            _engine_error, cap_for_arch, conversation_cache_slot, model_arch,
                            generation_options, parse_tool_calls, parse_dsv4_tool_calls,
-                           parse_arch_tool_calls, parse_k3_tool_calls,
+                           parse_arch_tool_calls, parse_k3_tool_calls, parse_qwen38_tool_calls,
                            read_engine_turn, render_chat, render_chat_kimi, render_chat_olmoe,
                            render_chat_qwen38, render_chat_v4, _dsv4_tool_calls, serve,
                            split_thinking_reply,
@@ -116,14 +116,62 @@ class TemplateTest(unittest.TestCase):
                          "<|im_start|>user\nHi<|im_end|>\n"
                          "<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
-    def test_qwen38_rejects_tools_and_non_text_content(self):
-        with self.assertRaisesRegex(APIError, "qwen38 engine"):
-            render_chat_qwen38([{"role": "user", "content": "Hi"}],
-                               tools=[{"type": "function"}])
+    def test_qwen38_still_rejects_non_text_content(self):
+        # Tools are wired up now; images are not. The engine is text-only, so a
+        # picture must still be refused rather than silently dropped.
         with self.assertRaisesRegex(APIError, "text message content only"):
             render_chat_qwen38([{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": "x"}}
             ]}])
+
+    def test_qwen38_renders_and_parses_its_own_tool_format(self):
+        tool = {"type": "function", "function": {
+            "name": "weather", "description": "w",
+            "parameters": {"type": "object",
+                           "properties": {"city": {"type": "string"},
+                                          "days": {"type": "integer"}}}}}
+        prompt = render_chat_qwen38([{"role": "user", "content": "Rome?"}], tools=[tool])
+        # The declaration teaches the model the syntax it must emit, so the
+        # preamble is transcribed from chat_template.jinja and not paraphrased.
+        self.assertIn("# Tools\n\nYou have access to the following functions:\n\n<tools>",
+                      prompt)
+        self.assertIn("<function=example_function_name>", prompt)
+        self.assertIn("</tools>", prompt)
+
+        # A call with no preceding text attaches directly; one with text is
+        # separated by a blank line. Getting that wrong changes the prompt.
+        with_text = render_chat_qwen38([
+            {"role": "user", "content": "Rome?"},
+            {"role": "assistant", "content": "Checking.", "tool_calls": [
+                {"type": "function", "function": {
+                    "name": "weather", "arguments": {"city": "Rome"}}}]},
+            {"role": "tool", "content": "clear"},
+            {"role": "user", "content": "thanks"},
+        ], tools=[tool])
+        self.assertIn("Checking.\n\n<tool_call>\n<function=weather>\n"
+                      "<parameter=city>\nRome\n</parameter>\n</function>\n</tool_call>",
+                      with_text)
+        # Consecutive tool results share one user turn.
+        self.assertIn("<|im_start|>user\n<tool_response>\nclear\n</tool_response><|im_end|>",
+                      with_text)
+
+        text, calls = parse_qwen38_tool_calls(
+            "Sure.\n\n<tool_call>\n<function=weather>\n<parameter=city>\nRome\n"
+            "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+            [tool])
+        self.assertEqual(text, "Sure.")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "weather")
+        # The template writes a string argument unquoted, so the type comes back
+        # from the declared schema: city stays a string, days becomes an int.
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"city": "Rome", "days": 3})
+
+    def test_qwen38_tool_choice_none_suppresses_the_declaration(self):
+        tool = {"type": "function", "function": {"name": "f", "description": "d"}}
+        prompt = render_chat_qwen38([{"role": "user", "content": "Hi"}],
+                                    tools=[tool], tool_choice="none")
+        self.assertNotIn("<tools>", prompt)
 
     def test_kimi_payload_preserves_utf8_lengths_and_turns(self):
         prompt = render_chat_kimi([
