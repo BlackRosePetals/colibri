@@ -215,6 +215,38 @@ lever here. It shrinks rather than crops: what is lost is detail, not pieces.
 
 **Normalisation is 0.5/0.5**, not the CLIP constants.
 
-The tower is 27 blocks, hidden 1152, 16 heads, patch 16, spatial merge 2,
-projecting to 2560. The prompt side is already documented by the template, which
-splices images as `<|vision_start|><|image_pad|><|vision_end|>`.
+### The tower
+
+`qwen38_vision.h` implements it: 27 blocks, hidden 1152, 16 heads, patch 16,
+spatial merge 2, projecting to 2560. Verified against the upstream
+`Qwen4ExpVisionModel`, again without the checkpoint -- the fixture is a 240 kB
+tower with random weights:
+
+```
+make -C c qwen38-vision-check
+```
+
+Two findings from building it are worth carrying, because both were invisible
+until an oracle was there to see them.
+
+**The merger uses a different GELU from the blocks.** The blocks take
+`ACT2FN[hidden_act]`, which is `gelu_pytorch_tanh` here; the merger instantiates
+`nn.GELU()`, the exact erf one. Using one for both matches to 4.6e-3 -- close
+enough to look right and far enough to move the image tokens.
+
+**A fixture can be too weak to test what it claims to.** The first version scaled
+the random weights to 0.05, which makes the q.k products so small that softmax
+comes out essentially uniform: attention degenerates into the mean of the values
+and stops depending on the scores. A tower with **no RoPE at all** passed that
+fixture. At 0.6 the scores have a real range, and the four negative controls
+(rope off, wrong GELU, raster patch order, flat position interpolation) all fail
+as they should.
+
+The tolerance is measured, not chosen: the reference in float32 differs from
+itself in float64 by 1.83e-4 on these activations, so a gap of that order is the
+arithmetic rather than a defect, and the threshold sits between it and the
+4.6e-3 the real bug produced.
+
+The prompt side is settled by the template, which splices images as
+`<|vision_start|><|image_pad|><|vision_end|>`. Wiring the tower into the engine's
+sequence, and accepting images at the gateway, is the remaining step.
