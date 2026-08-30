@@ -11079,7 +11079,13 @@ int main(int argc, char **argv){
         atexit(cluster_close_all);
     }
 #endif
-    Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
+    /* static, not a stack local: the PILOT prefetch worker is detached and
+     * loops forever, and it keeps this address in the global pilot_m. A stack
+     * Model dies when main returns while that thread is still dereferencing
+     * it -- ASan: stack-use-after-return, READ of size 8, in a worker thread,
+     * with the run's tokens already correct (#1262). Static storage outlives
+     * every thread, so the pointer the worker holds stays valid. */
+    static Model m; double t0=now_s(); model_init(&m,snap,cap,ebits,dbits);
     /* KV_TQ requires power-of-two row widths: both codecs rotate through a
      * radix-2 FWHT, and coli_kvq_quant_row returns an inert radius 0 for any
      * other width. On a model whose kv_lora/qk_rope are not powers of two that
