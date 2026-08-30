@@ -904,6 +904,7 @@ class FamilyRegistryTest(unittest.TestCase):
         release = (repo / ".github" / "workflows" / "release.yml").read_text(
             encoding="utf-8")
         docker = (repo / "docker" / "Dockerfile.slim").read_text(encoding="utf-8")
+        clean = (repo / "c" / "tools" / "clean.py").read_text(encoding="utf-8")
         make_rules = re.sub(r"\\\n[ \t]*", " ", makefile)
         install_rule = re.search(r"(?m)^install:\s*(.*)$", make_rules)
         self.assertIsNotNone(install_rule)
@@ -937,6 +938,16 @@ class FamilyRegistryTest(unittest.TestCase):
                                   f"{family.id}: release.yml copies "
                                   f"c/{family.engine_artifact} but never builds it")
                     self.assertIn(f"$(LIBEXECDIR)/{family.engine_artifact}", makefile)
+                    # `make clean` must actually remove the engine. When it does
+                    # not, a rebuild with different EXTRA_CFLAGS reports "up to
+                    # date" and the caller silently keeps the OLD binary. The
+                    # ASan step of the Qwen3.6 oracle job re-ran an
+                    # un-instrumented qwen36 that way for as long as it existed
+                    # (#1262): green, with the sanitizer never having run.
+                    self.assertIn(f'"{family.engine_artifact}"', clean,
+                                  f"{family.id}: tools/clean.py does not remove "
+                                  f"c/{family.engine_artifact}, so a rebuild with "
+                                  f"different flags is a silent no-op")
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
