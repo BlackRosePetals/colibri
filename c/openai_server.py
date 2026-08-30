@@ -1480,6 +1480,62 @@ def _image_bytes_from_url(url):
         raise APIError(400, f"cannot read image {path}: {problem}", "messages")
 
 
+# Qwen3.8 splices images as <|vision_start|> + N x <|image_pad|> + <|vision_end|>,
+# and N is not a constant: the resolution is dynamic, so it comes from the grid
+# the preprocessor chose. Hardcoding it would put the right vectors in the wrong
+# number of slots, which the engine refuses rather than guesses about.
+QWEN38_VISION_START = "<|vision_start|>"
+QWEN38_IMAGE_PAD = "<|image_pad|>"
+QWEN38_VISION_END = "<|vision_end|>"
+
+
+def _preprocess_qwen38_image(data, model_dir, max_tokens=None):
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+        _sys.path.insert(0, str(_Path(__file__).resolve().parent / "tools"))
+        from qwen38_image import preprocess
+    except ImportError as problem:
+        raise APIError(400, f"image support needs Pillow and numpy ({problem}).",
+                       "messages")
+    return preprocess(data, model_dir, max_tokens)
+
+
+def expand_qwen38_images(messages, model_dir, max_tokens=None):
+    """Replace image parts with their placeholders and pull out the patches.
+
+    Returns (rewritten messages, images). The messages come back as plain text,
+    so the renderer treats them like any other turn."""
+    images = []
+    rewritten = []
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            rewritten.append(message)
+            continue
+        pieces = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            kind = part.get("type")
+            if kind == "text":
+                pieces.append(part.get("text", ""))
+            elif kind in ("image_url", "input_image"):
+                url = (part.get("image_url") or {}).get("url") if kind == "image_url" \
+                      else part.get("image_url") or part.get("url")
+                data = _image_bytes_from_url(url)
+                patches, grid_h, grid_w = _preprocess_qwen38_image(
+                    data, model_dir, max_tokens)
+                tokens = (grid_h // 2) * (grid_w // 2)
+                images.append((patches, grid_h, grid_w))
+                pieces.append(QWEN38_VISION_START + QWEN38_IMAGE_PAD * tokens
+                              + QWEN38_VISION_END)
+            else:
+                raise APIError(400, f"unsupported content part {kind!r}.", "messages")
+        rewritten.append({**message, "content": "".join(pieces)})
+    return rewritten, images
+
+
 def expand_glm53_images(messages, model_dir):
     """Sostituisce le parti immagine coi loro segnaposto e ne estrae le patch.
 
@@ -3680,6 +3736,15 @@ class APIHandler(BaseHTTPRequestHandler):
         if ARCH == "glm53":
             messages, images = expand_glm53_images(
                 messages, getattr(self.server.engine, "model_dir", None))
+            if len(images) > 1:
+                raise APIError(400, "one image per request for now; the engine "
+                                    "holds a single pending image.", "messages")
+            image = images[0] if images else None
+        elif ARCH == "qwen38":
+            ceiling = os.environ.get("Q38_MAX_IMAGE_TOKENS")
+            messages, images = expand_qwen38_images(
+                messages, getattr(self.server.engine, "model_dir", None),
+                int(ceiling) if ceiling else None)
             if len(images) > 1:
                 raise APIError(400, "one image per request for now; the engine "
                                     "holds a single pending image.", "messages")

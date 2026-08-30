@@ -247,6 +247,34 @@ itself in float64 by 1.83e-4 on these activations, so a gap of that order is the
 arithmetic rather than a defect, and the threshold sits between it and the
 4.6e-3 the real bug produced.
 
-The prompt side is settled by the template, which splices images as
-`<|vision_start|><|image_pad|><|vision_end|>`. Wiring the tower into the engine's
-sequence, and accepting images at the gateway, is the remaining step.
+### Wired up
+
+Images work end to end. Send an OpenAI `image_url` part with a base64 data URI or
+a local path; the gateway preprocesses it, replaces the part with
+`<|vision_start|>` + N x `<|image_pad|>` + `<|vision_end|>`, and hands the patches
+to the engine in an `IMAGE` frame ahead of the `SUBMIT` they belong to. The engine
+runs the tower once and substitutes its output for the embedding of each
+placeholder.
+
+N is not a constant. The resolution is dynamic, so the placeholder count comes
+from the grid the preprocessor chose, and the engine **refuses** a request where
+the prompt and the grid disagree rather than guessing which vectors go where.
+`Q38_MAX_IMAGE_TOKENS` caps it; a 1080p photo is 2040 tokens without one.
+
+```
+make -C c qwen38-vision-serve-check
+```
+
+That gate does not check the model answers -- with random weights it would answer
+regardless, and would answer identically while ignoring the picture entirely. It
+checks that **two different images produce two different answers**, which is the
+only question a random fixture can answer honestly, and the one that catches the
+likeliest defect: patches loaded, tower run, result dropped somewhere between the
+merger and the embeddings. It also checks the refusals, since accepting a wrong
+image is worse than refusing it.
+
+Remote URLs are refused rather than fetched, as elsewhere: a request should not
+make the server open a connection of the sender's choosing.
+
+One image per request for now -- the engine holds a single pending image, and a
+second arriving before its `SUBMIT` drops the first and says so.
