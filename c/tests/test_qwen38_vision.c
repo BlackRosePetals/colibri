@@ -88,9 +88,13 @@ static int compare(const char *label, const float *got, const float *want,
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) { fprintf(stderr, "uso: %s <cartella-fixture>\n", argv[0]); return 2; }
+    /* `make test-c` esegue ogni tests/test_* SENZA argomenti. Senza fixture
+     * questo test non ha verificato niente, e dirlo saltato e' l'unica risposta
+     * onesta: uscire con errore lo farebbe fallire su ogni macchina che non ha
+     * ancora generato la fixture, e uscire con successo sarebbe una bugia. */
+    const char *fixture = (argc >= 2) ? argv[1] : "./qwen38_vision_tiny";
     char path[1024];
-    snprintf(path, sizeof path, "%s/ref_vision.json", argv[1]);
+    snprintf(path, sizeof path, "%s/ref_vision.json", fixture);
     FILE *f = fopen(path, "rb");
     if (!f) { printf("SKIP: manca %s; genera la fixture con "
                      "tools/make_qwen38_vision_tiny.py\n", path); return 0; }
@@ -112,12 +116,12 @@ int main(int argc, char **argv)
     float *want_out = json_floats(json_get(ref, "output"), &nout);
     float *want_last = json_floats(json_get(ref, "last_hidden"), &nlast);
 
-    shards S; st_init(&S, argv[1]);
+    shards S; st_init(&S, fixture);
 
     /* La geometria viene dal config della fixture, non da costanti qui: una
      * torre con dimensioni diverse deve fallire dicendo cosa non torna, non
      * leggere silenziosamente pesi della misura sbagliata. */
-    snprintf(path, sizeof path, "%s/config.json", argv[1]);
+    snprintf(path, sizeof path, "%s/config.json", fixture);
     FILE *cf = fopen(path, "rb");
     if (!cf) { fprintf(stderr, "manca %s\n", path); return 1; }
     fseek(cf, 0, SEEK_END); long csize = ftell(cf); fseek(cf, 0, SEEK_SET);
