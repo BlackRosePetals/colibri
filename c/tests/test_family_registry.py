@@ -1066,6 +1066,37 @@ class FamilyRegistryTest(unittest.TestCase):
         self.assertEqual(checks["engine.binary"]["status"], "fail")
         self.assertEqual(report["status"], "error")
 
+    def test_tools_capability_matches_what_the_renderer_actually_does(self):
+        """The `tools` flag must agree with the gateway's behaviour.
+
+        It is descriptive -- it only feeds the capability dict -- which is
+        exactly why it drifted: glm53 and kimi both render and parse tool calls
+        while sharing a COMMON_CAP that said they do not, and nothing failed to
+        tell anyone. A client asking what a family supports was told the
+        opposite of the truth. Ask the renderer instead of trusting the flag.
+        """
+        import openai_server
+
+        probe = [{"role": "user", "content": "hi"}]
+        tool = [{"type": "function",
+                 "function": {"name": "f", "description": "d",
+                              "parameters": {"type": "object", "properties": {}}}}]
+        for family in FAMILIES:
+            renderer = getattr(openai_server, f"render_chat_{family.id}", None)
+            if renderer is None:          # kimi/deepseek build their payload in C
+                continue
+            refused = False
+            try:
+                renderer(probe, tools=tool)
+            except openai_server.APIError as exc:
+                refused = getattr(exc, "code", None) == "unsupported_parameter"
+            except Exception:             # nothing else here is a capability answer
+                continue
+            self.assertEqual(
+                family.capabilities.tools, not refused,
+                f"{family.id}: registry says tools={family.capabilities.tools} but the "
+                f"renderer {'refuses' if refused else 'accepts'} them")
+
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")

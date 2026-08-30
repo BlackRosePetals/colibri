@@ -30,7 +30,33 @@ COLI_MODEL=~/Models/Qwen3.8-Flash-Next-FP8 ./c/coli chat
 `coli serve` and `coli web` use the same text-only gateway path. Qwen3.8 thinks
 by default; `reasoning_effort` accepts `low`, `medium`, `high`, and `xhigh`, and
 `enable_thinking: false` emits the model's official empty thinking prefix.
-Tools, image content, audio, and grammar constraints are rejected explicitly.
+Image content, audio and grammar constraints are rejected explicitly.
+
+Tool calling works. Qwen3.8 declares and emits calls in an XML-ish form of
+its own rather than the JSON block GLM uses, so it has its own renderer and
+its own parser:
+
+```
+<tool_call>
+<function=NAME>
+<parameter=KEY>
+VALUE
+</parameter>
+</function>
+</tool_call>
+```
+
+Both sides are transcribed from `chat_template.jinja` rather than
+paraphrased, because the declaration is what teaches the model the syntax it
+must emit: a preamble it has never seen is a different prompt. The whole
+rendering is pinned byte for byte against the official template
+(`tests/test_qwen38_chat_template.py`, 27 cases across the three reasoning
+levels).
+
+One asymmetry worth knowing: the template writes a string argument unquoted,
+so a value's original type is not recoverable from the text alone. The parser
+reads the declared schema and restores numbers and booleans from it, and
+leaves anything the schema did not describe as a string rather than guessing.
 
 The official FP8 repository is about 185.5 GB in decimal units (roughly 173
 GiB). The default CPU engine keeps resident BF16 matrices in their native
