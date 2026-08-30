@@ -97,7 +97,7 @@ static int hexnib(char c){
  * pre-tokenize + per-piece ByteLevel map + BPE merges. */
 typedef struct { char **keys; int *vals; int *used; int cap; } SMap;
 static unsigned shash(const char *s){ unsigned h=2166136261u; while(*s){ h^=(unsigned char)*s++; h*=16777619u; } return h; }
-static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc(cap,sizeof(char*)); m->vals=malloc(cap*sizeof(int)); m->used=calloc(cap,sizeof(int)); }
+static void smap_init(SMap *m,int cap){ m->cap=cap; m->keys=calloc((size_t)cap,sizeof(char*)); m->vals=malloc((size_t)cap*sizeof(int)); m->used=calloc((size_t)cap,sizeof(int)); }
 static void smap_put(SMap *m,const char *k,int v){ if(!k)return; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0){m->vals[h]=v;return;} h=(h+1)&(m->cap-1);} m->used[h]=1; m->keys[h]=(char*)k; m->vals[h]=v; }
 static int smap_get(SMap *m,const char *k){ if(!m||!m->cap||!k)return -1; unsigned h=shash(k)&(m->cap-1); while(m->used[h]){ if(m->keys[h]&&strcmp(m->keys[h],k)==0)return m->vals[h]; h=(h+1)&(m->cap-1);} return -1; }
 
@@ -362,7 +362,7 @@ static int json_escape(const unsigned char *s, int n, char *out, int outsz){
     return o;
 }
 
-/* Append b[0..n) into buf/*bn, extract as many LEADING complete UTF-8
+/* Append b[0..n) into buf (*bn), extract as many LEADING complete UTF-8
  * codepoints as possible into out[0..*outn) (max 255). Trailing partial
  * sequence stays in buf. Returns bytes written to out. */
 static int utf8_drain(unsigned char *buf, int *bn, const unsigned char *b, int n, unsigned char *out, int *outn){
@@ -484,7 +484,7 @@ static void stream_token(int id){
     if (g_openai){
         if (g_ttft < 0) g_ttft = now_s() - g_gen_t0;   /* TTFT on first token */
         if (!g_tok){
-            char jb[160];
+            char jb[512];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%d\"},\"finish_reason\":null}]}",
@@ -497,7 +497,7 @@ static void stream_token(int id){
         utf8_drain(g_sbuf, &g_sbn, tmp, tn, chunk, &cn);
         if (cn > 0){
             char esc[1024]; json_escape(chunk, cn, esc, sizeof esc);
-            char jb[1200];
+            char jb[2048];
             snprintf(jb, sizeof jb,
               "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
               "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
@@ -531,7 +531,7 @@ static void emit_openai_result(const int *out, int np, int n_new, int stream){
             for (int k=0;k<g_sbn;k++) chunk[cn++] = g_sbuf[k]; g_sbn = 0;
             if (cn > 0){
                 char esc[256]; json_escape(chunk, cn, esc, sizeof esc);
-                char jb[400];
+                char jb[768];
                 snprintf(jb, sizeof jb,
                   "{\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":\"%s\","
                   "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"%s\"},\"finish_reason\":null}]}",
@@ -1072,7 +1072,8 @@ static void load_cfg(Cfg *c, const char *snap) {
     c->n_experts = 256; c->topk = 8; c->inter = 512; c->shared_inter = 512;
     c->n_group = 1; c->topk_group = 1; c->norm_topk = 1; c->has_qk_norm = 1; c->has_bias = 0;
     c->attn_output_gate = 1; c->n_active = 0;
-    c->is_attn = calloc(c->n_layers, sizeof(uint8_t));
+    if (c->n_layers <= 0 || c->n_layers > 512) { fprintf(stderr, "load_cfg: n_layers=%d out of range 1..512\n", c->n_layers); exit(1); }
+    c->is_attn = calloc((size_t)c->n_layers, sizeof(uint8_t));
     for (int i = 0; i < c->n_layers; i++) c->is_attn[i] = (i % 4 == 3) ? 1 : 0;
 }
 
@@ -1242,6 +1243,9 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
     int n_layers_from_config = m->c.n_layers;
     load_meta(&m->c, snap);
     validate_cfg(&m->c, n_layers_from_config);
+    /* load_cfg and validate_cfg both guard n_layers, but the compiler can't see
+     * across function boundaries, so re-assert here to silence -Walloc-size-larger-than. */
+    if (m->c.n_layers <= 0) { fprintf(stderr, "model_init: n_layers=%d invalid\n", m->c.n_layers); exit(1); }
     if (m->c.rotary_dim > m->c.head_dim || m->c.rotary_dim % 2 != 0) {
         fprintf(stderr, "rotary_dim %d invalid for head_dim %d\n", m->c.rotary_dim, m->c.head_dim); exit(1);
     }
@@ -1260,7 +1264,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->lm_head    = load_t_n(m, "lm_head.weight", (int64_t)c->vocab * c->hidden);
         m->final_norm = load_t_n(m, "model.norm.weight", c->hidden);
     }
-    m->L = calloc(c->n_layers, sizeof(Layer));
+    m->L = calloc((size_t)c->n_layers, sizeof(Layer));
     /* Phase 2: the converter stores EVERY layer (Gated-Attention + Gated DeltaNet)
      * under its OWN original index model.layers.{i}. So active_of is the identity
      * map; experts and dense weights are read from model.layers.{i} for all i. */
@@ -1323,17 +1327,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
             #undef LD4
         }
     }
-    m->cache = calloc(c->n_layers, sizeof(LCache));
+    m->cache = calloc((size_t)c->n_layers, sizeof(LCache));
     for (int i = layer_begin; i < layer_end; i++) {
         m->cache[i].cap = cap;
-        m->cache[i].slots = calloc(cap, sizeof(Slot));
+        m->cache[i].slots = calloc((size_t)cap, sizeof(Slot));
         m->cache[i].slot_by_expert = malloc((size_t)c->n_experts * sizeof(int));
         if (!m->cache[i].slot_by_expert) { fprintf(stderr,"OOM expert cache index\n"); exit(1); }
         for (int e = 0; e < c->n_experts; e++) m->cache[i].slot_by_expert[e] = -1;
     }
     /* per-layer DeltaNet recurrent + conv state (only for linear_attention layers) */
-    m->DN_rec = calloc(c->n_layers, sizeof(float*));
-    m->DN_conv = calloc(c->n_layers, sizeof(float*));
+    m->DN_rec = calloc((size_t)c->n_layers, sizeof(float*));
+    m->DN_conv = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = layer_begin; allocate_state && i < layer_end; i++) {
         if (c->is_attn[i]) { m->DN_rec[i] = NULL; m->DN_conv[i] = NULL; continue; }
         if (c->dn_vheads <= 0) { fprintf(stderr, "layer %d is DeltaNet but dn dims missing from meta\n", i); exit(1); }
@@ -2309,7 +2313,7 @@ static void ensure_kv(Model *m){
         for (int i = 0; i < c->n_layers; i++){ if (m->K[i]) free(m->K[i]); if (m->V[i]) free(m->V[i]); }
         free(m->K); free(m->V); m->K = NULL; m->V = NULL;
     }
-    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    m->K = calloc((size_t)c->n_layers, sizeof(float*)); m->V = calloc((size_t)c->n_layers, sizeof(float*));
     for (int i = 0; i < c->n_layers; i++){
         if (c->is_attn[i]){
             m->K[i] = falloc((int64_t)c->kv_heads * m->max_t * c->k_head_dim);
