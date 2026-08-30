@@ -1825,11 +1825,23 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
     elif tool_choice == "none":
         tools = None                              # il client li ha vietati: non si offrono
 
-    # low e high passano, tutto il resto e' Max: e' la scala del template, non
-    # la nostra. `none` non arriva qui, spegne il ragionamento a monte.
-    effort = {"minimal": "Low", "low": "Low", "medium": "High",
-              "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
-    prompt = ["[gMASK]<sop>", f"<|system|>Reasoning Effort: {effort}"]
+    prompt = ["[gMASK]<sop>"]
+    if enable_thinking:
+        # SOLO col ragionamento acceso. Con --no-think il prompt chiude gia' il
+        # blocco, e lasciare "Reasoning Effort: Max" davanti a un <think></think>
+        # chiuso dice al modello due cose opposte: rifletti al massimo, e hai
+        # finito di riflettere. Il modello risponde riaprendo un <think>, lo
+        # splitter -- che era partito correttamente in modalita' testo -- lo vede
+        # e ci rientra, e da li' in poi tutta la risposta viene archiviata come
+        # pensiero: l'utente vede riflettere e poi nessuna risposta (#1278).
+        # render_chat (GLM-5.2) mette questa riga sotto la stessa condizione da
+        # sempre, ed e' l'unico dei due che non ha mai avuto questa segnalazione.
+        #
+        # low e high passano, tutto il resto e' Max: e' la scala del template,
+        # non la nostra. `none` non arriva qui, spegne il ragionamento a monte.
+        effort = {"minimal": "Low", "low": "Low", "medium": "High",
+                  "high": "High", "xhigh": "Max"}.get(reasoning_effort, "Max")
+        prompt.append(f"<|system|>Reasoning Effort: {effort}")
     if tools:
         prompt.append(_glm53_tool_block(tools))
 
