@@ -1032,6 +1032,20 @@ qwen38$(EXE): qwen38.c qwen38_core.h qwen38_nfc.h qwen38_nfc_tables.h st.h json.
 qwen38-tiny-generate:
 	$(PYTHON) tools/make_qwen38_tiny.py --out ./qwen38_tiny
 
+# Il prefetch PLE e' un riordino, non un cambio di calcolo: le stesse righe,
+# lette prima e in parallelo. Quindi acceso e spento devono dare gli STESSI
+# token, e questo lo pretende invece di fidarsi. Se un giorno divergono, il
+# prefetch ha smesso di essere un riordino e va guardato, non spento.
+.PHONY: qwen38-ple-prefetch-check
+qwen38-ple-prefetch-check: qwen38-tiny-generate qwen38$(EXE)
+	@fail=0; for cap in 1 2 4 8; do for pb in 0 1; do for bf in 0 1; do \
+		on=$$(Q38_PREFILL_BATCH=$$pb Q38_NATIVE_BF16=$$bf OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json 2>/dev/null | grep '^C engine'); \
+		off=$$(Q38_PLE_PREFETCH=0 Q38_PREFILL_BATCH=$$pb Q38_NATIVE_BF16=$$bf OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json 2>/dev/null | grep '^C engine'); \
+		if [ -z "$$on" ]; then echo "FAIL cap=$$cap batch=$$pb bf16=$$bf: no output"; fail=1; \
+		elif [ "$$on" != "$$off" ]; then echo "FAIL cap=$$cap batch=$$pb bf16=$$bf: prefetch changes the tokens"; fail=1; fi; \
+	done; done; done; \
+	[ $$fail -eq 0 ] && echo "PLE prefetch: identical tokens on and off, 16 configurations" || exit 1
+
 qwen38-tiny-check: qwen38-tiny-generate qwen38$(EXE)
 	@for batch in 0 1; do for bf16 in 0 1; do for cap in 1 4; do \
 		Q38_PREFILL_BATCH=$$batch Q38_NATIVE_BF16=$$bf16 OMP_NUM_THREADS=2 SNAP=./qwen38_tiny ./qwen38$(EXE) $$cap 8 ./qwen38_tiny/ref.json || exit $$?; \

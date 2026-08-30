@@ -1097,6 +1097,29 @@ class FamilyRegistryTest(unittest.TestCase):
                 f"{family.id}: registry says tools={family.capabilities.tools} but the "
                 f"renderer {'refuses' if refused else 'accepts'} them")
 
+    def test_a_reasoning_family_gets_more_room_than_a_single_answer(self):
+        """Chi ragiona deve avere un budget interattivo piu' largo del default.
+
+        Il tetto sui token e' una rete di sicurezza: la fine vera la decidono
+        gli stop token. Ma su un modello che riflette prima di rispondere, un
+        tetto stretto non ti prende DOPO la risposta, ti prende DENTRO al
+        pensiero, e il turno finisce senza che l'utente veda niente (#1278).
+
+        glm53, inkling e kimi erano rimaste all'interattivo uguale al default,
+        mentre ogni altra famiglia che ragiona lo aveva gia' alzato. Nessuno se
+        n'e' accorto perche' il registro accetta qualsiasi valore >= 1: questo
+        controllo esiste perche' la prossima non passi allo stesso modo.
+        """
+        for family in FAMILIES:
+            if not family.capabilities.thinking:
+                continue          # senza ragionamento il default e' la risposta intera
+            self.assertGreater(
+                family.limits.interactive_max_output, family.limits.default_max_output,
+                f"{family.id}: reasons, but its interactive budget "
+                f"({family.limits.interactive_max_output}) is no larger than the "
+                f"non-interactive default ({family.limits.default_max_output}) -- "
+                f"reasoning can consume it before the answer starts")
+
     def test_build_install_ci_and_release_cover_registered_engines(self):
         repo = Path(__file__).resolve().parents[2]
         makefile = (repo / "c" / "Makefile").read_text(encoding="utf-8")
