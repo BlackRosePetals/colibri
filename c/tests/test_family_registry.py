@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -1169,6 +1170,52 @@ class FamilyRegistryTest(unittest.TestCase):
                                 f"({family.id}); a reader in that language cannot "
                                 f"tell the family is supported")
 
+    def test_release_ships_everything_coli_reaches(self):
+        """L'archivio deve contenere ogni file Python che coli raggiunge.
+
+        #1296: il pacchetto v1.10.0 aveva quattro comandi rotti. release.yml
+        copiava sette .py scelti a mano piu' un solo file in tools/, e il
+        codice era andato avanti. Mancavano convert_fp8_to_int4.py,
+        eval_glm.py, fetch_benchmarks.py, mirror_plan.py, e i moduli cluster,
+        glm53_image, qwen38_image.
+
+        Ora la lista la calcola c/tools/pack_python.py. Questo test fissa i
+        due punti ciechi che avevano fatto passare il difetto, perche' sono i
+        due modi in cui un file sfugge a chi guarda a occhio:
+
+        - un import dentro una funzione, dopo un sys.path.insert. E' il caso
+          di qwen38_image in openai_server.py, e l'ImportError li' e'
+          catturato e riscritto come "image support needs Pillow and numpy":
+          nel pacchetto pubblicato mandare un'immagine dava la colpa
+          all'ambiente dell'utente per un file che non avevamo spedito.
+        - un sottoprocesso scritto con lo spazio dopo la virgola,
+          os.path.join(TOOLS, "mirror_plan.py"). La mia prima grep cercava
+          TOOLS," senza spazio e non lo vedeva: quattro invocazioni, non tre.
+        """
+        repo = Path(__file__).resolve().parents[2]
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+
+        reached = {path.name for path in pack_python.needed(repo / "c")}
+
+        # I sette file che mancavano davvero dall'archivio v1.10.0.
+        for name in ("convert_fp8_to_int4.py", "eval_glm.py",
+                     "fetch_benchmarks.py", "mirror_plan.py",
+                     "cluster.py", "glm53_image.py", "qwen38_image.py"):
+            self.assertIn(name, reached,
+                          f"{name} mancava dall'archivio v1.10.0 e il calcolo "
+                          f"non lo ritrova: #1296 si ripeterebbe")
+
+        release = (repo / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        self.assertIn("pack_python.py c dist", release,
+                      "release.yml non calcola piu' i file da copiare")
+        self.assertIn("--check", release,
+                      "release.yml non verifica piu' l'archivio estratto")
+
     def test_the_python_job_builds_every_engine_a_test_skips_without(self):
         """Un test protetto da skipUnless(ENGINE.exists()) sparisce se il job
         non compila quel motore, e sparisce in silenzio: la classe si salta,
@@ -1314,8 +1361,21 @@ class FamilyRegistryTest(unittest.TestCase):
                 else:
                     self.assertIn("deepseek-v4", ci)
                     self.assertIn("cp c/deepseek_v4", release)
-        for text in (makefile, release, docker):
+        for text in (makefile, docker):
             self.assertIn("family_registry.py", text)
+        # release.yml non nomina piu' i singoli .py: da #1296 la lista la
+        # calcola pack_python.py seguendo gli import a partire da coli. Il
+        # contratto qui e' sempre lo stesso -- family_registry.py deve finire
+        # nell'archivio -- ma va verificato alla fonte nuova, se no si
+        # controlla che esista una riga invece che il file venga spedito.
+        sys.path.insert(0, str(repo / "c" / "tools"))
+        try:
+            import pack_python
+        finally:
+            sys.path.pop(0)
+        shipped = {path.name for path in pack_python.needed(repo / "c")}
+        self.assertIn("family_registry.py", shipped,
+                      "l'archivio non spedirebbe family_registry.py")
 
 
 if __name__ == "__main__":
